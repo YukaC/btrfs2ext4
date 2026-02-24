@@ -1,0 +1,76 @@
+.TH BTRFS2EXT4 8 "February 2026" "btrfs2ext4 0.1.0-alpha" "System Administration Commands"
+.SH NAME
+btrfs2ext4 \- In-place Btrfs to Ext4 filesystem converter
+.SH SYNOPSIS
+.B btrfs2ext4
+[\fIOPTIONS\fR] \fIDEVICE\fR
+.SH DESCRIPTION
+.B btrfs2ext4
+is a destructive, zero-copy, in-place filesystem converter. It converts an existing Btrfs volume directly into an Ext4 volume on the same block device or image file without requiring an intermediate backup drive.
+.PP
+The tool works by mathematically calculating an optimal Ext4 layout, preserving Btrfs data extents exactly where they are, and physically relocating only those blocks that collide with the new Ext4 metadata structures (e.g., bitmaps, inode tables, superblock backups). 
+.PP
+All file permissions, ownership, exact timestamps (nanosecond precision), hard-links, extended attributes (xattrs), sparse files, inline data, and symlinks are faithfully preserved during conversion. The resulting filesystem behaves identically to a native Ext4 volume created by mkfs.ext4.
+.SH WARNING
+.B This tool performs DESTRUCTIVE modifications to the block device.
+Always back up critical data before proceeding. If a conversion fails or is interrupted due to power loss, use the \fB--rollback\fR flag to attempt automated restoration of the original Btrfs superblock.
+.SH OPTIONS
+.TP
+.BR \-n ", " \-\-dry\-run
+Simulate the conversion read-only. This performs a complete "Hardware Viability Audit," physically reading conflicting blocks to detect bad sectors, resolving layout overlaps, and verifying that the conversion can mathematically fit. It will cleanly abort if there is insufficient free space.
+.TP
+.BR \-v ", " \-\-verbose
+Enable verbose logging of relocation steps, block allocations, and metadata construction.
+.TP
+.BR \-b ", " \-\-block\-size \ \fISIZE\fR
+Set the Ext4 physical block size. Valid options are 1024, 2048, or \fB4096\fR. 4096 is the default and strongly recommended.
+.TP
+.BR \-i ", " \-\-inode\-ratio \ \fIRATIO\fR
+Set the bytes-per-inode ratio (default: 16384). A lower ratio creates more inodes, consuming more metadata blocks.
+.TP
+.BR \-w ", " \-\-workdir \ \fIPATH\fR
+Specify the directory used for large \fBmmap()\fR SSD-backed swap files when memory consumption exceeds limits (default: current working directory \fB./\fR).
+.TP
+.BR \-m ", " \-\-memory\-limit \ \fILIMIT\fR
+Define the strict threshold where the engine drops into \fBmmap()\fR paging to prevent OOM death. Can be an absolute byte count (e.g., \fB1073741824\fR) or a percentage of total system RAM (e.g., \fB60%\fR).
+.TP
+.BR \-r ", " \-\-rollback
+Roll back a previously interrupted or completed conversion by restoring the automatic Btrfs superblock backup. Run \fIbtrfs check\fR after using this function.
+.TP
+.BR \-V ", " \-\-version
+Print the software version.
+.TP
+.BR \-h ", " \-\-help
+Print the help menu and exit.
+.SH EXIT STATUS
+.B 0
+Success or successful dry-run equivalent.
+.br
+.B 1
+General failure, unrecoverable I/O error, invalid CLI flags, or Viability Audit rejection.
+.SH EXAMPLES
+Safely dry-run a volume to ensure successful mathematical conversion:
+.RS
+.B btrfs2ext4 --dry-run /dev/sda1
+.RE
+.PP
+Convert a live partition directly, defining an explicit memory boundary:
+.RS
+.B btrfs2ext4 -m 50% /dev/sda1
+.RE
+.PP
+Mount the newly converted Ext4 partition:
+.RS
+.B mount -t ext4 /dev/sda1 /mnt
+.RE
+.PP
+Rollback an aborted conversion:
+.RS
+.B btrfs2ext4 --rollback /dev/sda1
+.RE
+.SH SEE ALSO
+\fBfsck.ext4\fR(8), \fBmkfs.ext4\fR(8), \fBtune2fs\fR(8), \fBbtrfs-check\fR(8)
+.SH BUGS
+Multi-device Btrfs setups and partitions using sector sizes other than 4KiB are not supported in the v1 engine.
+.PP
+Please report all bugs on the project issue tracker.

@@ -1,0 +1,10 @@
+/home/yuka/Proyectos/btrfs2ext4/build/CMakeFiles/btrfs2ext4.dir
+/home/yuka/Proyectos/btrfs2ext4/build/CMakeFiles/test_stress.dir
+/home/yuka/Proyectos/btrfs2ext4/build/CMakeFiles/test_fuzz.dir
+/home/yuka/Proyectos/btrfs2ext4/build/CMakeFiles/test.dir
+/home/yuka/Proyectos/btrfs2ext4/build/CMakeFiles/edit_cache.dir
+/home/yuka/Proyectos/btrfs2ext4/build/CMakeFiles/rebuild_cache.dir
+/home/yuka/Proyectos/btrfs2ext4/build/CMakeFiles/list_install_components.dir
+/home/yuka/Proyectos/btrfs2ext4/build/CMakeFiles/install.dir
+/home/yuka/Proyectos/btrfs2ext4/build/CMakeFiles/install/local.dir
+/home/yuka/Proyectos/btrfs2ext4/build/CMakeFiles/install/strip.dir
