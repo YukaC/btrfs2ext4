@@ -76,6 +76,8 @@ Every feature in this tool—from the `mmap()` swap pagers and Bloom Filter fall
 | GCC / Clang (C11) | Compiler                            | ✅        |
 | `libuuid`         | UUID generation for Ext4 superblock | ✅        |
 | `zlib`            | CRC32 / compression support         | ✅        |
+| `libcrypto`       | SHA256 / BLAKE2b checksum support   | Optional  |
+| `libxxhash`       | xxHash64 checksum support           | Optional  |
 | `lzo2`            | LZO decompression (Btrfs data)      | Optional  |
 | `libzstd`         | Zstd decompression (Btrfs data)     | Optional  |
 | `pkg-config`      | Library discovery                   | ✅        |
@@ -168,7 +170,6 @@ sudo btrfs check /dev/sdX1
 
 - **Single-device only** — multi-device / RAID Btrfs is not supported
 - **4 KiB sector size only** — the only sector size supported in v1
-- **CRC32C checksums only** — xxhash / SHA-256 / BLAKE2 are not yet supported
 
 ---
 
@@ -192,7 +193,8 @@ btrfs2ext4/
 │   └── relocator.h              # Block-relocation engine
 ├── src/
 │   ├── btrfs/
-│   │   ├── superblock.c         # Superblock parser + CRC32C
+│   │   ├── superblock.c         # Superblock parser + Integrator
+│   │   ├── checksum.c           # CRC32C, xxHash64, SHA256, BLAKE2b validation
 │   │   ├── chunk_tree.c         # Chunk tree walker & resolver
 │   │   ├── btree.c              # Generic B-tree DFS walker
 │   │   └── fs_tree.c            # FS tree reader (inodes, dirs, extents)

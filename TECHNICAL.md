@@ -99,8 +99,8 @@ The top-level entry point is `btrfs2ext4_convert()` in `main.c`. It orchestrates
 
 1. Read 4 KiB at offset `0x10000` (the primary Btrfs superblock).
 2. Validate the magic number (`_BHRfS_M` little-endian).
-3. Verify the CRC32C checksum (Castagnoli polynomial `0x82F63B78`) over everything after the 32-byte `csum` field.
-4. Enforce v1 constraints: sector size = 4096, single-device only, CRC32C checksum type.
+3. Verify the checksum (CRC32C, xxHash64, SHA256, or BLAKE2b) over everything after the 32-byte `csum` field.
+4. Enforce v1 constraints: sector size = 4096, single-device only.
 
 ### 4.2 Chunk tree bootstrap (`chunk_tree.c`)
 
@@ -207,9 +207,9 @@ For each Btrfs data extent, resolve its physical block range and check whether a
 For each relocation entry:
 
 1. **Read** the source data (possibly multi-block).
-2. **CRC32C** the data.
+2. **Checksum** the data.
 3. **Write** to the destination.
-4. **Verify**: read-back and compare CRC32C (catches silent write corruption).
+4. **Verify**: read-back and compare checksum (catches silent write corruption).
 5. **Update in-memory extent maps** via a hash table mapping `physical_offset → (inode_idx, extent_idx)`. This avoids the previous O(inodes × extents) linear scan.
 6. **CoW Resolving**: For duplicate extents (Copy-on-Write clones from snapshots), the `extent_hash` tracking identifies shared logical boundaries. `btrfs2ext4` safely resolves multiple source logical mappings by physically allocating new Ext4 blocks and copying the data over, ensuring `e2fsck` does not report "Multiply-Claimed Blocks" corruption.
 7. Mark the entry as completed.
@@ -408,7 +408,7 @@ The journal (`journal.c`) provides a basic write-ahead log for block relocations
 ┌─────────────────────────┐
 │ journal_header          │  Magic: "B2E4" (0x42324534)
 │   magic, version,       │  State: CLEAN / IN_PROGRESS / ROLLBACK
-│   entry_count, state,   │  CRC32C header checksum
+│   entry_count, state,   │  Header checksum
 │   journal_offset, csum  │
 ├─────────────────────────┤
 │ relocation_entry[0]     │  src_offset, dst_offset, length,
@@ -462,7 +462,6 @@ All reads/writes use absolute byte offsets. Writes are automatically followed by
 
 - Single-device only (no multi-device / RAID)
 - 4 KiB sector size only
-- CRC32C checksums only (no xxhash / SHA-256 / BLAKE2)
 - Max ~157 million extents per file (depth-3 tree; depth chosen automatically)
 
 ### Planned optimisations (not yet implemented)
