@@ -12,11 +12,9 @@
 #include <string.h>
 
 #include "btrfs/btrfs_structures.h"
+#include "btrfs/checksum.h"
 #include "btrfs/chunk_tree.h"
 #include "device_io.h"
-
-/* Forward declaration */
-extern uint32_t crc32c(uint32_t crc, const void *buf, size_t len);
 
 /*
  * Callback type for B-tree leaf item processing.
@@ -42,6 +40,7 @@ typedef int (*btree_callback)(const struct btrfs_disk_key *key,
  *   root_logical   - logical address of the tree root node
  *   root_level     - level of the root node
  *   nodesize       - size of each node in bytes
+ *   csum_type      - checksum algorithm type (from superblock)
  *   callback       - function to call for each leaf item
  *   ctx            - user context passed to callback
  *
@@ -49,7 +48,7 @@ typedef int (*btree_callback)(const struct btrfs_disk_key *key,
  */
 int btree_walk(struct device *dev, const struct chunk_map *chunk_map,
                uint64_t root_logical, uint8_t root_level, uint32_t nodesize,
-               btree_callback callback, void *ctx) {
+               uint16_t csum_type, btree_callback callback, void *ctx) {
   /* Iterative DFS using explicit stack */
   struct stack_entry {
     uint64_t logical;
@@ -116,18 +115,14 @@ int btree_walk(struct device *dev, const struct chunk_map *chunk_map,
     uint8_t level = hdr->level;
 
     /* Validate header */
-    /* Check node checksum (CRC32C over everything after the csum field). */
-    uint32_t stored_csum;
-    memcpy(&stored_csum, hdr->csum, sizeof(uint32_t));
-    stored_csum = le32toh(stored_csum);
-    uint32_t computed_csum =
-        crc32c(0, (const uint8_t *)hdr + BTRFS_CSUM_SIZE,
-               nodesize - BTRFS_CSUM_SIZE);
-    if (stored_csum != computed_csum) {
+    /* Check node checksum using proper btrfs logic */
+    if (btrfs_verify_checksum(csum_type, hdr->csum,
+                              (const uint8_t *)hdr + BTRFS_CSUM_SIZE,
+                              nodesize - BTRFS_CSUM_SIZE) != 0) {
       fprintf(stderr,
               "btrfs2ext4: btree node checksum mismatch at logical 0x%lx "
-              "(stored=0x%08x computed=0x%08x)\n",
-              (unsigned long)node_logical, stored_csum, computed_csum);
+              "(algorithm: %s)\n",
+              (unsigned long)node_logical, btrfs_csum_name(csum_type));
       ret = -1;
       break;
     }

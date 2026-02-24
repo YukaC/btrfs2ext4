@@ -19,6 +19,19 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(UUID REQUIRED uuid)
 pkg_check_modules(ZLIB REQUIRED zlib)
 
+# Optional checksum libraries
+pkg_check_modules(CRYPTO libcrypto)
+if(CRYPTO_FOUND)
+    add_definitions(-DHAVE_LIBCRYPTO=1)
+    message(STATUS "Found libcrypto: enabling SHA256 and BLAKE2b support")
+endif()
+
+pkg_check_modules(XXHASH libxxhash)
+if(XXHASH_FOUND)
+    add_definitions(-DHAVE_LIBXXHASH=1)
+    message(STATUS "Found libxxhash: enabling XXHASH64 support")
+endif()
+
 # Optional compression libraries
 pkg_check_modules(LZO lzo2)
 pkg_check_modules(ZSTD libzstd)
@@ -29,6 +42,14 @@ include_directories(
     ${UUID_INCLUDE_DIRS}
     ${ZLIB_INCLUDE_DIRS}
 )
+
+if(CRYPTO_FOUND)
+    include_directories(${CRYPTO_INCLUDE_DIRS})
+endif()
+
+if(XXHASH_FOUND)
+    include_directories(${XXHASH_INCLUDE_DIRS})
+endif()
 
 if(LZO_FOUND)
     include_directories(${LZO_INCLUDE_DIRS})
@@ -44,6 +65,7 @@ endif()
 set(BTRFS2EXT4_SOURCES
     src/main.c
     src/device_io.c
+    src/btrfs/checksum.c
     src/btrfs/superblock.c
     src/btrfs/chunk_tree.c
     src/btrfs/btree.c
@@ -72,6 +94,14 @@ target_link_libraries(btrfs2ext4
     ${ZLIB_LIBRARIES}
 )
 
+if(CRYPTO_FOUND)
+    target_link_libraries(btrfs2ext4 ${CRYPTO_LIBRARIES})
+endif()
+
+if(XXHASH_FOUND)
+    target_link_libraries(btrfs2ext4 ${XXHASH_LIBRARIES})
+endif()
+
 if(LZO_FOUND)
     target_link_libraries(btrfs2ext4 ${LZO_LIBRARIES})
 endif()
@@ -90,6 +120,7 @@ enable_testing()
 # Shared source files (everything except main.c)
 set(BTRFS2EXT4_LIB_SOURCES
     src/device_io.c
+    src/btrfs/checksum.c
     src/btrfs/superblock.c
     src/btrfs/chunk_tree.c
     src/btrfs/btree.c
@@ -122,6 +153,15 @@ target_link_libraries(test_fuzz
     ${UUID_LIBRARIES}
     ${ZLIB_LIBRARIES}
 )
+
+if(CRYPTO_FOUND)
+    target_link_libraries(test_stress ${CRYPTO_LIBRARIES})
+    target_link_libraries(test_fuzz ${CRYPTO_LIBRARIES})
+endif()
+if(XXHASH_FOUND)
+    target_link_libraries(test_stress ${XXHASH_LIBRARIES})
+    target_link_libraries(test_fuzz ${XXHASH_LIBRARIES})
+endif()
 if(LZO_FOUND)
     target_link_libraries(test_stress ${LZO_LIBRARIES})
     target_link_libraries(test_fuzz ${LZO_LIBRARIES})
@@ -130,8 +170,28 @@ if(ZSTD_FOUND)
     target_link_libraries(test_stress ${ZSTD_LIBRARIES})
     target_link_libraries(test_fuzz ${ZSTD_LIBRARIES})
 endif()
+
+add_executable(test_checksum tests/test_checksum.c ${BTRFS2EXT4_LIB_SOURCES})
+target_link_libraries(test_checksum
+    ${UUID_LIBRARIES}
+    ${ZLIB_LIBRARIES}
+)
+if(CRYPTO_FOUND)
+    target_link_libraries(test_checksum ${CRYPTO_LIBRARIES})
+endif()
+if(XXHASH_FOUND)
+    target_link_libraries(test_checksum ${XXHASH_LIBRARIES})
+endif()
+if(LZO_FOUND)
+    target_link_libraries(test_checksum ${LZO_LIBRARIES})
+endif()
+if(ZSTD_FOUND)
+    target_link_libraries(test_checksum ${ZSTD_LIBRARIES})
+endif()
+
 add_test(NAME stress_test COMMAND test_stress)
 add_test(NAME fuzz_test COMMAND test_fuzz)
+add_test(NAME checksum_test COMMAND test_checksum)
 
 # Enable AddressSanitizer in debug builds for memory bug detection (if available)
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")

@@ -11,11 +11,9 @@
 #include <string.h>
 
 #include "btrfs/btrfs_structures.h"
+#include "btrfs/checksum.h"
 #include "btrfs/chunk_tree.h"
 #include "device_io.h"
-
-/* CRC32C from superblock.c */
-extern uint32_t crc32c(uint32_t crc, const void *buf, size_t len);
 
 #define INITIAL_CHUNK_CAPACITY 64
 
@@ -71,8 +69,7 @@ int chunk_map_init_from_superblock(struct chunk_map *map,
 
   /* Parse sys_chunk_array from superblock */
   uint32_t array_size = le32toh(sb->sys_chunk_array_size);
-  if (array_size == 0 ||
-      array_size > BTRFS_SYSTEM_CHUNK_ARRAY_SIZE) {
+  if (array_size == 0 || array_size > BTRFS_SYSTEM_CHUNK_ARRAY_SIZE) {
     fprintf(stderr,
             "btrfs2ext4: invalid sys_chunk_array_size=%u "
             "(max=%u) — superblock corrupt or unsupported\n",
@@ -156,6 +153,7 @@ int chunk_map_populate(struct chunk_map *map, struct device *dev,
   uint64_t chunk_root_logical = le64toh(sb->chunk_root);
   uint8_t chunk_root_level = sb->chunk_root_level;
   uint32_t nodesize = le32toh(sb->nodesize);
+  uint16_t csum_type = le16toh(sb->csum_type);
 
   printf("Walking chunk tree (root=0x%lx, level=%u, nodesize=%u)...\n",
          (unsigned long)chunk_root_logical, chunk_root_level, nodesize);
@@ -203,17 +201,13 @@ int chunk_map_populate(struct chunk_map *map, struct device *dev,
     uint8_t level = hdr->level;
 
     /* Validate checksum for chunk tree nodes as well */
-    uint32_t stored_csum;
-    memcpy(&stored_csum, hdr->csum, sizeof(uint32_t));
-    stored_csum = le32toh(stored_csum);
-    uint32_t computed_csum =
-        crc32c(0, (const uint8_t *)hdr + BTRFS_CSUM_SIZE,
-               nodesize - BTRFS_CSUM_SIZE);
-    if (stored_csum != computed_csum) {
+    if (btrfs_verify_checksum(csum_type, hdr->csum,
+                              (const uint8_t *)hdr + BTRFS_CSUM_SIZE,
+                              nodesize - BTRFS_CSUM_SIZE) != 0) {
       fprintf(stderr,
               "btrfs2ext4: chunk tree node checksum mismatch at logical 0x%lx "
-              "(stored=0x%08x computed=0x%08x)\n",
-              (unsigned long)node_logical, stored_csum, computed_csum);
+              "(algorithm: %s)\n",
+              (unsigned long)node_logical, btrfs_csum_name(csum_type));
       free(node_buf);
       return -1;
     }

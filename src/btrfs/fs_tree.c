@@ -6,11 +6,11 @@
  */
 
 #include <endian.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <limits.h>
 
 #include "btrfs/btrfs_reader.h"
 #include "btrfs/btrfs_structures.h"
@@ -180,7 +180,8 @@ struct file_entry *btrfs_find_inode(struct btrfs_fs_info *fs_info,
   if (fe)
     return fe;
 
-  /* Fallback: linear scan (used during very early phases or if hash disabled) */
+  /* Fallback: linear scan (used during very early phases or if hash disabled)
+   */
   for (uint32_t i = 0; i < fs_info->inode_count; i++) {
     if (fs_info->inode_table[i]->ino == ino)
       return fs_info->inode_table[i];
@@ -214,7 +215,8 @@ typedef int (*btree_callback)(const struct btrfs_disk_key *key,
                               const void *data, uint32_t data_size, void *ctx);
 extern int btree_walk(struct device *dev, const struct chunk_map *chunk_map,
                       uint64_t root_logical, uint8_t root_level,
-                      uint32_t nodesize, btree_callback callback, void *ctx);
+                      uint32_t nodesize, uint16_t csum_type,
+                      btree_callback callback, void *ctx);
 
 /* ========================================================================
  * CoW Deduplication Hash Table (Phase 4.1)
@@ -621,7 +623,8 @@ int btrfs_read_fs(struct device *dev, struct btrfs_fs_info *fs_info) {
   memset(&rctx, 0, sizeof(rctx));
 
   if (btree_walk(dev, fs_info->chunk_map, root_tree_logical, root_tree_level,
-                 nodesize, root_tree_callback, &rctx) < 0) {
+                 nodesize, le16toh(fs_info->sb.csum_type), root_tree_callback,
+                 &rctx) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to walk root tree\n");
     return -1;
   }
@@ -639,7 +642,8 @@ int btrfs_read_fs(struct device *dev, struct btrfs_fs_info *fs_info) {
   cow_hash_init(&fctx.cow_track, 1024);
 
   if (btree_walk(dev, fs_info->chunk_map, rctx.fs_tree_bytenr,
-                 rctx.fs_tree_level, nodesize, fs_tree_callback, &fctx) < 0) {
+                 rctx.fs_tree_level, nodesize, le16toh(fs_info->sb.csum_type),
+                 fs_tree_callback, &fctx) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to walk FS tree\n");
     free(fctx.cow_track.buckets);
     return -1;
@@ -657,7 +661,8 @@ int btrfs_read_fs(struct device *dev, struct btrfs_fs_info *fs_info) {
 
   if (rctx.found_extent) {
     if (btree_walk(dev, fs_info->chunk_map, rctx.extent_tree_bytenr,
-                   rctx.extent_tree_level, nodesize, extent_tree_callback,
+                   rctx.extent_tree_level, nodesize,
+                   le16toh(fs_info->sb.csum_type), extent_tree_callback,
                    &ectx) < 0) {
       fprintf(stderr, "btrfs2ext4: warning: extent tree walk failed, "
                       "using FS tree extents only\n");

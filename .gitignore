@@ -1,0 +1,14 @@
+# Build and IDE files
+build/
+.cursor/
+btrfs2ext4
+test_stress
+test_fuzz
+test_checksum
+compile_commands.json
+.cache/
+
+# Object files
+*.o
+*.a
+*.so

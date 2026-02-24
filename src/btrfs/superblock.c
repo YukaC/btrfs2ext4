@@ -10,37 +10,8 @@
 
 #include "btrfs/btrfs_reader.h"
 #include "btrfs/btrfs_structures.h"
+#include "btrfs/checksum.h"
 #include "device_io.h"
-
-/* CRC32C (Castagnoli) implementation */
-static uint32_t crc32c_table[256];
-static int crc32c_initialized = 0;
-
-static void crc32c_init_table(void) {
-  uint32_t i, j, crc;
-  for (i = 0; i < 256; i++) {
-    crc = i;
-    for (j = 0; j < 8; j++) {
-      if (crc & 1)
-        crc = (crc >> 1) ^ 0x82F63B78;
-      else
-        crc >>= 1;
-    }
-    crc32c_table[i] = crc;
-  }
-  crc32c_initialized = 1;
-}
-
-uint32_t crc32c(uint32_t crc, const void *buf, size_t len) {
-  const uint8_t *p = (const uint8_t *)buf;
-  if (!crc32c_initialized)
-    crc32c_init_table();
-
-  crc = ~crc;
-  while (len--)
-    crc = crc32c_table[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
-  return ~crc;
-}
 
 /*
  * Validate and parse the btrfs superblock.
@@ -63,28 +34,20 @@ int btrfs_read_superblock(struct device *dev, struct btrfs_super_block *sb) {
     return -1;
   }
 
-  /* Validate checksum (CRC32C of everything after the csum field) */
+  /* Validate checksum (CRC32C or others supported) */
   uint16_t csum_type = le16toh(sb->csum_type);
-  if (csum_type != BTRFS_CSUM_TYPE_CRC32) {
-    fprintf(
-        stderr,
-        "btrfs2ext4: unsupported checksum type %u (only CRC32C supported)\n",
-        csum_type);
+  if (btrfs_csum_size(csum_type) == 0) {
+    fprintf(stderr, "btrfs2ext4: unsupported checksum type %u\n", csum_type);
     return -1;
   }
 
-  uint32_t stored_csum;
-  memcpy(&stored_csum, sb->csum, sizeof(uint32_t));
-  stored_csum = le32toh(stored_csum);
-
-  uint32_t computed_csum = crc32c(0, (const uint8_t *)sb + BTRFS_CSUM_SIZE,
-                                  sizeof(*sb) - BTRFS_CSUM_SIZE);
-
-  if (stored_csum != computed_csum) {
+  if (btrfs_verify_checksum(csum_type, sb->csum,
+                            (const uint8_t *)sb + BTRFS_CSUM_SIZE,
+                            sizeof(*sb) - BTRFS_CSUM_SIZE) != 0) {
     fprintf(stderr,
-            "btrfs2ext4: superblock checksum mismatch: stored=0x%08x "
-            "computed=0x%08x\n",
-            stored_csum, computed_csum);
+            "btrfs2ext4: superblock checksum mismatch "
+            "(algorithm: %s)\n",
+            btrfs_csum_name(csum_type));
     return -1;
   }
 
@@ -103,7 +66,7 @@ int btrfs_read_superblock(struct device *dev, struct btrfs_super_block *sb) {
   printf("  Num devices: %lu\n", (unsigned long)le64toh(sb->num_devices));
   printf("  Root tree:   0x%lx\n", (unsigned long)le64toh(sb->root));
   printf("  Chunk tree:  0x%lx\n", (unsigned long)le64toh(sb->chunk_root));
-  printf("  Csum type:   %u (CRC32C)\n", csum_type);
+  printf("  Csum type:   %u (%s)\n", csum_type, btrfs_csum_name(csum_type));
   printf("========================\n\n");
 
   /* Validate sector size */
