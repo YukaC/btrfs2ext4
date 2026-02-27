@@ -37,12 +37,32 @@ static struct file_entry *file_entry_create(uint64_t ino) {
 
 static int file_entry_add_extent(struct file_entry *fe,
                                  const struct file_extent *ext) {
+  /* Phase 2.4: Adjacent Extent Coalescing */
+  if (fe->extent_count > 0) {
+    struct file_extent *last = &fe->extents[fe->extent_count - 1];
+
+    if (last->type != BTRFS_FILE_EXTENT_INLINE &&
+        ext->type != BTRFS_FILE_EXTENT_INLINE &&
+        last->compression == ext->compression &&
+        last->file_offset + last->num_bytes == ext->file_offset &&
+        last->disk_bytenr != 0 && ext->disk_bytenr != 0 &&
+        last->disk_bytenr + last->disk_num_bytes == ext->disk_bytenr) {
+
+      last->num_bytes += ext->num_bytes;
+      last->disk_num_bytes += ext->disk_num_bytes;
+      last->ram_bytes += ext->ram_bytes;
+      return 0;
+    }
+  }
+
   if (fe->extent_count >= fe->extent_capacity) {
     uint32_t new_cap = fe->extent_capacity * 2;
     struct file_extent *new_ext =
         realloc(fe->extents, new_cap * sizeof(struct file_extent));
-    if (!new_ext)
+    if (!new_ext) {
+      fprintf(stderr, "btrfs2ext4: OOM reallocating file extents\n");
       return -1;
+    }
     fe->extents = new_ext;
     fe->extent_capacity = new_cap;
   }
@@ -57,8 +77,10 @@ static int file_entry_add_child(struct file_entry *parent,
     uint32_t new_cap = parent->child_capacity ? parent->child_capacity * 2 : 16;
     struct dir_entry_link *new_children =
         realloc(parent->children, new_cap * sizeof(struct dir_entry_link));
-    if (!new_children)
+    if (!new_children) {
+      fprintf(stderr, "btrfs2ext4: OOM reallocating dir children\n");
       return -1;
+    }
     parent->children = new_children;
     parent->child_capacity = new_cap;
   }
@@ -157,18 +179,22 @@ static int fs_info_add_inode(struct btrfs_fs_info *fs_info,
         fs_info->inode_capacity ? fs_info->inode_capacity * 2 : 256;
     struct file_entry **new_table =
         realloc(fs_info->inode_table, new_cap * sizeof(struct file_entry *));
-    if (!new_table)
+    if (!new_table) {
+      fprintf(stderr, "btrfs2ext4: OOM reallocating inode_table\n");
       return -1;
+    }
     fs_info->inode_table = new_table;
     fs_info->inode_capacity = new_cap;
   }
   fs_info->inode_table[fs_info->inode_count++] = fe;
 
   /* Best-effort insertion into hash table; fall back to linear scan on OOM */
-  if (ino_ht_insert(fs_info, fe) < 0)
+  if (fs_info->use_hash && ino_ht_insert(fs_info, fe) < 0) {
     fprintf(stderr,
             "btrfs2ext4: warning: inode hash table disabled (OOM), falling "
             "back to linear lookups\n");
+    fs_info->use_hash = 0;
+  }
 
   return 0;
 }
@@ -176,9 +202,11 @@ static int fs_info_add_inode(struct btrfs_fs_info *fs_info,
 struct file_entry *btrfs_find_inode(struct btrfs_fs_info *fs_info,
                                     uint64_t ino) {
   /* Fast path: use hash table if available */
-  struct file_entry *fe = ino_ht_get(fs_info, ino);
-  if (fe)
-    return fe;
+  if (fs_info->use_hash) {
+    struct file_entry *fe = ino_ht_get(fs_info, ino);
+    if (fe)
+      return fe;
+  }
 
   /* Fallback: linear scan (used during very early phases or if hash disabled)
    */
@@ -541,8 +569,10 @@ static int used_block_map_add(struct used_block_map *map, uint64_t start,
     uint32_t new_cap = map->capacity ? map->capacity * 2 : 256;
     struct used_extent *new_ext =
         realloc(map->extents, new_cap * sizeof(struct used_extent));
-    if (!new_ext)
+    if (!new_ext) {
+      fprintf(stderr, "btrfs2ext4: OOM reallocating used block map\n");
       return -1;
+    }
     map->extents = new_ext;
     map->capacity = new_cap;
   }
@@ -591,6 +621,7 @@ extern int btrfs_read_superblock(struct device *dev,
 int btrfs_read_fs(struct device *dev, struct btrfs_fs_info *fs_info) {
   memset(fs_info, 0, sizeof(*fs_info));
   fs_info->dev = dev;
+  fs_info->use_hash = 1;
 
   printf("=== Phase 1: Reading Btrfs Metadata ===\n\n");
 
@@ -615,6 +646,7 @@ int btrfs_read_fs(struct device *dev, struct btrfs_fs_info *fs_info) {
 
   /* Step 4: Walk root tree to find FS tree and extent tree roots */
   printf("Step 4/6: Walking root tree...\n");
+  posix_fadvise(dev->fd, 0, 0, POSIX_FADV_SEQUENTIAL);
   uint64_t root_tree_logical = le64toh(fs_info->sb.root);
   uint8_t root_tree_level = fs_info->sb.root_level;
   uint32_t nodesize = le32toh(fs_info->sb.nodesize);
@@ -802,10 +834,12 @@ void btrfs_free_fs(struct btrfs_fs_info *fs_info) {
   }
 
   /* Free used block map */
-  free(fs_info->used_blocks.extents);
+  if (fs_info->used_blocks.extents)
+    free(fs_info->used_blocks.extents);
 
   /* Free inode hash table */
-  free(fs_info->ino_ht.buckets);
+  if (fs_info->ino_ht.buckets)
+    free(fs_info->ino_ht.buckets);
   fs_info->ino_ht.buckets = NULL;
   fs_info->ino_ht.capacity = 0;
   fs_info->ino_ht.count = 0;

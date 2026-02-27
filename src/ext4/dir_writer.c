@@ -223,7 +223,8 @@ int ext4_write_directories(struct device *dev, const struct ext4_layout *layout,
       dotdot->name[1] = '.';
 
       struct ext4_dx_root_info *info = (void *)(dir_blocks[0] + 24);
-      info->hash_version = 0; /* EXT4_HASH_LEGACY */
+      info->hash_version =
+          EXT4_HASH_HALF_MD4; /* Must match sb.s_def_hash_version */
       info->info_length = 8;
       info->indirect_levels = 1; /* 2-level HTree */
       info->unused_flags = 0;
@@ -302,15 +303,23 @@ int ext4_write_directories(struct device *dev, const struct ext4_layout *layout,
 
         if (num_blocks + 2 >= max_dir_blocks) {
           uint32_t new_max = max_dir_blocks * 2;
+          /* Bug I fix: Use temp variables for realloc to avoid dangling
+           * pointers if one succeeds and the other fails. */
           uint64_t *new_nums =
               realloc(dir_block_nums, new_max * sizeof(uint64_t));
-          uint8_t **new_blks = realloc(dir_blocks, new_max * sizeof(uint8_t *));
-          if (!new_nums || !new_blks) {
+          if (!new_nums) {
             fprintf(stderr,
                     "btrfs2ext4: OOM reallocating directory pointer array\n");
             break;
           }
           dir_block_nums = new_nums;
+
+          uint8_t **new_blks = realloc(dir_blocks, new_max * sizeof(uint8_t *));
+          if (!new_blks) {
+            fprintf(stderr,
+                    "btrfs2ext4: OOM reallocating directory block array\n");
+            break;
+          }
           dir_blocks = new_blks;
 
           /* Need to safely zero out the new trailing portion of the array */
@@ -389,10 +398,51 @@ int ext4_write_directories(struct device *dev, const struct ext4_layout *layout,
     /* Finalize last block */
     finalize_dir_block(dir_blocks[num_blocks - 1], offset, block_size);
 
-    /* Write all directory blocks to disk */
-    for (uint32_t b = 0; b < num_blocks; b++) {
-      if (device_write(dev, dir_block_nums[b] * block_size, dir_blocks[b],
-                       block_size) < 0) {
+    /* Bug J fix: Write contiguous directory blocks in a single I/O.
+     * If allocator placed them sequentially, one device_write replaces
+     * potentially hundreds of 4KB pwrite() calls. */
+    int contiguous = 1;
+    for (uint32_t b = 1; b < num_blocks; b++) {
+      if (dir_block_nums[b] != dir_block_nums[b - 1] + 1) {
+        contiguous = 0;
+        break;
+      }
+    }
+
+    if (contiguous && num_blocks > 1) {
+      uint8_t *combined = malloc((size_t)num_blocks * block_size);
+      if (combined) {
+        for (uint32_t b = 0; b < num_blocks; b++)
+          memcpy(combined + (size_t)b * block_size, dir_blocks[b], block_size);
+        if (device_write(dev, dir_block_nums[0] * block_size, combined,
+                         (size_t)num_blocks * block_size) < 0) {
+          free(combined);
+          for (uint32_t j = 0; j < num_blocks; j++)
+            free(dir_blocks[j]);
+          free(dir_blocks);
+          free(dir_block_nums);
+          return -1;
+        }
+        free(combined);
+      } else {
+        /* OOM fallback: write per-block with batch API */
+        goto write_per_block;
+      }
+    } else {
+    write_per_block:
+      /* Use batch API: queue all blocks, submit in one syscall */
+      device_write_batch_begin(dev);
+      for (uint32_t b = 0; b < num_blocks; b++) {
+        if (device_write_batch_add(dev, dir_block_nums[b] * block_size,
+                                   dir_blocks[b], block_size) < 0) {
+          for (uint32_t j = 0; j < num_blocks; j++)
+            free(dir_blocks[j]);
+          free(dir_blocks);
+          free(dir_block_nums);
+          return -1;
+        }
+      }
+      if (device_write_batch_submit(dev) < 0) {
         for (uint32_t j = 0; j < num_blocks; j++)
           free(dir_blocks[j]);
         free(dir_blocks);
@@ -414,46 +464,148 @@ int ext4_write_directories(struct device *dev, const struct ext4_layout *layout,
       uint64_t inode_offset = bg->inode_table_start * block_size +
                               (uint64_t)ino_local * layout->inode_size;
 
-      struct ext4_inode tmp_inode;
-      if (device_read(dev, inode_offset, &tmp_inode, sizeof(tmp_inode)) == 0) {
-        /* Build extent tree for directory data blocks */
-        struct ext4_extent_header *eh =
-            (struct ext4_extent_header *)tmp_inode.i_block;
-        eh->eh_magic = htole16(EXT4_EXT_MAGIC);
-        eh->eh_depth = htole16(0);
+      /* Bug K fix: Build inode directly instead of Read-Modify-Write.
+       * We construct the directory inode in RAM from scratch, avoiding
+       * the device_read() that doubled I/O for every directory. */
+      uint8_t *inode_buf = calloc(1, layout->inode_size);
+      if (inode_buf) {
+        struct ext4_inode *tmp_inode = (struct ext4_inode *)inode_buf;
 
-        uint16_t max_inline = 4;
-        uint16_t n_extents =
-            (num_blocks <= max_inline) ? (uint16_t)num_blocks : max_inline;
-        eh->eh_entries = htole16(n_extents);
-        eh->eh_max = htole16(max_inline);
+        /* Set directory inode fields */
+        tmp_inode->i_mode = htole16(040755);   /* Directory, rwxr-xr-x */
+        tmp_inode->i_links_count = htole16(2); /* . and .. */
+        tmp_inode->i_flags = htole32(EXT4_EXTENTS_FL | EXT4_INDEX_FL);
 
-        struct ext4_extent *ext =
-            (struct ext4_extent *)((uint8_t *)tmp_inode.i_block +
-                                   sizeof(struct ext4_extent_header));
+        /* Directory size = num_blocks * block_size */
+        uint64_t dir_size = (uint64_t)num_blocks * block_size;
+        tmp_inode->i_size_lo = htole32((uint32_t)(dir_size & 0xFFFFFFFF));
+        tmp_inode->i_size_high = htole32((uint32_t)(dir_size >> 32));
 
-        for (uint16_t e = 0; e < n_extents; e++) {
-          ext[e].ee_block = htole32(e); /* Each block maps to file_block e */
-          ext[e].ee_len = htole16(1);
-          ext[e].ee_start_lo =
-              htole32((uint32_t)(dir_block_nums[e] & 0xFFFFFFFF));
-          ext[e].ee_start_hi = htole16((uint16_t)(dir_block_nums[e] >> 32));
+        /* Block count (in 512-byte sectors) */
+        uint64_t sectors = (dir_size + 511) / 512;
+        tmp_inode->i_blocks_lo = htole32((uint32_t)(sectors & 0xFFFFFFFF));
+        tmp_inode->i_blocks_high = htole16((uint16_t)(sectors >> 32));
+
+        /* Compile blocks into contiguous extents */
+        struct _dir_ext {
+          uint32_t len;
+          uint64_t phys;
+        } *exts = calloc(num_blocks, sizeof(*exts));
+        uint16_t n_extents = 0;
+
+        if (num_blocks > 0) {
+          exts[0].len = 1;
+          exts[0].phys = dir_block_nums[0];
+          n_extents = 1;
+          for (uint32_t b = 1; b < num_blocks; b++) {
+            if (dir_block_nums[b] ==
+                    exts[n_extents - 1].phys + exts[n_extents - 1].len &&
+                exts[n_extents - 1].len < 32768) {
+              exts[n_extents - 1].len++;
+            } else {
+              exts[n_extents].len = 1;
+              exts[n_extents].phys = dir_block_nums[b];
+              n_extents++;
+            }
+          }
         }
 
-        /* Update directory size */
-        uint64_t dir_size = (uint64_t)num_blocks * block_size;
-        tmp_inode.i_size_lo = htole32((uint32_t)(dir_size & 0xFFFFFFFF));
-        tmp_inode.i_size_high = htole32((uint32_t)(dir_size >> 32));
+        uint16_t max_inline = 4;
 
-        /* Update block count (in 512-byte sectors) */
-        uint64_t sectors = (dir_size + 511) / 512;
-        tmp_inode.i_blocks_lo = htole32((uint32_t)(sectors & 0xFFFFFFFF));
-        tmp_inode.i_blocks_high = htole16((uint16_t)(sectors >> 32));
+        if (n_extents <= max_inline) {
+          /* Inline extent tree (depth=0) */
+          struct ext4_extent_header *eh =
+              (struct ext4_extent_header *)tmp_inode->i_block;
+          eh->eh_magic = htole16(EXT4_EXT_MAGIC);
+          eh->eh_depth = htole16(0);
+          eh->eh_entries = htole16(n_extents);
+          eh->eh_max = htole16(max_inline);
 
-        device_write(dev, inode_offset, &tmp_inode, sizeof(tmp_inode));
+          struct ext4_extent *ext =
+              (struct ext4_extent *)((uint8_t *)tmp_inode->i_block +
+                                     sizeof(struct ext4_extent_header));
+
+          uint32_t logical_block = 0;
+          for (uint16_t e = 0; e < n_extents; e++) {
+            ext[e].ee_block = htole32(logical_block);
+            ext[e].ee_len = htole16((uint16_t)exts[e].len);
+            ext[e].ee_start_lo = htole32((uint32_t)(exts[e].phys & 0xFFFFFFFF));
+            ext[e].ee_start_hi = htole16((uint16_t)(exts[e].phys >> 32));
+            logical_block += exts[e].len;
+          }
+        } else {
+          /* Depth=1 extent tree */
+          uint64_t leaf_block = ext4_alloc_block(alloc, layout);
+          if (leaf_block == (uint64_t)-1) {
+            fprintf(stderr, "btrfs2ext4: no space for dir extent tree leaf\n");
+            free(exts);
+            free(inode_buf);
+            goto cleanup;
+          }
+
+          struct ext4_extent_header *root_eh =
+              (struct ext4_extent_header *)tmp_inode->i_block;
+          root_eh->eh_magic = htole16(EXT4_EXT_MAGIC);
+          root_eh->eh_depth = htole16(1);
+          root_eh->eh_entries = htole16(1);
+          root_eh->eh_max = htole16(max_inline);
+
+          struct ext4_extent_idx *idx =
+              (struct ext4_extent_idx *)((uint8_t *)tmp_inode->i_block +
+                                         sizeof(struct ext4_extent_header));
+          idx->ei_block = htole32(0);
+          idx->ei_leaf_lo = htole32((uint32_t)(leaf_block & 0xFFFFFFFF));
+          idx->ei_leaf_hi = htole16((uint16_t)(leaf_block >> 32));
+          idx->ei_unused = 0;
+
+          /* Create leaf block */
+          uint8_t *leaf_buf = calloc(1, block_size);
+          struct ext4_extent_header *leaf_eh =
+              (struct ext4_extent_header *)leaf_buf;
+          leaf_eh->eh_magic = htole16(EXT4_EXT_MAGIC);
+          leaf_eh->eh_depth = htole16(0);
+          leaf_eh->eh_entries = htole16(n_extents);
+          leaf_eh->eh_max =
+              htole16((block_size - sizeof(struct ext4_extent_header)) /
+                      sizeof(struct ext4_extent));
+
+          struct ext4_extent *leaf_ext =
+              (struct ext4_extent *)(leaf_buf +
+                                     sizeof(struct ext4_extent_header));
+
+          uint32_t logical_block = 0;
+          for (uint16_t e = 0; e < n_extents; e++) {
+            leaf_ext[e].ee_block = htole32(logical_block);
+            leaf_ext[e].ee_len = htole16((uint16_t)exts[e].len);
+            leaf_ext[e].ee_start_lo =
+                htole32((uint32_t)(exts[e].phys & 0xFFFFFFFF));
+            leaf_ext[e].ee_start_hi = htole16((uint16_t)(exts[e].phys >> 32));
+            logical_block += exts[e].len;
+          }
+
+          if (device_write(dev, leaf_block * block_size, leaf_buf, block_size) <
+              0) {
+            fprintf(stderr,
+                    "btrfs2ext4: failed to write dir extent tree leaf\n");
+          }
+          free(leaf_buf);
+
+          /* Extra dir block adds to inode block count */
+          uint64_t sectors_including_leaf =
+              ((dir_size + block_size) + 511) / 512;
+          tmp_inode->i_blocks_lo =
+              htole32((uint32_t)(sectors_including_leaf & 0xFFFFFFFF));
+          tmp_inode->i_blocks_high =
+              htole16((uint16_t)(sectors_including_leaf >> 32));
+        }
+
+        device_write(dev, inode_offset, inode_buf, layout->inode_size);
+        free(exts);
+        free(inode_buf);
       }
     }
 
+  cleanup:
     /* Cleanup */
     for (uint32_t b = 0; b < num_blocks; b++)
       free(dir_blocks[b]);

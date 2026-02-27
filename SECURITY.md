@@ -1,42 +1,41 @@
-# btrfs2ext4 Security Policy
+# Security Policy
 
-## Supported Versions
+## Supported versions
 
-Currently only the `master` branch is receiving proactive security audits and hardening updates.
+Only the `master` branch receives active fixes.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| `0.1.x` | :white_check_mark: |
-| `< 0.1` | :x:                |
-
----
-
-## Threat Model
-
-`btrfs2ext4` operates as a filesystem metadata parser and binary format translator. Crucially, the tool often operates with root/sudo privileges (required to access raw block devices `BLKGETSIZE64` operations), meaning an exploitation could compromise the host OS.
-
-The tool intentionally assumes **all Btrfs data structures are unconditionally malicious, corrupted, or crafted by an attacker**.
-
-The engine implements several explicit defenses to combat this:
-
-1. **Mathematical Fuzzing Protection:** The `test_fuzz.c` suite continuously mutates B-Tree bounds, depth metrics, CRC payloads, and overlapping physical extents to actively seek crash states or out-of-bounds `memcpy` behavior.
-2. **Zero-Trust Input Parsing:** Length checks, bounds clipping, stack/buffer overflow limits, and explicit integer overflow prevention mechanisms (via GCC `__builtin_add_overflow`) intercept corrupt physical size claims to avoid exploitable execution logic.
-3. **Hardened Tree Traversal:** Recursive structures are mitigated via explicit stack-bounded loops (DFS max array trackers), protecting against deep stack exhaustion crashes intended to disrupt kernel memory boundaries.
+| Version | Supported |
+| ------- | --------- |
+| `0.2.x` | ✅        |
+| `< 0.2` | ❌        |
 
 ---
 
-## Reporting a Vulnerability
+## Threat model
 
-If you've found a way to reliably execute arbitrary code via a malformed filesystem image, discover an integer overflow path we missed, or determine a mechanism capable of bypassing the ASan boundary checks and tricking the engine into destroying an unintended disk—**please do not open a public issue.**
+`btrfs2ext4` runs as root and reads raw Btrfs on-disk structures. This makes it an attractive attack surface: a maliciously crafted filesystem image could potentially cause memory corruption, stack exhaustion, or arbitrary writes.
 
-Instead, please send an immediate, detailed email covering the attack vector or vulnerability to:
+The tool treats **all Btrfs input as untrusted by default:**
 
-📧 **agusyuk25@gmail.com**
+- Length and bounds checks on every B-tree item before access
+- Integer overflow guards via GCC `__builtin_add_overflow`
+- Explicit depth caps on recursive tree traversal (no unbounded stack growth)
+- A fuzz suite (`test_stress.c`) that feeds malformed headers, truncated nodes, loops, and out-of-bounds references to all reader APIs
 
-**Please include:**
+That said — this is a hobby project built quickly. There are almost certainly gaps. If you find one, please report it.
 
-1. A brief description of the vulnerability and attack vector.
-2. The specific file, struct, or API call exhibiting the flaw.
-3. (Crucial) Instructions on how to reproduce the issue, or ideally, a minimal Btrfs hex-dump/image that triggers the error context.
+---
 
-You should receive a response within 48 hours. Validated vulnerabilities will result in an immediate hotfix push, followed by a public CVE disclosure if appropriate. Thank you for making file conversions safer for everyone!
+## Reporting a vulnerability
+
+If you find something exploitable — a memory corruption path, an integer overflow that bypasses the guards, a way to trick the engine into writing to unintended blocks — **please do not open a public issue.**
+
+Send an email to: **agusyuk25@gmail.com**
+
+Include:
+
+1. A brief description of the vulnerability and how you found it
+2. The specific file, struct, or code path involved
+3. A minimal reproducer if possible (a Btrfs image or hex dump that triggers it)
+
+I'll respond within 48 hours. Confirmed vulnerabilities will get a fix pushed immediately, and I'll file a public CVE if appropriate.

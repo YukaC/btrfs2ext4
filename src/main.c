@@ -6,11 +6,13 @@
 
 #include <dirent.h>
 #include <getopt.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "btrfs/btrfs_reader.h"
@@ -20,9 +22,9 @@
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_writer.h"
 #include "journal.h"
+#include "mem_tracker.h"
 #include "migration_map.h"
 #include "relocator.h"
-#include "mem_tracker.h"
 
 #define VERSION "0.1.0-alpha"
 
@@ -58,7 +60,49 @@ void btrfs2ext4_version(void) { printf("btrfs2ext4 version " VERSION "\n"); }
 
 static void progress_print(const char *phase, uint32_t percent,
                            const char *detail) {
-  printf("[%s] %u%% %s\n", phase, percent, detail ? detail : "");
+  static struct timespec start_time;
+  static int started = 0;
+  static const char *last_phase = NULL;
+
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+
+  /* Reset timer on phase change */
+  if (!started || !last_phase || strcmp(phase, last_phase) != 0) {
+    start_time = now;
+    started = 1;
+    last_phase = phase;
+  }
+
+  /* Build progress bar: [████████░░░░░░░░] 45% */
+  char bar[21]; /* 20 chars + null */
+  uint32_t filled = percent / 5;
+  for (uint32_t i = 0; i < 20; i++)
+    bar[i] = (i < filled) ? '#' : '-';
+  bar[20] = '\0';
+
+  /* Calculate ETA */
+  double elapsed = (double)(now.tv_sec - start_time.tv_sec) +
+                   (double)(now.tv_nsec - start_time.tv_nsec) / 1e9;
+  char eta_buf[32] = "";
+  if (percent > 0 && percent < 100 && elapsed > 1.0) {
+    double total_est = elapsed * 100.0 / (double)percent;
+    double remaining = total_est - elapsed;
+    if (remaining > 3600)
+      snprintf(eta_buf, sizeof(eta_buf), " ETA: %.0fh%.0fm", remaining / 3600,
+               fmod(remaining, 3600) / 60);
+    else if (remaining > 60)
+      snprintf(eta_buf, sizeof(eta_buf), " ETA: %.0fm%.0fs", remaining / 60,
+               fmod(remaining, 60));
+    else
+      snprintf(eta_buf, sizeof(eta_buf), " ETA: %.0fs", remaining);
+  }
+
+  printf("\r[%s] [%s] %3u%%%s %s", phase, bar, percent, eta_buf,
+         detail ? detail : "");
+  if (percent >= 100)
+    printf("\n");
+  fflush(stdout);
 }
 
 /* ========================================================================
@@ -285,24 +329,29 @@ int btrfs2ext4_convert(const struct convert_options *opts,
     goto cleanup;
   }
 
-  if (!opts->dry_run && reloc_plan.count > 0) {
+  if (!opts->dry_run) {
     if (progress)
       progress("Pass 2", 60, "Saving migration map and btrfs backup...");
 
-    /* Save original btrfs superblock and block relocation map for robust
-     * rollback */
+    /* plan.v1 fix: Save migration map UNCONDITIONALLY (even when count=0).
+     * This ensures a rollback checkpoint exists before Pass 3 writes begin,
+     * even if no blocks needed relocation. Without this, a crash during
+     * Pass 3 would leave the filesystem in an unrecoverable state. */
     if (migration_map_save(&dev, &reloc_plan) < 0) {
       fprintf(stderr, "btrfs2ext4: failed to save migration map (aborting to "
                       "prevent data loss)\n");
       goto cleanup;
     }
 
-    if (progress)
-      progress("Pass 2", 70, "Relocating conflicting blocks...");
+    if (reloc_plan.count > 0) {
+      if (progress)
+        progress("Pass 2", 70, "Relocating conflicting blocks...");
 
-    if (relocator_execute(&reloc_plan, &dev, &fs_info, layout.block_size) < 0) {
-      fprintf(stderr, "btrfs2ext4: block relocation failed!\n");
-      goto cleanup;
+      if (relocator_execute(&reloc_plan, &dev, &fs_info, layout.block_size) <
+          0) {
+        fprintf(stderr, "btrfs2ext4: block relocation failed!\n");
+        goto cleanup;
+      }
     }
   }
 
@@ -379,6 +428,81 @@ int btrfs2ext4_convert(const struct convert_options *opts,
          available > 0 ? (double)(available - total_needed) * 100.0 / available
                        : 0.0);
   printf("===================================================\n\n");
+
+  /* ================================================
+   * DRY-RUN Benchmark and ETA Estimation
+   * ================================================ */
+  if (opts->dry_run) {
+    printf("=== DRY RUN: ETA Benchmark ===\n");
+    printf("  Benchmarking device read speed to estimate real conversion "
+           "time...\n");
+
+    /* Benchmark 128 MB or total device size, whichever is smaller */
+    uint64_t bench_size = 128ULL * 1024 * 1024;
+    if (bench_size > dev.size)
+      bench_size = dev.size;
+
+    uint32_t chunk = 1048576; /* 1 MB */
+    uint8_t *bench_buf = malloc(chunk);
+    if (!bench_buf) {
+      printf("  WARNING: Could not allocate benchmark buffer.\n");
+    } else {
+      struct timespec tb_start, tb_end;
+      clock_gettime(CLOCK_MONOTONIC, &tb_start);
+
+      uint64_t read_bytes = 0;
+      uint64_t offset = 0;
+
+      while (read_bytes < bench_size) {
+        if (device_read(&dev, offset, bench_buf, chunk) < 0)
+          break;
+        read_bytes += chunk;
+        offset += chunk;
+      }
+
+      clock_gettime(CLOCK_MONOTONIC, &tb_end);
+      free(bench_buf);
+
+      double elapsed_sec = (tb_end.tv_sec - tb_start.tv_sec) +
+                           (tb_end.tv_nsec - tb_start.tv_nsec) / 1e9;
+
+      if (elapsed_sec > 0.0 && read_bytes > 0) {
+        double speed_mb_s =
+            ((double)read_bytes / (1024.0 * 1024.0)) / elapsed_sec;
+        printf("  Read speed measured:    %.1f MB/s\n", speed_mb_s);
+
+        /* Calculate approximate write footprint to be deployed in Phase 3 */
+        uint64_t inode_tbl_bytes =
+            (uint64_t)layout.total_inodes * layout.inode_size;
+        uint64_t gdt_bytes = (uint64_t)layout.num_groups * layout.desc_size;
+        uint64_t bitmap_bytes =
+            (uint64_t)layout.num_groups * layout.block_size * 2;
+        uint64_t total_meta_write_bytes =
+            inode_tbl_bytes + gdt_bytes + bitmap_bytes;
+
+        /* Penalize speed: 40% efficiency for sequential-ish, 10% efficiency for
+         * scattered */
+        double write_speed_optimistic = speed_mb_s * 0.40;
+        double write_speed_pessimistic = speed_mb_s * 0.10;
+
+        double eta_min_sec =
+            ((double)total_meta_write_bytes / (1024.0 * 1024.0)) /
+            write_speed_optimistic;
+        double eta_max_sec =
+            ((double)total_meta_write_bytes / (1024.0 * 1024.0)) /
+            write_speed_pessimistic;
+
+        printf("  Phase 3 Write footprint:%.1f MB\n",
+               (double)total_meta_write_bytes / (1024.0 * 1024.0));
+        printf(
+            "\n  >> Estimated Real Conversion Time: %.0f to %.0f seconds <<\n",
+            eta_min_sec, eta_max_sec);
+      } else {
+        printf("  Benchmark failed to complete.\n");
+      }
+    }
+    printf("==============================\n\n");
+  }
 
   /* ================================================
    * PASS 3: Write ext4 structures
@@ -498,15 +622,7 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   }
 
   if (progress)
-    progress("Pass 3", 40, "Writing bitmaps...");
-
-  if (ext4_write_bitmaps(&dev, &layout, &alloc) < 0) {
-    fprintf(stderr, "btrfs2ext4: failed to write bitmaps\n");
-    goto cleanup;
-  }
-
-  if (progress)
-    progress("Pass 3", 60, "Writing inode tables...");
+    progress("Pass 3", 40, "Writing inode tables...");
 
   if (ext4_write_inode_table(&dev, &layout, &fs_info, &ino_map, &alloc) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to write inode tables\n");
@@ -514,7 +630,17 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   }
 
   if (progress)
-    progress("Pass 3", 80, "Writing directory entries...");
+    progress("Pass 3", 55, "Writing bitmaps...");
+
+  /* Bug A fix: bitmaps are written AFTER inode tables so the inode_map
+   * is fully populated and ext4_write_bitmaps can mark active inodes. */
+  if (ext4_write_bitmaps(&dev, &layout, &alloc, &ino_map) < 0) {
+    fprintf(stderr, "btrfs2ext4: failed to write bitmaps\n");
+    goto cleanup;
+  }
+
+  if (progress)
+    progress("Pass 3", 60, "Writing directory entries...");
 
   if (ext4_write_directories(&dev, &layout, &fs_info, &ino_map, &alloc) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to write directories\n");
@@ -555,6 +681,10 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   printf("Next steps:\n");
   printf("  1. Run: e2fsck -f %s\n", opts->device_path);
   printf("  2. Mount: mount %s /mnt\n", opts->device_path);
+  printf("  3. (Optional) Defragment: e4defrag /mnt\n");
+  printf("     After conversion, files may be fragmented because btrfs and\n");
+  printf("     ext4 use different allocation strategies. e4defrag can\n");
+  printf("     consolidate file extents for improved sequential read speed.\n");
   printf("\n");
 
   ret = 0;

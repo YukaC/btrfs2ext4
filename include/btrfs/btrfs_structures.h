@@ -22,6 +22,7 @@
 #define BTRFS_SUPER_OFFSET 0x10000           /* 64 KiB */
 #define BTRFS_SUPER_MIRROR_1 0x4000000       /* 64 MiB */
 #define BTRFS_SUPER_MIRROR_2 0x4000000000ULL /* 256 GiB */
+#define BTRFS_SUPER_INFO_SIZE 4096           /* 4 KiB */
 
 #define BTRFS_CSUM_SIZE 32
 #define BTRFS_FSID_SIZE 16
@@ -215,7 +216,7 @@ struct btrfs_super_block {
   uint64_t reserved[28];
   uint8_t sys_chunk_array[BTRFS_SYSTEM_CHUNK_ARRAY_SIZE];
   struct btrfs_root_backup super_roots[BTRFS_NUM_BACKUP_ROOTS];
-  /* padding to 4096 bytes happens naturally */
+  uint8_t padding[565]; /* explicitly pad to 4096 bytes */
 } __attribute__((packed));
 
 /* ========================================================================

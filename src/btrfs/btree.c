@@ -55,11 +55,14 @@ int btree_walk(struct device *dev, const struct chunk_map *chunk_map,
     uint8_t level;
   };
 
-  /* Max stack depth = BTRFS_MAX_LEVEL * max_keys_per_node.
-   * A node can contain at most (nodesize - header_size) / key_ptr_size items.
-   * For 16K nodes: (16384 - 101) / 33 ≈ 493 key ptrs per level.
-   * 8 levels * 493 = ~3944 entries max. Use 8192 for safety. */
-  struct stack_entry *stack = malloc(8192 * sizeof(struct stack_entry));
+  /* Advise kernel of highly sequential tree layout to enable prefetching */
+  posix_fadvise(dev->fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+
+  /* Bug L fix: Dynamically growing stack instead of fixed 8192 entries.
+   * Start with 1024 entries and double as needed, preventing overflow
+   * for pathological trees. */
+  uint32_t stack_cap = 1024;
+  struct stack_entry *stack = malloc(stack_cap * sizeof(struct stack_entry));
   if (!stack) {
     fprintf(stderr, "btrfs2ext4: out of memory for btree walk stack\n");
     return -1;
@@ -165,10 +168,18 @@ int btree_walk(struct device *dev, const struct chunk_map *chunk_map,
       }
 
       for (int i = (int)nritems - 1; i >= 0; i--) {
-        if (stack_top >= 8192) {
-          fprintf(stderr, "btrfs2ext4: btree walk stack overflow\n");
-          ret = -1;
-          goto done;
+        /* Bug L fix: Grow stack dynamically instead of hard-failing at 8192 */
+        if ((uint32_t)stack_top >= stack_cap - 1) {
+          uint32_t new_cap = stack_cap * 2;
+          struct stack_entry *new_stack =
+              realloc(stack, new_cap * sizeof(struct stack_entry));
+          if (!new_stack) {
+            fprintf(stderr, "btrfs2ext4: btree walk stack realloc failed\n");
+            ret = -1;
+            goto done;
+          }
+          stack = new_stack;
+          stack_cap = new_cap;
         }
         stack[stack_top].logical = le64toh(ptrs[i].blockptr);
         stack[stack_top].level = level - 1;

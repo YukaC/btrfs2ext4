@@ -12,6 +12,7 @@
  * - ZSTD: standard zstd frame
  */
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -166,6 +167,16 @@ int btrfs_decompress_extent(struct device *dev,
     return -1;
   }
 
+  /* Security Check: Limit decompression to max 2x the allocated extent bytes
+   * (anti-bomb) */
+  if (decomp_size > ext->num_bytes * 2) {
+    fprintf(stderr,
+            "btrfs2ext4: safety limit exceeded - decompressed size (%lu) > 2x "
+            "extent limit (%lu)\n",
+            (unsigned long)decomp_size, (unsigned long)ext->num_bytes);
+    return -1;
+  }
+
   /* Resolve physical address of compressed data */
   uint64_t phys = chunk_map_resolve(chunk_map, ext->disk_bytenr);
   if (phys == (uint64_t)-1) {
@@ -175,23 +186,47 @@ int btrfs_decompress_extent(struct device *dev,
   }
 
   /* Read compressed data from disk */
-  uint8_t *comp_buf = malloc(comp_size);
-  if (!comp_buf)
-    return -1;
+  static __thread uint8_t *shared_comp_buf = NULL;
+  static __thread size_t shared_comp_size = 0;
 
-  if (device_read(dev, phys, comp_buf, comp_size) < 0) {
-    free(comp_buf);
+  if (comp_size > shared_comp_size) {
+    free(shared_comp_buf);
+    shared_comp_buf = malloc(comp_size);
+    if (!shared_comp_buf) {
+      shared_comp_size = 0;
+      return -1;
+    }
+    shared_comp_size = comp_size;
+  }
+  uint8_t *comp_buf = shared_comp_buf;
+
+  static pthread_mutex_t decompress_io_mutex = PTHREAD_MUTEX_INITIALIZER;
+  pthread_mutex_lock(&decompress_io_mutex);
+  int read_ret = device_read(dev, phys, comp_buf, comp_size);
+  pthread_mutex_unlock(&decompress_io_mutex);
+
+  if (read_ret < 0) {
     return -1;
   }
 
   /* Round up to block boundary */
   uint64_t aligned_size =
       ((decomp_size + block_size - 1) / block_size) * block_size;
-  uint8_t *decomp_buf = calloc(1, aligned_size);
-  if (!decomp_buf) {
-    free(comp_buf);
-    return -1;
+
+  static __thread uint8_t *shared_decomp_buf = NULL;
+  static __thread size_t shared_decomp_size = 0;
+
+  if (aligned_size > shared_decomp_size) {
+    free(shared_decomp_buf);
+    shared_decomp_buf = malloc(aligned_size);
+    if (!shared_decomp_buf) {
+      shared_decomp_size = 0;
+      return -1;
+    }
+    shared_decomp_size = aligned_size;
   }
+  uint8_t *decomp_buf = shared_decomp_buf;
+  memset(decomp_buf, 0, aligned_size);
 
   int ret = -1;
 
@@ -226,10 +261,7 @@ int btrfs_decompress_extent(struct device *dev,
     break;
   }
 
-  free(comp_buf);
-
   if (ret < 0) {
-    free(decomp_buf);
     return -1;
   }
 

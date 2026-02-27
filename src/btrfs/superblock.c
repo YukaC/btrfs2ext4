@@ -43,7 +43,7 @@ int btrfs_read_superblock(struct device *dev, struct btrfs_super_block *sb) {
 
   if (btrfs_verify_checksum(csum_type, sb->csum,
                             (const uint8_t *)sb + BTRFS_CSUM_SIZE,
-                            sizeof(*sb) - BTRFS_CSUM_SIZE) != 0) {
+                            BTRFS_SUPER_INFO_SIZE - BTRFS_CSUM_SIZE) != 0) {
     fprintf(stderr,
             "btrfs2ext4: superblock checksum mismatch "
             "(algorithm: %s)\n",

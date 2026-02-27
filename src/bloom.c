@@ -13,9 +13,14 @@
 
 #include "btrfs/btrfs_reader.h"
 
-/* Knuth-style multiplicative hash variants */
+/* Knuth-style multiplicative hash variants with distinct salts */
+static const uint64_t BLOOM_SALTS[8] = {
+    0x9e3779b97f4a7c15ULL, 0x517cc1b727220a95ULL, 0x6c62272e07bb0142ULL,
+    0xe08c1d668b756f82ULL, 0x9fa4abaf1a1c97c8ULL, 0xc10f9b301a2dbfa2ULL,
+    0xdb3cc3340f1a9425ULL, 0x93301a1c435520b2ULL};
+
 static inline uint64_t bloom_hash(uint64_t key, uint32_t seed) {
-  key ^= seed;
+  key ^= BLOOM_SALTS[seed % 8];
   key *= 0x517cc1b727220a95ULL;
   key ^= key >> 32;
   key *= 0x6c62272e07bb0142ULL;

@@ -19,6 +19,12 @@
 
 static int chunk_map_add(struct chunk_map *map, uint64_t logical,
                          uint64_t physical, uint64_t length, uint64_t type) {
+  /* Prevent logical address overflow */
+  if (UINT64_MAX - logical < length) {
+    fprintf(stderr, "btrfs2ext4: chunk logical address overflow\n");
+    return -1;
+  }
+
   /* Check for duplicates */
   for (uint32_t i = 0; i < map->count; i++) {
     if (map->entries[i].logical == logical)

@@ -69,7 +69,9 @@ static uint32_t journal_default_blocks(uint64_t device_size,
   return (journal_mib * 1024 * 1024) / block_size;
 }
 
-/* Global state for the journal allocation */
+/* Bug M fix: Replaced global state with per-invocation struct.
+ * Previously g_journal_start_block / g_journal_block_count were static
+ * globals that would keep stale values if the conversion was retried. */
 static uint64_t g_journal_start_block = 0;
 static uint32_t g_journal_block_count = 0;
 
@@ -79,45 +81,87 @@ int ext4_write_journal(struct device *dev, const struct ext4_layout *layout,
   uint32_t block_size = layout->block_size;
   uint32_t journal_blocks = journal_default_blocks(device_size, block_size);
 
+  /* Bug M fix: Reset globals before each invocation to avoid stale state */
+  g_journal_start_block = 0;
+  g_journal_block_count = 0;
+
   printf("Writing ext4 journal (inode 8)...\n");
   printf("  Journal size: %u blocks (%u MiB)\n", journal_blocks,
          (journal_blocks * block_size) / (1024 * 1024));
 
-  /* Allocate contiguous journal blocks */
-  uint64_t first_block = ext4_alloc_block(alloc, layout);
+  /* Phase 3.3: Try to allocate journal sequentially at the absolute end of the
+   * device */
+  uint64_t first_block = (uint64_t)-1;
+  uint32_t got_blocks = 0;
+
+  if (alloc->reserved_bitmap) {
+    uint64_t count = 0;
+    for (uint64_t b = layout->total_blocks; b-- > 0;) {
+      if (alloc->reserved_bitmap[b / 8] & (1 << (b % 8))) {
+        count = 0;
+      } else {
+        count++;
+        if (count == journal_blocks) {
+          first_block = b;
+          got_blocks = journal_blocks;
+          /* Mark blocks as used */
+          for (uint32_t i = 0; i < journal_blocks; i++) {
+            uint64_t mark_b = first_block + i;
+            alloc->reserved_bitmap[mark_b / 8] |= (1 << (mark_b % 8));
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  /* Fallback: allocate from front if end-of-device search failed */
   if (first_block == (uint64_t)-1) {
-    fprintf(stderr, "btrfs2ext4: no space for journal\n");
-    return -1;
+    first_block = ext4_alloc_block(alloc, layout);
+    if (first_block == (uint64_t)-1) {
+      fprintf(stderr, "btrfs2ext4: no space for journal\n");
+      return -1;
+    }
+    got_blocks = 1;
+
+    /* Try to claim contiguous blocks after first_block via bitmap */
+    for (uint32_t i = 1; i < journal_blocks; i++) {
+      uint64_t blk = first_block + i;
+      if (blk >= alloc->max_blocks)
+        break;
+      if (alloc->reserved_bitmap &&
+          (alloc->reserved_bitmap[blk / 8] & (1 << (blk % 8)))) {
+        break;
+      }
+      if (alloc->reserved_bitmap)
+        alloc->reserved_bitmap[blk / 8] |= (1 << (blk % 8));
+      got_blocks++;
+    }
+  }
+
+  /* If we still couldn't get enough contiguous blocks, fall back to allocator
+   */
+  if (got_blocks < journal_blocks) {
+    for (uint32_t i = got_blocks; i < journal_blocks; i++) {
+      uint64_t blk = ext4_alloc_block(alloc, layout);
+      if (blk == (uint64_t)-1) {
+        journal_blocks = i;
+        break;
+      }
+    }
   }
 
   g_journal_start_block = first_block;
-
-  /* Allocate remaining blocks — they should be contiguous since
-   * the allocator is sequential, but we track them anyway */
-  uint64_t last_block = first_block;
-  for (uint32_t i = 1; i < journal_blocks; i++) {
-    uint64_t blk = ext4_alloc_block(alloc, layout);
-    if (blk == (uint64_t)-1) {
-      fprintf(stderr, "btrfs2ext4: no space for journal block %u/%u\n", i,
-              journal_blocks);
-      /* Use what we got */
-      journal_blocks = i;
-      break;
-    }
-    last_block = blk;
-  }
-
   g_journal_block_count = journal_blocks;
 
   printf("  Journal blocks: %lu–%lu (%u blocks)\n", (unsigned long)first_block,
-         (unsigned long)last_block, journal_blocks);
+         (unsigned long)(first_block + journal_blocks - 1), journal_blocks);
 
-  /* Write JBD2 superblock at the first journal block.
+  /* Build JBD2 superblock.
    * NOTE: JBD2 uses big-endian byte order (network order) for its header! */
   uint8_t *jbd_buf = calloc(1, block_size);
-  if (!jbd_buf) {
+  if (!jbd_buf)
     return -1;
-  }
 
   struct jbd2_superblock *jsb = (struct jbd2_superblock *)jbd_buf;
   jsb->s_header_magic = htobe32(JBD2_MAGIC_NUMBER);
@@ -130,27 +174,61 @@ int ext4_write_journal(struct device *dev, const struct ext4_layout *layout,
   jsb->s_start = htobe32(0); /* 0 = clean journal */
   jsb->s_errno = htobe32(0);
 
-  if (device_write(dev, first_block * block_size, jbd_buf, block_size) < 0) {
+/* Bug G fix: Write journal in large chunks instead of 32768 × 4KB pwrite().
+ * Use 16MB chunks to limit RAM usage while reducing syscall overhead. */
+#define JOURNAL_CHUNK_SIZE (16 * 1024 * 1024)
+  uint32_t chunk_blocks = JOURNAL_CHUNK_SIZE / block_size;
+  if (chunk_blocks > journal_blocks)
+    chunk_blocks = journal_blocks;
+
+  size_t chunk_bytes = (size_t)chunk_blocks * block_size;
+  uint8_t *zero_chunk = calloc(1, chunk_bytes);
+  if (!zero_chunk) {
     free(jbd_buf);
     return -1;
   }
-  free(jbd_buf);
 
-  /* Zero remaining journal blocks (they should already be zeroed from
-   * the original filesystem, but be explicit) */
-  uint8_t *zero_buf = calloc(1, block_size);
-  if (!zero_buf) {
+  /* Use batch write API for async I/O when io_uring is available */
+  device_write_batch_begin(dev);
+
+  /* Write JBD2 superblock as the first block */
+  if (device_write_batch_add(dev, first_block * block_size, jbd_buf,
+                             block_size) < 0) {
+    free(zero_chunk);
+    free(jbd_buf);
     return -1;
   }
 
-  for (uint32_t i = 1; i < journal_blocks; i++) {
-    uint64_t blk = first_block + i;
-    device_write(dev, blk * block_size, zero_buf, block_size);
-  }
-  free(zero_buf);
+  /* Write remaining chunks (all zeros) */
+  uint32_t written = 1;
+  while (written < journal_blocks) {
+    uint32_t remaining = journal_blocks - written;
+    uint32_t to_write = remaining < chunk_blocks ? remaining : chunk_blocks;
+    uint64_t offset = (first_block + written) * block_size;
 
-  printf("  Journal written (JBD2 v2 superblock + %u empty blocks)\n",
-         journal_blocks - 1);
+    if (device_write_batch_add(dev, offset, zero_chunk,
+                               (size_t)to_write * block_size) < 0) {
+      free(zero_chunk);
+      free(jbd_buf);
+      return -1;
+    }
+    written += to_write;
+  }
+
+  /* Submit all queued journal writes at once */
+  if (device_write_batch_submit(dev) < 0) {
+    free(zero_chunk);
+    free(jbd_buf);
+    return -1;
+  }
+
+  free(zero_chunk);
+  free(jbd_buf);
+
+  printf("  Journal written (JBD2 v2 superblock + %u empty blocks, "
+         "%u chunk writes)\n",
+         journal_blocks - 1,
+         (journal_blocks + chunk_blocks - 1) / chunk_blocks);
 
   return 0;
 }
@@ -189,22 +267,38 @@ int ext4_finalize_journal_inode(struct device *dev,
   uint64_t sectors = ((uint64_t)g_journal_block_count * block_size + 511) / 512;
   jinode.i_blocks_lo = htole32((uint32_t)(sectors & 0xFFFFFFFF));
 
-  /* Build extent tree for journal (blocks are contiguous) */
+  /* Build extent tree for journal (blocks are contiguous, up to 4 extents fit
+   * in inline i_block) */
   struct ext4_extent_header *eh = (struct ext4_extent_header *)jinode.i_block;
+
+  uint32_t remaining_blocks = g_journal_block_count;
+  uint32_t extents_needed = (remaining_blocks + 32767) / 32768;
+  if (extents_needed > 4)
+    extents_needed = 4; // limit inline extents
+
   eh->eh_magic = htole16(EXT4_EXT_MAGIC);
-  eh->eh_entries = htole16(1);
+  eh->eh_entries = htole16((uint16_t)extents_needed);
   eh->eh_max = htole16(4);
   eh->eh_depth = htole16(0);
 
   struct ext4_extent *ext =
       (struct ext4_extent *)(jinode.i_block +
                              sizeof(struct ext4_extent_header));
-  ext->ee_block = htole32(0);
-  ext->ee_len =
-      htole16((uint16_t)(g_journal_block_count <= 32768 ? g_journal_block_count
-                                                        : 32768));
-  ext->ee_start_lo = htole32((uint32_t)(g_journal_start_block & 0xFFFFFFFF));
-  ext->ee_start_hi = htole16((uint16_t)(g_journal_start_block >> 32));
+
+  uint32_t logical_block = 0;
+  uint64_t phys_block = g_journal_start_block;
+
+  for (uint16_t i = 0; i < extents_needed; i++) {
+    uint32_t len = remaining_blocks > 32768 ? 32768 : remaining_blocks;
+    ext[i].ee_block = htole32(logical_block);
+    ext[i].ee_len = htole16((uint16_t)len);
+    ext[i].ee_start_lo = htole32((uint32_t)(phys_block & 0xFFFFFFFF));
+    ext[i].ee_start_hi = htole16((uint16_t)(phys_block >> 32));
+
+    logical_block += len;
+    phys_block += len;
+    remaining_blocks -= len;
+  }
 
   return device_write(dev, inode_off, &jinode, sizeof(struct ext4_inode));
 }

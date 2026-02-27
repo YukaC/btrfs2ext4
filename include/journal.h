@@ -61,6 +61,19 @@ int journal_check(struct device *dev, uint64_t journal_offset);
 int journal_replay(struct device *dev, uint64_t journal_offset);
 
 /*
+ * Replay/rollback an incomplete journal partially up to a specific sequence.
+ * Reverses any partially-completed relocation operations up to failed_seq.
+ * Returns 0 on success, -1 on error.
+ */
+int journal_replay_partial(struct device *dev, uint64_t journal_offset,
+                           uint32_t failed_seq);
+
+/*
+ * Returns the currently active journal offset.
+ */
+uint64_t journal_current_offset(void);
+
+/*
  * Clear the journal (mark as clean).
  * Called after successful conversion.
  * Returns 0 on success, -1 on error.

@@ -89,6 +89,11 @@
 #define EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE 0x0040
 #define EXT4_FEATURE_RO_COMPAT_METADATA_CSUM 0x0400
 
+/* Block group flags (bg_flags in group descriptor) */
+#define EXT4_BG_INODE_UNINIT 0x0001 /* Inode table not initialized */
+#define EXT4_BG_BLOCK_UNINIT 0x0002 /* Block bitmap not initialized */
+#define EXT4_BG_INODE_ZEROED 0x0004 /* Inode table zeroed */
+
 /* Default hash algorithm */
 #define EXT4_HASH_HALF_MD4 1
 #define EXT4_HASH_TEA 2

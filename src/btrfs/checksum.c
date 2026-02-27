@@ -39,9 +39,9 @@ uint32_t btrfs_crc32c(uint32_t crc, const void *data, size_t len) {
   while (len--) {
     crc = crc32c_table[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
   }
-  // Btrfs CRC32C *does not* do a final bitwise invert (~crc) before
-  // writing to disk. Return raw.
-  return crc;
+  // Btrfs CRC32C applies a final bitwise invert before writing to disk,
+  // consistent with standard CRC32c (RFC 3720 / iSCSI convention).
+  return ~crc;
 }
 
 const char *btrfs_csum_name(uint16_t type) {
@@ -80,10 +80,9 @@ int btrfs_verify_checksum(uint16_t type, const uint8_t *stored_csum,
 
   switch (type) {
   case BTRFS_CSUM_TYPE_CRC32: {
-    // CRC32c initial value for Btrfs is ~0U (0xFFFFFFFF)
+    // Btrfs CRC32c: seed = ~0U, with final bitwise invert (standard CRC32c).
+    // btrfs_crc32c() already applies the final ~crc inversion.
     uint32_t crc = btrfs_crc32c(~0U, data, len);
-
-    // Store as little-endian
     uint32_t le_crc = htole32(crc);
     memcpy(computed, &le_crc, 4);
     break;
@@ -145,7 +144,13 @@ int btrfs_verify_checksum(uint16_t type, const uint8_t *stored_csum,
   return 0; // Checksum OK
 }
 
-/* Standard RFC 3720 CRC32C, used by Ext4 and migration/relocation maps */
+/*
+ * Standard RFC 3720 CRC32C wrapper (used by Ext4 and relocation maps).
+ * Callers pass an initial CRC (0 for a fresh computation), and the result
+ * can be fed back in for chained buffers.  The final invert is already
+ * applied inside btrfs_crc32c(), so we just invert the seed here to undo
+ * the extra inversion from chaining.
+ */
 uint32_t crc32c(uint32_t crc, const void *data, size_t len) {
-  return ~btrfs_crc32c(~crc, data, len);
+  return btrfs_crc32c(~crc, data, len);
 }

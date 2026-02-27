@@ -36,6 +36,15 @@ endif()
 pkg_check_modules(LZO lzo2)
 pkg_check_modules(ZSTD libzstd)
 
+# Optional io_uring for async batch I/O
+pkg_check_modules(URING liburing)
+if(URING_FOUND)
+    add_definitions(-DHAVE_IO_URING=1)
+    message(STATUS "Found liburing: enabling io_uring batch I/O")
+endif()
+
+find_package(Threads REQUIRED)
+
 # Include directories
 include_directories(
     ${CMAKE_SOURCE_DIR}/include
@@ -61,6 +70,10 @@ if(ZSTD_FOUND)
     add_definitions(-DHAVE_ZSTD=1)
 endif()
 
+if(URING_FOUND)
+    include_directories(${URING_INCLUDE_DIRS})
+endif()
+
 # Source files
 set(BTRFS2EXT4_SOURCES
     src/main.c
@@ -79,11 +92,13 @@ set(BTRFS2EXT4_SOURCES
     src/ext4/dir_writer.c
     src/ext4/extent_writer.c
     src/ext4/journal_writer.c
+    src/ext4/ext4_crc16.c
     src/relocator.c
     src/bloom.c
     src/journal.c
     src/mem_tracker.c
     src/migration_map.c
+    src/thread_pool.c
 )
 
 # Main executable
@@ -92,6 +107,8 @@ add_executable(btrfs2ext4 ${BTRFS2EXT4_SOURCES})
 target_link_libraries(btrfs2ext4
     ${UUID_LIBRARIES}
     ${ZLIB_LIBRARIES}
+    Threads::Threads
+    m
 )
 
 if(CRYPTO_FOUND)
@@ -108,6 +125,10 @@ endif()
 
 if(ZSTD_FOUND)
     target_link_libraries(btrfs2ext4 ${ZSTD_LIBRARIES})
+endif()
+
+if(URING_FOUND)
+    target_link_libraries(btrfs2ext4 ${URING_LIBRARIES})
 endif()
 
 # Install target
@@ -134,11 +155,13 @@ set(BTRFS2EXT4_LIB_SOURCES
     src/ext4/dir_writer.c
     src/ext4/extent_writer.c
     src/ext4/journal_writer.c
+    src/ext4/ext4_crc16.c
     src/relocator.c
     src/bloom.c
     src/journal.c
     src/mem_tracker.c
     src/migration_map.c
+    src/thread_pool.c
 )
 
 # Stress / vulnerability / performance test suite
@@ -146,12 +169,14 @@ add_executable(test_stress tests/test_stress.c ${BTRFS2EXT4_LIB_SOURCES})
 target_link_libraries(test_stress
     ${UUID_LIBRARIES}
     ${ZLIB_LIBRARIES}
+    Threads::Threads
 )
 
 add_executable(test_fuzz tests/test_fuzz.c ${BTRFS2EXT4_LIB_SOURCES})
 target_link_libraries(test_fuzz
     ${UUID_LIBRARIES}
     ${ZLIB_LIBRARIES}
+    Threads::Threads
 )
 
 if(CRYPTO_FOUND)
@@ -170,11 +195,17 @@ if(ZSTD_FOUND)
     target_link_libraries(test_stress ${ZSTD_LIBRARIES})
     target_link_libraries(test_fuzz ${ZSTD_LIBRARIES})
 endif()
+if(URING_FOUND)
+    target_link_libraries(test_stress ${URING_LIBRARIES})
+    target_link_libraries(test_fuzz ${URING_LIBRARIES})
+endif()
 
+# Checksum test
 add_executable(test_checksum tests/test_checksum.c ${BTRFS2EXT4_LIB_SOURCES})
 target_link_libraries(test_checksum
     ${UUID_LIBRARIES}
     ${ZLIB_LIBRARIES}
+    Threads::Threads
 )
 if(CRYPTO_FOUND)
     target_link_libraries(test_checksum ${CRYPTO_LIBRARIES})
@@ -188,10 +219,38 @@ endif()
 if(ZSTD_FOUND)
     target_link_libraries(test_checksum ${ZSTD_LIBRARIES})
 endif()
+if(URING_FOUND)
+    target_link_libraries(test_checksum ${URING_LIBRARIES})
+endif()
+
+# --- Integration Test ---
+add_executable(test_integration tests/test_integration.c ${BTRFS2EXT4_LIB_SOURCES})
+target_link_libraries(test_integration
+    ${UUID_LIBRARIES}
+    ${ZLIB_LIBRARIES}
+    Threads::Threads
+)
+if(CRYPTO_FOUND)
+    target_link_libraries(test_integration ${CRYPTO_LIBRARIES})
+endif()
+if(XXHASH_FOUND)
+    target_link_libraries(test_integration ${XXHASH_LIBRARIES})
+endif()
+if(LZO_FOUND)
+    target_link_libraries(test_integration ${LZO_LIBRARIES})
+endif()
+if(ZSTD_FOUND)
+    target_link_libraries(test_integration ${ZSTD_LIBRARIES})
+endif()
+if(URING_FOUND)
+    target_link_libraries(test_integration ${URING_LIBRARIES})
+endif()
+
 
 add_test(NAME stress_test COMMAND test_stress)
 add_test(NAME fuzz_test COMMAND test_fuzz)
 add_test(NAME checksum_test COMMAND test_checksum)
+add_test(NAME integration_test COMMAND test_integration)
 
 # Enable AddressSanitizer in debug builds for memory bug detection (if available)
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -200,5 +259,9 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     if(HAS_ASAN)
         target_compile_options(test_stress PRIVATE -fsanitize=address -fno-omit-frame-pointer)
         target_link_options(test_stress PRIVATE -fsanitize=address)
+        
+        # Agregamos ASAN al test de integracion tambien
+        target_compile_options(test_integration PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+        target_link_options(test_integration PRIVATE -fsanitize=address)
     endif()
 endif()

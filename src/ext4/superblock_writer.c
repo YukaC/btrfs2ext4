@@ -77,13 +77,17 @@ int ext4_write_superblock(struct device *dev, const struct ext4_layout *layout,
   sb.s_feature_compat = htole32(
       EXT4_FEATURE_COMPAT_EXT_ATTR | EXT4_FEATURE_COMPAT_DIR_INDEX |
       EXT4_FEATURE_COMPAT_RESIZE_INODE | EXT4_FEATURE_COMPAT_HAS_JOURNAL);
+  /* Bug O fix: Added CSUM_SEED (incompat) and METADATA_CSUM (ro_compat)
+   * for modern ext4 metadata checksumming support (kernel 3.18+). */
   sb.s_feature_incompat =
       htole32(EXT4_FEATURE_INCOMPAT_FILETYPE | EXT4_FEATURE_INCOMPAT_EXTENTS |
-              EXT4_FEATURE_INCOMPAT_64BIT | EXT4_FEATURE_INCOMPAT_FLEX_BG);
+              EXT4_FEATURE_INCOMPAT_64BIT | EXT4_FEATURE_INCOMPAT_FLEX_BG |
+              EXT4_FEATURE_INCOMPAT_CSUM_SEED);
   sb.s_feature_ro_compat = htole32(
       EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER | EXT4_FEATURE_RO_COMPAT_LARGE_FILE |
       EXT4_FEATURE_RO_COMPAT_HUGE_FILE | EXT4_FEATURE_RO_COMPAT_GDT_CSUM |
-      EXT4_FEATURE_RO_COMPAT_DIR_NLINK | EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE);
+      EXT4_FEATURE_RO_COMPAT_DIR_NLINK | EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE |
+      EXT4_FEATURE_RO_COMPAT_METADATA_CSUM);
 
   /* Generate UUID */
   uuid_generate(sb.s_uuid);

@@ -156,6 +156,7 @@ struct btrfs_fs_info {
 
   /* Optional inode lookup hash table (accelerates btrfs_find_inode) */
   struct inode_lookup_ht ino_ht;
+  int use_hash;
 
   /* Compression statistics (computed during Pass 1) */
   uint64_t total_compressed_bytes;   /* sum of disk_num_bytes for compressed */

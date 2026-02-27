@@ -25,7 +25,38 @@
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_structures.h"
 #include "ext4/ext4_writer.h"
+#include "relocator.h"
+#include "thread_pool.h"
 
+/* Global decomp pool */
+static struct thread_pool *g_decomp_pool = NULL;
+
+struct decomp_job {
+  struct device *dev;
+  struct chunk_map *chunk_map;
+  struct file_extent *ext;
+  uint32_t block_size;
+
+  uint8_t *decomp_buf;
+  uint64_t decomp_len;
+  int status;
+};
+
+static void decomp_worker(void *arg) {
+  struct decomp_job *job = arg;
+  uint8_t *thread_buf = NULL;
+  job->status =
+      btrfs_decompress_extent(job->dev, job->chunk_map, job->ext,
+                              job->block_size, &thread_buf, &job->decomp_len);
+  if (job->status == 0 && thread_buf && job->decomp_len > 0) {
+    job->decomp_buf = malloc(job->decomp_len);
+    if (job->decomp_buf) {
+      memcpy(job->decomp_buf, thread_buf, job->decomp_len);
+    } else {
+      job->status = -1;
+    }
+  }
+}
 /* ========================================================================
  * Inode number mapping
  * ======================================================================== */
@@ -79,8 +110,10 @@ int inode_map_add(struct inode_map *map, uint64_t btrfs_ino,
       /* standard realloc */
       struct inode_map_entry *new_entries =
           realloc(map->capacity ? map->entries : NULL, new_size);
-      if (!new_entries)
+      if (!new_entries) {
+        fprintf(stderr, "btrfs2ext4: OOM reallocating inode map\n");
         return -1;
+      }
       map->entries = new_entries;
     }
     map->capacity = new_cap;
@@ -229,6 +262,8 @@ int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
 
   printf("Writing inode tables...\n");
 
+  g_decomp_pool = thread_pool_create(4, 1024);
+
   /* Step 1: Assign ext4 inode numbers to btrfs inodes.
    * Inode 2 = root directory, inodes 1-10 are reserved. */
 
@@ -275,8 +310,7 @@ int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
 
     for (uint32_t ino = ino_start; ino < ino_end; ino++) {
       /* Find the btrfs file entry for this ext4 inode (O(1) lookup) */
-      uint64_t btrfs_ino =
-          (ino < max_ino) ? btrfs_for_ext4[ino] : 0;
+      uint64_t btrfs_ino = (ino < max_ino) ? btrfs_for_ext4[ino] : 0;
       if (btrfs_ino == 0) {
         /* Special handling for reserved inodes */
         if (ino == EXT4_ROOT_INO) {
@@ -392,22 +426,52 @@ int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
         }
 
         if (has_compressed) {
+          struct thread_pool_wait_group *wg = thread_pool_wg_create();
+          struct decomp_job *jobs =
+              calloc(fe_mut->extent_count, sizeof(struct decomp_job));
+
+          /* Pass 1: Dispatch to pool */
           for (uint32_t e = 0; e < fe_mut->extent_count; e++) {
             struct file_extent *ext = &fe_mut->extents[e];
             if (ext->compression == BTRFS_COMPRESS_NONE ||
                 ext->type == BTRFS_FILE_EXTENT_INLINE || ext->disk_bytenr == 0)
               continue;
 
-            uint8_t *decomp_buf = NULL;
-            uint64_t decomp_len = 0;
-            if (btrfs_decompress_extent(dev, fs_info->chunk_map, ext,
-                                        block_size, &decomp_buf,
-                                        &decomp_len) < 0) {
+            jobs[e].dev = dev;
+            jobs[e].chunk_map = fs_info->chunk_map;
+            jobs[e].ext = ext;
+            jobs[e].block_size = block_size;
+            jobs[e].status = -1;
+
+            thread_pool_wg_add(wg, 1);
+            if (thread_pool_submit(g_decomp_pool, decomp_worker, &jobs[e], wg) <
+                0) {
+              /* Fallback if pool is full or fails */
+              thread_pool_wg_done(wg);
+              decomp_worker(&jobs[e]);
+            }
+          }
+
+          thread_pool_wg_wait(wg);
+          thread_pool_wg_destroy(wg);
+
+          /* Pass 2: Allocate blocks and queue I/O sequentially */
+          for (uint32_t e = 0; e < fe_mut->extent_count; e++) {
+            struct file_extent *ext = &fe_mut->extents[e];
+            if (ext->compression == BTRFS_COMPRESS_NONE ||
+                ext->type == BTRFS_FILE_EXTENT_INLINE || ext->disk_bytenr == 0)
+              continue;
+
+            if (jobs[e].status < 0) {
               fprintf(stderr,
                       "btrfs2ext4: failed to decompress extent for inode %lu\n",
                       (unsigned long)fe->ino);
+              free(jobs[e].decomp_buf);
               continue;
             }
+
+            uint8_t *decomp_buf = jobs[e].decomp_buf;
+            uint64_t decomp_len = jobs[e].decomp_len;
 
             /* Allocate new blocks and write decompressed data */
             uint32_t needed_blocks =
@@ -419,13 +483,12 @@ int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
             };
             struct run *runs = calloc(needed_blocks, sizeof(struct run));
             if (!runs) {
-              free(decomp_buf);
               continue;
             }
             uint32_t num_runs = 0;
             int alloc_failed = 0;
 
-            /* Write each block of decompressed data */
+            /* First: allocate blocks and build runs array */
             for (uint32_t b = 0; b < needed_blocks; b++) {
               uint64_t blk = ext4_alloc_block(alloc, layout);
               if (blk == (uint64_t)-1) {
@@ -446,21 +509,46 @@ int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
                 runs[num_runs].count = 1;
                 num_runs++;
               }
-
-              uint64_t offset = (uint64_t)b * block_size;
-              uint32_t write_len = block_size;
-              if (offset + write_len > decomp_len)
-                write_len = (uint32_t)(decomp_len - offset);
-
-              uint8_t *block_buf = calloc(1, block_size);
-              if (block_buf) {
-                memcpy(block_buf, decomp_buf + offset, write_len);
-                device_write(dev, blk * block_size, block_buf, block_size);
-                free(block_buf);
-              }
             }
 
-            free(decomp_buf);
+            /* Bug D fix + io_uring: Write decompressed data per contiguous
+             * run using batch API. Buffers are deferred-freed after submit
+             * so they remain valid for async I/O. */
+            device_write_batch_begin(dev);
+
+            /* Collect run buffers for deferred free after submit */
+            uint8_t **run_bufs = calloc(num_runs, sizeof(uint8_t *));
+            uint32_t blocks_written = 0;
+            for (uint32_t r = 0; r < num_runs && !alloc_failed; r++) {
+              uint64_t run_byte_offset = runs[r].phys_block * block_size;
+              size_t run_bytes = (size_t)runs[r].count * block_size;
+
+              uint64_t src_offset = (uint64_t)blocks_written * block_size;
+              size_t write_len = run_bytes;
+              if (src_offset + write_len > decomp_len)
+                write_len = (size_t)(decomp_len - src_offset);
+
+              uint8_t *run_buf = calloc(1, run_bytes);
+              if (run_buf) {
+                if (write_len > 0)
+                  memcpy(run_buf, decomp_buf + src_offset, write_len);
+                device_write_batch_add(dev, run_byte_offset, run_buf,
+                                       run_bytes);
+                if (run_bufs)
+                  run_bufs[r] = run_buf;
+              }
+              blocks_written += runs[r].count;
+            }
+
+            /* Submit all queued run writes at once */
+            device_write_batch_submit(dev);
+
+            /* Now safe to free all run buffers */
+            if (run_bufs) {
+              for (uint32_t r = 0; r < num_runs; r++)
+                free(run_bufs[r]);
+              free(run_bufs);
+            }
 
             if (alloc_failed || num_runs == 0) {
               free(runs);
@@ -530,8 +618,11 @@ int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
                                       loop continues correctly */
             }
 
+            /* Cleanup original thread buffer replica */
+            free(decomp_buf);
             free(runs);
           }
+          free(jobs);
         }
 
         /* Check if we can store it as Native Inline Data (Phase 5) */
@@ -748,5 +839,11 @@ int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
 
   printf("  Inode tables written\n");
   free(btrfs_for_ext4);
+
+  if (g_decomp_pool) {
+    thread_pool_destroy(g_decomp_pool);
+    g_decomp_pool = NULL;
+  }
+
   return 0;
 }

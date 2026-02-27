@@ -33,6 +33,13 @@ int ext4_plan_layout(struct ext4_layout *layout, uint64_t device_size,
   }
 
   layout->block_size = block_size;
+
+  uint64_t total_blocks;
+  if (__builtin_mul_overflow(device_size, 1, &total_blocks) ||
+      device_size / block_size == 0) {
+    fprintf(stderr, "btrfs2ext4: block calculation overflow or zero blocks\n");
+    return -1;
+  }
   layout->total_blocks = device_size / block_size;
   layout->blocks_per_group = 8 * block_size; /* bits in one block */
   layout->inode_size = EXT4_DEFAULT_INODE_SIZE;
@@ -192,6 +199,8 @@ int ext4_plan_layout(struct ext4_layout *layout, uint64_t device_size,
           uint64_t *new_blocks =
               realloc(layout->reserved_blocks, new_cap * sizeof(uint64_t));
           if (!new_blocks) {
+            fprintf(stderr,
+                    "btrfs2ext4: OOM reallocating reserved blocks (gdt)\n");
             free(layout->groups);
             free(layout->reserved_blocks);
             return -1;
@@ -223,6 +232,8 @@ int ext4_plan_layout(struct ext4_layout *layout, uint64_t device_size,
         uint64_t *new_blocks =
             realloc(layout->reserved_blocks, new_cap * sizeof(uint64_t));
         if (!new_blocks) {
+          fprintf(stderr, "btrfs2ext4: OOM reallocating reserved blocks "
+                          "(bitmaps/itable)\n");
           free(layout->groups);
           free(layout->reserved_blocks);
           return -1;

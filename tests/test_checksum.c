@@ -1,3 +1,4 @@
+
 #include "btrfs/btrfs_structures.h"
 #include "btrfs/checksum.h"
 #include <stdint.h>
@@ -19,16 +20,17 @@ int test_rfc3720_crc32c() {
 
 int test_btrfs_crc32c_verify() {
   const char *data = "123456789";
-  // standard is 0xE3069283, btrfs does not do final inversion, so it's
-  // ~0xE3069283
-  uint32_t raw_btrfs = ~0xE3069283;
+  // Standard CRC32c of "123456789" is 0xE3069283.
+  // Btrfs uses seed ~0U with a final bitwise invert — which is exactly the
+  // same as standard RFC 3720 CRC32c. So the stored checksum on disk IS
+  // 0xE3069283 (confirmed against a real Btrfs volume).
+  uint32_t expected_le = 0xE3069283;
 
-  // Btrfs stores it as little endian
   uint8_t stored_csum[4];
-  stored_csum[0] = (raw_btrfs >> 0) & 0xFF;
-  stored_csum[1] = (raw_btrfs >> 8) & 0xFF;
-  stored_csum[2] = (raw_btrfs >> 16) & 0xFF;
-  stored_csum[3] = (raw_btrfs >> 24) & 0xFF;
+  stored_csum[0] = (expected_le >> 0) & 0xFF;
+  stored_csum[1] = (expected_le >> 8) & 0xFF;
+  stored_csum[2] = (expected_le >> 16) & 0xFF;
+  stored_csum[3] = (expected_le >> 24) & 0xFF;
 
   if (btrfs_verify_checksum(BTRFS_CSUM_TYPE_CRC32, stored_csum, data, 9) != 0) {
     printf("FAIL: Btrfs CRC32c verify\n");

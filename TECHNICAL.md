@@ -232,7 +232,7 @@ Writes a fully populated `ext4_super_block` at byte offset 1024 (the primary cop
 
 ### 6.2 Group Descriptor Table (`gdt_writer.c`)
 
-For each block group, fills an `ext4_group_desc` (64 bytes in 64-bit mode) with bitmap/inode-table block pointers and initial free counts. The GDT is replicated to every block group that has a superblock backup.
+For each block group, fills an `ext4_group_desc` (64 bytes in 64-bit mode) with bitmap/inode-table block pointers and initial free counts. Crucially, the `bg_checksum` is statically sealed evaluating an LSB-first `crc16-ANSI` hash across the core Btrfs UUID overlaid with the exact group descriptor structure configuration satisfying `e2fsck` structural integrity requirements. The GDT is replicated to every block group that has a superblock backup.
 
 ### 6.3 Bitmaps (`bitmap_writer.c`)
 
@@ -270,7 +270,7 @@ For each directory inode:
 2. Write `.` and `..` entries, then child entries. Each `ext4_dir_entry_2` is 4-byte aligned.
 3. The last entry's `rec_len` is extended to fill the remainder of the block.
 4. **HTree Generation**: If entries overflow the standard 4KiB block, the directory undergoes a full `Ext4 2-Level HTree` indexing. Legacy hashes are generated off the decouple `dir_entry_link` maps, dot entries are assigned to block 0, and subsequent nodes are spun up as a 2-level B-Tree branch structure with `indirect_levels = 1`, supporting potentially millions of directory entries without arbitrarily degrading I/O limits.
-5. The inode's `i_block[]` is updated with an inline extent tree pointing to the directory's data blocks.
+5. The inode's `i_block[]` is updated with a mapped extent tree. Small directories fit inside an inline `depth=0` root (max 4 mapping extents). To support massive and highly fragmented directories, dynamic B-Tree leaf blocks are independently allocated and linked upgrading the nodes to `depth=1`, scaling seamlessly to thousands of contiguous bounds.
 
 File-type translation: `btrfs_to_ext4_filetype()` maps POSIX `S_IS*()` modes to `EXT4_FT_*` constants.
 
@@ -398,6 +398,18 @@ A number of critical optimisations have been extensively implemented:
 
 **Solution**: A pre-computation `qsort` rearranges `btrfs2ext4` writing array pipelines primarily targeting layout assignments based on the bounding `parent_inode`. Subsequent Ext4 inode generation flows purely linearly clustering all deep directory sub-dependencies to perfectly sequential sectors immediately accelerating general layout tree indexing.
 
+### #16 — Async I/O & Pre-Fetched Disk Layout (`device_io.c` & `btree.c`)
+
+**Problem**: Mechanical hard drives idle their read heads between synchronous block fetches and B-tree hops.
+
+**Solution**: Added `io_uring` support for deeply queued asynchronous reads, and `POSIX_FADV_SEQUENTIAL` before major tree walks, prompting the Linux kernel to hyper-aggressively pre-fetch blocks.
+
+### #17 — Ext4 Journal Tail Placement (`journal_writer.c`)
+
+**Problem**: Standard allocators interleave the Ext4 journal between data groups, provoking massive head sweeps on old drives as the system bounds between metadata and the journal.
+
+**Solution**: Dedicated fallback iterators enforce absolute placement of the journal sequence physically at the extremely localized absolute rear bytes of the block device, vastly boosting target drive runtime speeds.
+
 ---
 
 ## 9. Crash-Recovery Journal
@@ -458,7 +470,7 @@ All reads/writes use absolute byte offsets. Writes are automatically followed by
 
 ## 12. Current Limitations & Future Work
 
-### Limitations (v0.1.0-alpha)
+### Limitations (v0.2.0-alpha)
 
 - Single-device only (no multi-device / RAID)
 - 4 KiB sector size only

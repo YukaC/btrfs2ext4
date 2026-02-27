@@ -18,6 +18,9 @@ struct ext4_block_allocator {
   uint64_t max_blocks;
   /* 1 bit por bloque físico: 1 = bloque en uso (meta o datos) */
   uint8_t *reserved_bitmap;
+  /* Cursor for O(1) amortized allocation (Bug E fix) */
+  uint32_t current_group;
+  uint32_t current_block_in_group;
 };
 
 /* Inode mapping: btrfs objectid → ext4 inode number */
@@ -66,7 +69,8 @@ int ext4_write_superblock(struct device *dev, const struct ext4_layout *layout,
                           const struct btrfs_fs_info *fs_info);
 int ext4_write_gdt(struct device *dev, const struct ext4_layout *layout);
 int ext4_write_bitmaps(struct device *dev, const struct ext4_layout *layout,
-                       const struct ext4_block_allocator *alloc);
+                       const struct ext4_block_allocator *alloc,
+                       const struct inode_map *inode_map);
 int ext4_update_free_counts(struct device *dev,
                             const struct ext4_layout *layout);
 int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,

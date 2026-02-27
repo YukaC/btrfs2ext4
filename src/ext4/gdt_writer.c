@@ -2,14 +2,13 @@
  * gdt_writer.c — Ext4 Group Descriptor Table writer
  */
 
+#include "device_io.h"
+#include "ext4/ext4_crc16.h"
+#include "ext4/ext4_planner.h"
+#include "ext4/ext4_structures.h"
 #include <endian.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-
-#include "device_io.h"
-#include "ext4/ext4_planner.h"
-#include "ext4/ext4_structures.h"
 
 int ext4_write_gdt(struct device *dev, const struct ext4_layout *layout) {
   uint32_t block_size = layout->block_size;
@@ -19,6 +18,14 @@ int ext4_write_gdt(struct device *dev, const struct ext4_layout *layout) {
   uint8_t *gdt_buf = calloc(gdt_blocks, block_size);
   if (!gdt_buf) {
     fprintf(stderr, "btrfs2ext4: out of memory for GDT buffer\n");
+    return -1;
+  }
+
+  struct ext4_super_block sb;
+  if (device_read(dev, EXT4_SUPER_OFFSET, &sb, sizeof(sb)) < 0) {
+    fprintf(stderr,
+            "btrfs2ext4: failed to read superblock for GDT checksums\n");
+    free(gdt_buf);
     return -1;
   }
 
@@ -50,8 +57,19 @@ int ext4_write_gdt(struct device *dev, const struct ext4_layout *layout) {
     desc->bg_free_inodes_count_hi = htole16(0);
     desc->bg_used_dirs_count_lo = htole16(0);
 
-    /* Flags: uninit for optimization */
-    desc->bg_flags = htole16(0);
+    /* Lazy inode init: Mark inode tables as zeroed.
+     * Since we calloc the inode table buffers, they are already zero-filled.
+     * EXT4_BG_INODE_ZEROED tells the kernel's ext4lazyinit thread to skip
+     * re-zeroing, which speeds up the first mount dramatically. */
+    desc->bg_flags = htole16(EXT4_BG_INODE_ZEROED);
+
+    /* Bug B-6 fix: calculate initial checksums for the empty descriptors */
+    desc->bg_checksum = 0;
+    uint16_t crc = ext4_crc16(~0, sb.s_uuid, sizeof(sb.s_uuid));
+    uint32_t le_group = htole32(g);
+    crc = ext4_crc16(crc, &le_group, sizeof(le_group));
+    crc = ext4_crc16(crc, desc, layout->desc_size);
+    desc->bg_checksum = htole16(crc);
   }
 
   printf("Writing GDT (%u groups, %u blocks)...\n", layout->num_groups,

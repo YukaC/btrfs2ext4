@@ -8,6 +8,10 @@ test_checksum
 compile_commands.json
 .cache/
 
+# Debug / scratch binaries
+check_sb_size
+debug_csum
+
 # Object files
 *.o
 *.a
