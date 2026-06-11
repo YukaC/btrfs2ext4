@@ -40,6 +40,26 @@
 #define INDEX_PER_BLOCK(bs)                                                    \
   (((bs) - sizeof(struct ext4_extent_header)) / sizeof(struct ext4_extent_idx))
 
+/*
+ * Resolve btrfs extent disk_bytenr to a physical byte offset.
+ * Uses is_physical flag or falls back when chunk_map_resolve fails.
+ */
+static uint64_t extent_resolve_phys(const struct file_extent *ext,
+                                    const struct chunk_map *chunk_map,
+                                    uint64_t device_size) {
+  if (ext->is_physical)
+    return ext->disk_bytenr;
+
+  uint64_t phys = chunk_map_resolve(chunk_map, ext->disk_bytenr);
+  if (phys != (uint64_t)-1)
+    return phys;
+
+  if (device_size > 0 && ext->disk_bytenr < device_size)
+    return ext->disk_bytenr;
+
+  return (uint64_t)-1;
+}
+
 /* ========================================================================
  * Block allocator (bitmap-based, O(1) per allocation)
  * ======================================================================== */
@@ -137,16 +157,16 @@ void ext4_block_alloc_mark_fs_data(struct ext4_block_allocator *alloc,
       if (ext->type == BTRFS_FILE_EXTENT_INLINE || ext->disk_bytenr == 0)
         continue;
 
-      /* ext->disk_bytenr puede ser lógico Btrfs (pre-reloc) o físico
-       * (tras relocación u otras transformaciones). Intentar resolver
-       * vía chunk_map y, si falla, tratarlo como físico directo. */
-      uint64_t phys = chunk_map_resolve(fs_info->chunk_map, ext->disk_bytenr);
+      uint64_t device_size = (uint64_t)layout->total_blocks * block_size;
+      uint64_t phys =
+          extent_resolve_phys(ext, fs_info->chunk_map, device_size);
       if (phys == (uint64_t)-1)
-        phys = ext->disk_bytenr;
+        continue;
 
       uint64_t start_blk = phys / block_size;
-      uint64_t end_blk =
-          (phys + ext->disk_num_bytes + block_size - 1) / block_size;
+      uint64_t extent_bytes =
+          ext->num_bytes ? ext->num_bytes : ext->disk_num_bytes;
+      uint64_t end_blk = (phys + extent_bytes + block_size - 1) / block_size;
 
       for (uint64_t b = start_blk; b < end_blk && b < layout->total_blocks;
            b++) {
@@ -197,18 +217,23 @@ static int resolve_extents(struct ext4_block_allocator *alloc,
   if (!exts)
     return -1;
 
+  uint64_t device_size = dev ? dev->size : 0;
   uint32_t count = 0;
   for (uint32_t i = 0; i < fe->extent_count; i++) {
     const struct file_extent *bext = &fe->extents[i];
     if (bext->type == BTRFS_FILE_EXTENT_INLINE || bext->disk_bytenr == 0)
       continue;
 
-    uint64_t phys = chunk_map_resolve(chunk_map, bext->disk_bytenr);
+    uint64_t phys = extent_resolve_phys(bext, chunk_map, device_size);
     if (phys == (uint64_t)-1)
       continue;
+    phys += bext->offset;
 
     uint32_t file_block_start = (uint32_t)(bext->file_offset / block_size);
-    uint32_t num_blocks = (uint32_t)(bext->num_bytes / block_size);
+    uint64_t extent_bytes =
+        bext->num_bytes ? bext->num_bytes : bext->disk_num_bytes;
+    uint32_t num_blocks =
+        (uint32_t)((extent_bytes + block_size - 1) / block_size);
     uint64_t phys_block_start = phys / block_size;
 
     if (num_blocks == 0)
