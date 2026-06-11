@@ -104,6 +104,7 @@ set(BTRFS2EXT4_SOURCES
     src/btrfs/checksum.c
     src/btrfs/superblock.c
     src/btrfs/chunk_tree.c
+    src/btrfs/tree_walk.c
     src/btrfs/btree.c
     src/btrfs/fs_tree.c
     src/btrfs/decompress.c
@@ -169,6 +170,7 @@ set(BTRFS2EXT4_LIB_SOURCES
     src/btrfs/checksum.c
     src/btrfs/superblock.c
     src/btrfs/chunk_tree.c
+    src/btrfs/tree_walk.c
     src/btrfs/btree.c
     src/btrfs/fs_tree.c
     src/btrfs/decompress.c
@@ -193,6 +195,7 @@ set(BTRFS2EXT4_LIB_SOURCES
 
 # Stress / vulnerability / performance test suite
 add_executable(test_stress tests/test_stress.c ${BTRFS2EXT4_LIB_SOURCES})
+target_compile_definitions(test_stress PRIVATE BTRFS_TESTING=1)
 target_link_libraries(test_stress
     ${UUID_LIBRARIES}
     ${ZLIB_LIBRARIES}
@@ -200,6 +203,7 @@ target_link_libraries(test_stress
 )
 
 add_executable(test_fuzz tests/test_fuzz.c ${BTRFS2EXT4_LIB_SOURCES})
+target_compile_definitions(test_fuzz PRIVATE BTRFS_TESTING=1)
 target_link_libraries(test_fuzz
     ${UUID_LIBRARIES}
     ${ZLIB_LIBRARIES}

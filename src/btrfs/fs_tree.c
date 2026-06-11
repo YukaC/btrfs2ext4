@@ -17,6 +17,10 @@
 #include "btrfs/chunk_tree.h"
 #include "device_io.h"
 
+#ifdef BTRFS_TESTING
+void *btrfs_test_malloc(size_t size);
+#endif
+
 /* ========================================================================
  * Internal helpers
  * ======================================================================== */
@@ -37,13 +41,14 @@ static struct file_entry *file_entry_create(uint64_t ino) {
 
 static int file_entry_add_extent(struct file_entry *fe,
                                  const struct file_extent *ext) {
-  /* Phase 2.4: Adjacent Extent Coalescing */
+  /* Phase 2.8: Adjacent extent coalescing (skip partial shared extents) */
   if (fe->extent_count > 0) {
     struct file_extent *last = &fe->extents[fe->extent_count - 1];
 
     if (last->type != BTRFS_FILE_EXTENT_INLINE &&
         ext->type != BTRFS_FILE_EXTENT_INLINE &&
         last->compression == ext->compression &&
+        last->offset == 0 && ext->offset == 0 &&
         last->file_offset + last->num_bytes == ext->file_offset &&
         last->disk_bytenr != 0 && ext->disk_bytenr != 0 &&
         last->disk_bytenr + last->disk_num_bytes == ext->disk_bytenr) {
@@ -250,21 +255,36 @@ extern int btree_walk(struct device *dev, const struct chunk_map *chunk_map,
  * CoW Deduplication Hash Table (Phase 4.1)
  * ======================================================================== */
 
+struct cow_hash_key {
+  uint64_t bytenr;
+  uint64_t num_bytes;
+};
+
 struct cow_hash {
-  uint64_t *buckets;
+  struct cow_hash_key *buckets;
   uint32_t capacity;
   uint32_t count;
 };
 
+static int cow_hash_key_empty(const struct cow_hash_key *key) {
+  return key->bytenr == 0 && key->num_bytes == 0;
+}
+
+static uint32_t cow_hash_index(const struct cow_hash *h, uint64_t bytenr,
+                               uint64_t num_bytes) {
+  uint64_t key = bytenr ^ (num_bytes * 0x9e3779b97f4a7c15ULL);
+  return (uint32_t)(key * 2654435761ULL) % h->capacity;
+}
+
 static void cow_hash_init(struct cow_hash *h, uint32_t initial_cap) {
   h->capacity = initial_cap;
   h->count = 0;
-  h->buckets = calloc(h->capacity, sizeof(uint64_t));
+  h->buckets = calloc(h->capacity, sizeof(struct cow_hash_key));
 }
 
 static int cow_hash_rehash(struct cow_hash *h) {
   uint32_t old_cap = h->capacity;
-  uint64_t *old_buckets = h->buckets;
+  struct cow_hash_key *old_buckets = h->buckets;
 
   if (old_cap > UINT32_MAX / 2) {
     fprintf(stderr, "btrfs2ext4: cow_hash: cannot grow beyond 2^31 buckets\n");
@@ -272,7 +292,7 @@ static int cow_hash_rehash(struct cow_hash *h) {
   }
 
   h->capacity = old_cap * 2;
-  h->buckets = calloc(h->capacity, sizeof(uint64_t));
+  h->buckets = calloc(h->capacity, sizeof(struct cow_hash_key));
   if (!h->buckets) {
     h->buckets = old_buckets;
     h->capacity = old_cap;
@@ -281,13 +301,13 @@ static int cow_hash_rehash(struct cow_hash *h) {
   h->count = 0;
 
   for (uint32_t i = 0; i < old_cap; i++) {
-    if (old_buckets[i] == 0)
+    if (cow_hash_key_empty(&old_buckets[i]))
       continue;
-    uint64_t key = old_buckets[i];
-    uint32_t idx = (uint32_t)(key * 2654435761ULL) % h->capacity;
-    while (h->buckets[idx] != 0)
+    uint32_t idx =
+        cow_hash_index(h, old_buckets[i].bytenr, old_buckets[i].num_bytes);
+    while (!cow_hash_key_empty(&h->buckets[idx]))
       idx = (idx + 1) % h->capacity;
-    h->buckets[idx] = key;
+    h->buckets[idx] = old_buckets[i];
     h->count++;
   }
 
@@ -295,21 +315,39 @@ static int cow_hash_rehash(struct cow_hash *h) {
   return 0;
 }
 
-static int cow_hash_check_and_add(struct cow_hash *h, uint64_t bytenr) {
+/*
+ * Phase 2.3: PREALLOC reserves space but does not commit file data.
+ * Treat disk_bytenr==0 or unwritten prealloc as a sparse hole — never read
+ * uninitialized on-disk blocks as file content.
+ */
+static void apply_prealloc_hole_rules(struct file_extent *ext) {
+  if (ext->disk_bytenr == 0 || ext->num_bytes == 0) {
+    ext->disk_bytenr = 0;
+    ext->disk_num_bytes = 0;
+  } else {
+    ext->disk_bytenr = 0;
+    ext->disk_num_bytes = 0;
+  }
+}
+
+static int cow_hash_check_and_add(struct cow_hash *h, uint64_t bytenr,
+                                  uint64_t num_bytes) {
   if (h->count * 2 >= h->capacity) {
     if (cow_hash_rehash(h) < 0)
       return -1;
   }
 
-  uint32_t idx = (uint32_t)(bytenr * 2654435761ULL) % h->capacity;
-  while (h->buckets[idx] != 0) {
-    if (h->buckets[idx] == bytenr) {
+  uint32_t idx = cow_hash_index(h, bytenr, num_bytes);
+  while (!cow_hash_key_empty(&h->buckets[idx])) {
+    if (h->buckets[idx].bytenr == bytenr &&
+        h->buckets[idx].num_bytes == num_bytes) {
       return 1; /* Already seen! It's a CoW duplicate */
     }
     idx = (idx + 1) % h->capacity;
   }
 
-  h->buckets[idx] = bytenr;
+  h->buckets[idx].bytenr = bytenr;
+  h->buckets[idx].num_bytes = num_bytes;
   h->count++;
   return 0; /* First time seeing this physical layout */
 }
@@ -424,14 +462,31 @@ static int fs_tree_callback(const struct btrfs_disk_key *key, const void *data,
       size_t header_size = offsetof(struct btrfs_file_extent_item, disk_bytenr);
       if (data_size > header_size) {
         ext.inline_data_len = data_size - header_size;
+#ifdef BTRFS_TESTING
+        ext.inline_data = btrfs_test_malloc(ext.inline_data_len);
+#else
         ext.inline_data = malloc(ext.inline_data_len);
-        if (ext.inline_data) {
-          memcpy(ext.inline_data, (const uint8_t *)data + header_size,
-                 ext.inline_data_len);
+#endif
+        if (!ext.inline_data) {
+          fprintf(stderr,
+                  "btrfs2ext4: OOM allocating inline extent data (ino %lu, "
+                  "len %u)\n",
+                  (unsigned long)objectid, ext.inline_data_len);
+          return -1;
         }
+        memcpy(ext.inline_data, (const uint8_t *)data + header_size,
+               ext.inline_data_len);
       }
+    } else if (fi->type == BTRFS_FILE_EXTENT_PREALLOC) {
+      if (data_size >= sizeof(struct btrfs_file_extent_item)) {
+        ext.num_bytes = le64toh(fi->num_bytes);
+        ext.disk_bytenr = le64toh(fi->disk_bytenr);
+        ext.disk_num_bytes = le64toh(fi->disk_num_bytes);
+        ext.offset = le64toh(fi->offset);
+      }
+      apply_prealloc_hole_rules(&ext);
     } else {
-      /* Regular or prealloc extent */
+      /* Regular extent */
       if (data_size >= sizeof(struct btrfs_file_extent_item)) {
         ext.disk_bytenr = le64toh(fi->disk_bytenr);
         ext.disk_num_bytes = le64toh(fi->disk_num_bytes);
@@ -448,13 +503,16 @@ static int fs_tree_callback(const struct btrfs_disk_key *key, const void *data,
             ext.is_physical = 1;
         }
 
-        /* CoW Deduplication Tracking (Phase 4.1) */
-        if (ext.disk_bytenr != 0 && ext.type != BTRFS_FILE_EXTENT_INLINE) {
-          if (cow_hash_check_and_add(&fctx->cow_track, ext.disk_bytenr)) {
-            /* We have seen this physical block sequence before. Needs clone. */
+        /* CoW Deduplication Tracking (Phase 2.6) */
+        if (ext.disk_bytenr != 0) {
+          int cow_ret =
+              cow_hash_check_and_add(&fctx->cow_track, ext.disk_bytenr,
+                                     ext.disk_num_bytes);
+          if (cow_ret < 0)
+            return -1;
+          if (cow_ret > 0) {
             fs_info->shared_extent_count++;
 
-            /* Add to required deduplication physical blocks count */
             uint32_t block_size =
                 fs_info->sb.sectorsize ? le32toh(fs_info->sb.sectorsize) : 4096;
             fs_info->dedup_blocks_needed +=
@@ -464,7 +522,8 @@ static int fs_tree_callback(const struct btrfs_disk_key *key, const void *data,
       }
     }
 
-    file_entry_add_extent(fe, &ext);
+    if (file_entry_add_extent(fe, &ext) < 0)
+      return -1;
     break;
   }
 
@@ -571,6 +630,7 @@ static int root_tree_callback(const struct btrfs_disk_key *key,
 
 struct extent_tree_ctx {
   struct used_block_map *map;
+  uint32_t nodesize;
 };
 
 static int used_block_map_add(struct used_block_map *map, uint64_t start,
@@ -609,8 +669,8 @@ static int extent_tree_callback(const struct btrfs_disk_key *key,
       if (key->type == BTRFS_EXTENT_ITEM_KEY) {
         length = le64toh(key->offset);
       } else {
-        /* METADATA_ITEM uses nodesize as implicit length */
-        length = 0; /* Will be filled in later with nodesize */
+        /* Phase 2.7: METADATA_ITEM length is nodesize */
+        length = ectx->nodesize;
       }
 
       uint64_t flags = le64toh(ei->flags);
@@ -700,6 +760,7 @@ int btrfs_read_fs(struct device *dev, struct btrfs_fs_info *fs_info) {
    */
   struct extent_tree_ctx ectx;
   ectx.map = &fs_info->used_blocks;
+  ectx.nodesize = nodesize;
 
   if (rctx.found_extent) {
     if (btree_walk(dev, fs_info->chunk_map, rctx.extent_tree_bytenr,
@@ -856,3 +917,43 @@ void btrfs_free_fs(struct btrfs_fs_info *fs_info) {
 
   memset(fs_info, 0, sizeof(*fs_info));
 }
+
+#ifdef BTRFS_TESTING
+/* ========================================================================
+ * Test-only helpers (Phase 2.9)
+ * ======================================================================== */
+
+static size_t btrfs_test_malloc_fail_at = 0;
+static struct cow_hash test_cow_hash;
+
+void *btrfs_test_malloc(size_t size) {
+  if (btrfs_test_malloc_fail_at > 0 && size >= btrfs_test_malloc_fail_at)
+    return NULL;
+  return malloc(size);
+}
+
+void btrfs_test_set_malloc_fail_at(size_t size) {
+  btrfs_test_malloc_fail_at = size;
+}
+
+void btrfs_test_cow_hash_reset(void) {
+  free(test_cow_hash.buckets);
+  memset(&test_cow_hash, 0, sizeof(test_cow_hash));
+  cow_hash_init(&test_cow_hash, 16);
+}
+
+int btrfs_test_cow_hash_check_and_add(uint64_t bytenr, uint64_t num_bytes) {
+  if (!test_cow_hash.buckets)
+    btrfs_test_cow_hash_reset();
+  return cow_hash_check_and_add(&test_cow_hash, bytenr, num_bytes);
+}
+
+void btrfs_test_apply_prealloc_rules(struct file_extent *ext) {
+  apply_prealloc_hole_rules(ext);
+}
+
+int btrfs_test_alloc_inline_data(size_t len, uint8_t **out) {
+  *out = btrfs_test_malloc(len);
+  return *out ? 0 : -1;
+}
+#endif /* BTRFS_TESTING */

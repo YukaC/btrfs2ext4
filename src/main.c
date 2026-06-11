@@ -405,6 +405,7 @@ int btrfs2ext4_convert(const struct convert_options *opts,
     const struct file_entry *fe = st.fs_info.inode_table[i];
     for (uint32_t j = 0; j < fe->extent_count; j++) {
       if (fe->extents[j].type != BTRFS_FILE_EXTENT_INLINE &&
+          fe->extents[j].type != BTRFS_FILE_EXTENT_PREALLOC &&
           fe->extents[j].disk_bytenr != 0) {
         used_data_blocks +=
             (fe->extents[j].disk_num_bytes + st.layout.block_size - 1) /

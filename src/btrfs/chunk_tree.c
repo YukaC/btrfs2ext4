@@ -11,8 +11,8 @@
 #include <string.h>
 
 #include "btrfs/btrfs_structures.h"
-#include "btrfs/checksum.h"
 #include "btrfs/chunk_tree.h"
+#include "btrfs/tree_walk.h"
 #include "device_io.h"
 
 #define INITIAL_CHUNK_CAPACITY 64
@@ -148,14 +148,47 @@ int chunk_map_init_from_superblock(struct chunk_map *map,
   return 0;
 }
 
+static enum btrfs_walk_error chunk_tree_leaf_cb(const struct btrfs_disk_key *key,
+                                                const void *data,
+                                                uint32_t data_size,
+                                                void *ctx) {
+  struct chunk_map *map = (struct chunk_map *)ctx;
+
+  if (key->type != BTRFS_CHUNK_ITEM_KEY)
+    return BTRFS_WALK_CONTINUE;
+
+  if (data_size < sizeof(struct btrfs_chunk) + sizeof(struct btrfs_stripe)) {
+    fprintf(stderr, "btrfs2ext4: chunk item too small\n");
+    return BTRFS_WALK_CONTINUE;
+  }
+
+  const struct btrfs_chunk *chunk = (const struct btrfs_chunk *)data;
+  uint16_t num_stripes = le16toh(chunk->num_stripes);
+  size_t expected_size =
+      sizeof(struct btrfs_chunk) + (size_t)num_stripes * sizeof(struct btrfs_stripe);
+  if (expected_size > data_size) {
+    fprintf(stderr,
+            "btrfs2ext4: chunk item stripe count exceeds item size\n");
+    return BTRFS_WALK_CONTINUE;
+  }
+
+  const struct btrfs_stripe *stripe =
+      (const struct btrfs_stripe *)((const uint8_t *)chunk +
+                                    sizeof(struct btrfs_chunk));
+
+  uint64_t logical = le64toh(key->offset);
+  uint64_t physical = le64toh(stripe->offset);
+  uint64_t length = le64toh(chunk->length);
+  uint64_t type = le64toh(chunk->type);
+
+  if (chunk_map_add(map, logical, physical, length, type) < 0)
+    return BTRFS_WALK_ABORT;
+
+  return BTRFS_WALK_CONTINUE;
+}
+
 int chunk_map_populate(struct chunk_map *map, struct device *dev,
                        const struct btrfs_super_block *sb) {
-  /*
-   * Walk the chunk tree to get ALL chunk mappings (not just system chunks).
-   * The chunk tree root is at sb->chunk_root (logical address).
-   * We can resolve it using the bootstrap mappings already loaded.
-   */
-
   uint64_t chunk_root_logical = le64toh(sb->chunk_root);
   uint8_t chunk_root_level = sb->chunk_root_level;
   uint32_t nodesize = le32toh(sb->nodesize);
@@ -164,27 +197,22 @@ int chunk_map_populate(struct chunk_map *map, struct device *dev,
   printf("Walking chunk tree (root=0x%lx, level=%u, nodesize=%u)...\n",
          (unsigned long)chunk_root_logical, chunk_root_level, nodesize);
 
-  /* Allocate buffer for reading tree nodes */
-  uint8_t *node_buf = malloc(nodesize);
-  if (!node_buf) {
-    fprintf(stderr, "btrfs2ext4: out of memory for node buffer\n");
+  if (btrfs_tree_walk(dev, map, chunk_root_logical, chunk_root_level, nodesize,
+                      csum_type, chunk_tree_leaf_cb, map) < 0)
     return -1;
-  }
 
-  /* Recursive tree walk - use a simple stack */
-  struct {
-    uint64_t logical;
-    uint8_t level;
-  } stack[BTRFS_MAX_LEVEL * 256]; /* generous stack */
-  int stack_top = 0;
+  qsort(map->entries, map->count, sizeof(struct chunk_mapping), chunk_cmp);
 
-  stack[stack_top].logical = chunk_root_logical;
-  stack[stack_top].level = chunk_root_level;
-  stack_top++;
+  printf("  Total chunk mappings: %u\n\n", map->count);
+  return 0;
+}
 
-  while (stack_top > 0) {
+/* chunk_map_populate legacy marker removed */
+static void chunk_map_populate_unused_marker(void) {
+  while (0) {
     stack_top--;
     uint64_t node_logical = stack[stack_top].logical;
+    uint8_t expected_level = stack[stack_top].level;
 
     /* Resolve logical → physical */
     uint64_t node_physical = chunk_map_resolve(map, node_logical);
@@ -192,19 +220,46 @@ int chunk_map_populate(struct chunk_map *map, struct device *dev,
       fprintf(stderr,
               "btrfs2ext4: cannot resolve chunk tree node at logical 0x%lx\n",
               (unsigned long)node_logical);
-      free(node_buf);
-      return -1;
+      ret = -1;
+      break;
     }
 
     /* Read the node */
     if (device_read(dev, node_physical, node_buf, nodesize) < 0) {
-      free(node_buf);
-      return -1;
+      ret = -1;
+      break;
     }
 
     const struct btrfs_header *hdr = (const struct btrfs_header *)node_buf;
     uint32_t nritems = le32toh(hdr->nritems);
     uint8_t level = hdr->level;
+
+    uint64_t bytenr = le64toh(hdr->bytenr);
+    if (bytenr != node_logical) {
+      fprintf(stderr,
+              "btrfs2ext4: chunk tree node bytenr mismatch: expected 0x%lx, "
+              "got 0x%lx\n",
+              (unsigned long)node_logical, (unsigned long)bytenr);
+      ret = -1;
+      break;
+    }
+
+    if (level != expected_level) {
+      fprintf(stderr,
+              "btrfs2ext4: chunk tree node level mismatch/cycle detected: "
+              "expected %u, got %u at 0x%lx\n",
+              expected_level, level, (unsigned long)node_logical);
+      ret = -1;
+      break;
+    }
+
+    if (le64toh(hdr->generation) == 0) {
+      fprintf(stderr,
+              "btrfs2ext4: chunk tree node generation=0 at logical 0x%lx\n",
+              (unsigned long)node_logical);
+      ret = -1;
+      break;
+    }
 
     /* Validate checksum for chunk tree nodes as well */
     if (btrfs_verify_checksum(csum_type, hdr->csum,
@@ -214,8 +269,8 @@ int chunk_map_populate(struct chunk_map *map, struct device *dev,
               "btrfs2ext4: chunk tree node checksum mismatch at logical 0x%lx "
               "(algorithm: %s)\n",
               (unsigned long)node_logical, btrfs_csum_name(csum_type));
-      free(node_buf);
-      return -1;
+      ret = -1;
+      break;
     }
 
     uint32_t max_items =
@@ -225,8 +280,8 @@ int chunk_map_populate(struct chunk_map *map, struct device *dev,
               "btrfs2ext4: chunk tree node nritems=%u exceeds "
               "theoretical max=%u — corrupt node\n",
               nritems, max_items);
-      free(node_buf);
-      return -1;
+      ret = -1;
+      break;
     }
 
     if (level > 0) {
@@ -235,11 +290,19 @@ int chunk_map_populate(struct chunk_map *map, struct device *dev,
           (const struct btrfs_key_ptr *)(node_buf +
                                          sizeof(struct btrfs_header));
 
-      for (uint32_t i = 0; i < nritems; i++) {
-        if (stack_top >= (int)(sizeof(stack) / sizeof(stack[0]))) {
-          fprintf(stderr, "btrfs2ext4: chunk tree walk stack overflow\n");
-          free(node_buf);
-          return -1;
+      for (int i = (int)nritems - 1; i >= 0; i--) {
+        if ((uint32_t)stack_top >= stack_cap - 1) {
+          uint32_t new_cap = stack_cap * 2;
+          struct stack_entry *new_stack =
+              realloc(stack, new_cap * sizeof(struct stack_entry));
+          if (!new_stack) {
+            fprintf(stderr,
+                    "btrfs2ext4: chunk tree walk stack realloc failed\n");
+            ret = -1;
+            goto done;
+          }
+          stack = new_stack;
+          stack_cap = new_cap;
         }
         stack[stack_top].logical = le64toh(ptrs[i].blockptr);
         stack[stack_top].level = level - 1;
@@ -294,14 +357,19 @@ int chunk_map_populate(struct chunk_map *map, struct device *dev,
         uint64_t type = le64toh(chunk->type);
 
         if (chunk_map_add(map, logical, physical, length, type) < 0) {
-          free(node_buf);
-          return -1;
+          ret = -1;
+          goto done;
         }
       }
     }
   }
 
+done:
   free(node_buf);
+  free(stack);
+
+  if (ret < 0)
+    return -1;
 
   /* Re-sort after adding new entries */
   qsort(map->entries, map->count, sizeof(struct chunk_mapping), chunk_cmp);
