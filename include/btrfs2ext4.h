@@ -7,6 +7,9 @@
 
 #include <stdint.h>
 
+#define BTRFS2EXT4_EXIT_OK  0
+#define BTRFS2EXT4_EXIT_ERR 1
+
 /* Conversion options */
 struct convert_options {
   const char *device_path;
@@ -27,12 +30,7 @@ typedef void (*progress_callback)(const char *phase, uint32_t percent,
 /*
  * Perform the in-place btrfs → ext4 conversion.
  *
- * This is the main entry point that orchestrates all three passes:
- *   Pass 1: Read btrfs metadata
- *   Pass 2: Plan ext4 layout + relocate conflicting blocks
- *   Pass 3: Write ext4 structures
- *
- * Returns 0 on success, -1 on error.
+ * Returns BTRFS2EXT4_EXIT_OK on success, BTRFS2EXT4_EXIT_ERR on error.
  */
 int btrfs2ext4_convert(const struct convert_options *opts,
                        progress_callback progress);
@@ -40,7 +38,8 @@ int btrfs2ext4_convert(const struct convert_options *opts,
 /*
  * Rollback a previous conversion.
  * Restores the btrfs superblock from backup.
- * Returns 0 on success, -1 on error.
+ *
+ * Returns BTRFS2EXT4_EXIT_OK on success, BTRFS2EXT4_EXIT_ERR on error.
  */
 int btrfs2ext4_rollback(const char *device_path);
 

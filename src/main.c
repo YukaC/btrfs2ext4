@@ -209,12 +209,15 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   struct ext4_layout layout;
   struct relocation_plan reloc_plan;
   struct inode_map ino_map;
-  int ret = -1;
+  struct ext4_block_allocator alloc;
+  int alloc_ready = 0;
+  int ret = BTRFS2EXT4_EXIT_ERR;
 
   memset(&fs_info, 0, sizeof(fs_info));
   memset(&layout, 0, sizeof(layout));
   memset(&reloc_plan, 0, sizeof(reloc_plan));
   memset(&ino_map, 0, sizeof(ino_map));
+  memset(&alloc, 0, sizeof(alloc));
 
   printf("==============================================\n");
   printf("   btrfs2ext4 v" VERSION "\n");
@@ -285,7 +288,7 @@ int btrfs2ext4_convert(const struct convert_options *opts,
 
   /* Open device */
   if (device_open(&dev, opts->device_path, opts->dry_run) < 0)
-    return -1;
+    return BTRFS2EXT4_EXIT_ERR;
 
   printf("Device: %s (%.1f GiB)\n\n", opts->device_path,
          (double)dev.size / (1024.0 * 1024.0 * 1024.0));
@@ -567,12 +570,12 @@ int btrfs2ext4_convert(const struct convert_options *opts,
       printf("===============================\n");
     }
 
-    ret = 0;
+    ret = BTRFS2EXT4_EXIT_OK;
     goto cleanup;
   }
 
   if (!opts->dry_run && !check_battery_safe()) {
-    ret = -1;
+    ret = BTRFS2EXT4_EXIT_ERR;
     goto cleanup;
   }
 
@@ -601,8 +604,8 @@ int btrfs2ext4_convert(const struct convert_options *opts,
 
   /* Inicializar el allocator global de bloques Ext4 y marcar bloques de datos
    * ya usados por Btrfs (tras la relocación) para que no se reutilicen. */
-  struct ext4_block_allocator alloc;
   ext4_block_alloc_init(&alloc, &layout);
+  alloc_ready = 1;
   ext4_block_alloc_mark_fs_data(&alloc, &layout, &fs_info);
 
   /* Link adaptive memory management to the Ext4 inode map */
@@ -687,10 +690,11 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   printf("     consolidate file extents for improved sequential read speed.\n");
   printf("\n");
 
-  ret = 0;
+  ret = BTRFS2EXT4_EXIT_OK;
 
 cleanup:
-  ext4_block_alloc_free(&alloc);
+  if (alloc_ready)
+    ext4_block_alloc_free(&alloc);
   inode_map_free(&ino_map);
   relocator_free(&reloc_plan);
   ext4_free_layout(&layout);
@@ -706,12 +710,12 @@ int btrfs2ext4_rollback(const char *device_path) {
   printf("Attempting rollback of %s...\n", device_path);
 
   if (device_open(&dev, device_path, 0) < 0)
-    return -1;
+    return BTRFS2EXT4_EXIT_ERR;
 
   if (migration_map_rollback(&dev) < 0) {
     fprintf(stderr, "btrfs2ext4: Rollback failed.\n");
     device_close(&dev);
-    return -1;
+    return BTRFS2EXT4_EXIT_ERR;
   }
 
   device_close(&dev);
@@ -720,7 +724,7 @@ int btrfs2ext4_rollback(const char *device_path) {
          "restored.\n");
   printf("Run 'btrfs check %s' to verify integrity.\n", device_path);
 
-  return 0;
+  return BTRFS2EXT4_EXIT_OK;
 }
 
 int main(int argc, char **argv) {
@@ -757,7 +761,7 @@ int main(int argc, char **argv) {
           opts.block_size != 4096) {
         fprintf(stderr, "Invalid block size %u (must be 1024, 2048, or 4096)\n",
                 opts.block_size);
-        return 1;
+        return BTRFS2EXT4_EXIT_ERR;
       }
       break;
     case 'i':
@@ -774,20 +778,20 @@ int main(int argc, char **argv) {
       break;
     case 'h':
       print_usage(argv[0]);
-      return 0;
+      return BTRFS2EXT4_EXIT_OK;
     case 'V':
       btrfs2ext4_version();
-      return 0;
+      return BTRFS2EXT4_EXIT_OK;
     default:
       print_usage(argv[0]);
-      return 1;
+      return BTRFS2EXT4_EXIT_ERR;
     }
   }
 
   if (optind >= argc) {
     fprintf(stderr, "Error: no device specified\n\n");
     print_usage(argv[0]);
-    return 1;
+    return BTRFS2EXT4_EXIT_ERR;
   }
 
   opts.device_path = argv[optind];
@@ -796,7 +800,7 @@ int main(int argc, char **argv) {
   struct stat st;
   if (stat(opts.device_path, &st) < 0) {
     perror(opts.device_path);
-    return 1;
+    return BTRFS2EXT4_EXIT_ERR;
   }
 
   /* Warn if not a block device and not a regular file */
@@ -808,7 +812,7 @@ int main(int argc, char **argv) {
   /* Must be root for block devices */
   if (S_ISBLK(st.st_mode) && geteuid() != 0) {
     fprintf(stderr, "Error: must run as root for block device access\n");
-    return 1;
+    return BTRFS2EXT4_EXIT_ERR;
   }
 
   if (opts.rollback) {

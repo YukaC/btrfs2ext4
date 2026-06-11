@@ -1,3 +1,6 @@
+# BTRFS2EXT4_ENABLE_SANITIZERS: enable AddressSanitizer + UBSan on all test
+# targets. Defaults to ON for Debug builds and OFF for Release. Override with
+# -DBTRFS2EXT4_ENABLE_SANITIZERS=ON|OFF.
 cmake_minimum_required(VERSION 3.16)
 project(btrfs2ext4 C)
 
@@ -14,6 +17,15 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug)
 endif()
 
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(BTRFS2EXT4_ENABLE_SANITIZERS_DEFAULT ON)
+else()
+    set(BTRFS2EXT4_ENABLE_SANITIZERS_DEFAULT OFF)
+endif()
+option(BTRFS2EXT4_ENABLE_SANITIZERS
+       "Enable ASan+UBSan on test targets"
+       ${BTRFS2EXT4_ENABLE_SANITIZERS_DEFAULT})
+
 # Find required libraries
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(UUID REQUIRED uuid)
@@ -22,8 +34,19 @@ pkg_check_modules(ZLIB REQUIRED zlib)
 # Optional checksum libraries
 pkg_check_modules(CRYPTO libcrypto)
 if(CRYPTO_FOUND)
-    add_definitions(-DHAVE_LIBCRYPTO=1)
-    message(STATUS "Found libcrypto: enabling SHA256 and BLAKE2b support")
+    include(CheckSymbolExists)
+    set(CMAKE_REQUIRED_INCLUDES ${CRYPTO_INCLUDE_DIRS})
+    set(CMAKE_REQUIRED_LIBRARIES ${CRYPTO_LIBRARIES})
+    check_symbol_exists(EVP_sha256 "openssl/evp.h" HAVE_OPENSSL_SHA256)
+    check_symbol_exists(EVP_blake2b256 "openssl/evp.h" HAVE_OPENSSL_BLAKE2B256)
+    if(HAVE_OPENSSL_SHA256 OR HAVE_OPENSSL_BLAKE2B256)
+        add_definitions(-DHAVE_LIBCRYPTO=1)
+        message(STATUS "Found libcrypto: enabling OpenSSL checksum support")
+    endif()
+    if(HAVE_OPENSSL_BLAKE2B256)
+        add_definitions(-DHAVE_OPENSSL_BLAKE2B256=1)
+        message(STATUS "Found EVP_blake2b256: enabling BLAKE2b support")
+    endif()
 endif()
 
 pkg_check_modules(XXHASH libxxhash)
@@ -252,16 +275,28 @@ add_test(NAME fuzz_test COMMAND test_fuzz)
 add_test(NAME checksum_test COMMAND test_checksum)
 add_test(NAME integration_test COMMAND test_integration)
 
-# Enable AddressSanitizer in debug builds for memory bug detection (if available)
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    include(CheckCCompilerFlag)
-    check_c_compiler_flag(-fsanitize=address HAS_ASAN)
-    if(HAS_ASAN)
-        target_compile_options(test_stress PRIVATE -fsanitize=address -fno-omit-frame-pointer)
-        target_link_options(test_stress PRIVATE -fsanitize=address)
-        
-        # Agregamos ASAN al test de integracion tambien
-        target_compile_options(test_integration PRIVATE -fsanitize=address -fno-omit-frame-pointer)
-        target_link_options(test_integration PRIVATE -fsanitize=address)
+
+function(btrfs2ext4_enable_sanitizers target)
+    if(NOT BTRFS2EXT4_ENABLE_SANITIZERS)
+        return()
     endif()
-endif()
+    include(CheckCCompilerFlag)
+    if(NOT DEFINED HAS_BTRFS2EXT4_SANITIZERS)
+        set(CMAKE_REQUIRED_LINK_OPTIONS -fsanitize=address,undefined)
+        check_c_compiler_flag(-fsanitize=address,undefined HAS_BTRFS2EXT4_SANITIZERS)
+        unset(CMAKE_REQUIRED_LINK_OPTIONS)
+        if(HAS_BTRFS2EXT4_SANITIZERS)
+            message(STATUS "Enabling ASan+UBSan on test targets")
+        endif()
+    endif()
+    if(HAS_BTRFS2EXT4_SANITIZERS)
+        target_compile_options(${target} PRIVATE
+            -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+    endif()
+endfunction()
+
+btrfs2ext4_enable_sanitizers(test_stress)
+btrfs2ext4_enable_sanitizers(test_fuzz)
+btrfs2ext4_enable_sanitizers(test_checksum)
+btrfs2ext4_enable_sanitizers(test_integration)
