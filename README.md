@@ -1,5 +1,7 @@
 # btrfs2ext4
 
+[![CI](https://github.com/OWNER/btrfs2ext4/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/btrfs2ext4/actions/workflows/ci.yml)
+
 **In-place Btrfs → Ext4 filesystem converter**
 
 > [!CAUTION]
@@ -108,6 +110,10 @@ cmake --build build -j$(nproc)
 cd build && ctest --output-on-failure
 ```
 
+### Continuous integration
+
+GitHub Actions builds and tests every push/PR to `main` on Ubuntu with GCC and Clang in both Debug and Release configurations (see `.github/workflows/ci.yml`). Replace `OWNER` in the CI badge URL above with the repository owner.
+
 ---
 
 ## Usage
@@ -169,7 +175,7 @@ Things the tool doesn't do yet but reasonably could:
 - Subvolume selection
 - Non-4K sector size support
 - Better progress reporting
-- `io_uring` for async I/O on modern kernels
+- Broader `io_uring` adoption (batch APIs exist but are not used on all I/O paths yet)
 
 Contributions and bug reports are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 

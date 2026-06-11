@@ -36,14 +36,26 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
-**Debug build (AddressSanitizer + UBSan):**
+**Debug build (AddressSanitizer + UBSan on test targets):**
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j$(nproc)
 ```
 
-**Dependencies:** CMake ≥ 3.16, GCC or Clang, `libuuid-devel`, `zlib-devel`. Optional: `lzo-devel`, `libzstd-devel`.
+Sanitizers are enabled by default in Debug via `BTRFS2EXT4_ENABLE_SANITIZERS` (ASan + UBSan on all four test binaries). Disable with `-DBTRFS2EXT4_ENABLE_SANITIZERS=OFF`.
+
+**Dependencies:** CMake ≥ 3.16, GCC or Clang, `libuuid-dev`, `zlib1g-dev`. Optional: `libssl-dev`, `libxxhash-dev`, `liblzo2-dev`, `libzstd-dev`, `liburing-dev`.
+
+**Run CI locally (matches GitHub Actions):**
+
+```bash
+sudo apt-get install -y build-essential cmake pkg-config \
+  uuid-dev zlib1g-dev libssl-dev libxxhash-dev liblzo2-dev libzstd-dev liburing-dev
+cmake -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build -j$(nproc)
+ctest --test-dir build --output-on-failure
+```
 
 ---
 
@@ -57,7 +69,7 @@ The test suite (`test_stress.c`) covers:
 
 - Virtual loop device conversions with edge-case filesystems (massive inline files, millions of empty files, overlapping extents)
 - Fuzz inputs: malformed superblocks, truncated B-trees, looping symlinks, out-of-bounds references
-- ASan / UBSan traps on corrupted input
+- ASan + UBSan traps on corrupted input (enabled on test targets in Debug builds)
 
 If your change touches Btrfs parsing, run the fuzz path and confirm no new ASan warnings appear.
 
@@ -65,8 +77,8 @@ If your change touches Btrfs parsing, run the fuzz path and confirm no new ASan 
 
 ## Pull request checklist
 
-1. Builds clean with zero warnings in both `Release` and `Debug`
-2. `ctest` passes
+1. Builds clean with zero warnings in both `Release` and `Debug` (aside from `-Werror=implicit-function-declaration`)
+2. `ctest --output-on-failure` passes in a Debug build
 3. If you change space accounting, update the dry-run math to match
 4. Wrap `device_write()` failures to abort cleanly and record to the journal
 5. Add a test case if you're fixing a bug or adding a feature

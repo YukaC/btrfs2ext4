@@ -225,7 +225,7 @@ All moved data is also backed by the Btrfs superblock backup (see §10) so the o
 Writes a fully populated `ext4_super_block` at byte offset 1024 (the primary copy) and at the start of every block group with `has_super = true`. Key fields:
 
 - **Feature flags**: `FILETYPE | EXTENTS | 64BIT | FLEX_BG` (incompat), `SPARSE_SUPER | LARGE_FILE | HUGE_FILE | GDT_CSUM | DIR_NLINK | EXTRA_ISIZE` (ro_compat), `EXT_ATTR | DIR_INDEX | RESIZE_INODE` (compat).
-- **No journal** — the output is intentionally ext2-compatible so `tune2fs -j` can add a journal after `e2fsck -f`.
+- **JBD2 journal** — `ext4_write_journal()` creates an on-disk ext4 journal inode during Pass 3 (placed at the tail of the device for HDD locality).
 - **UUID**: freshly generated.
 - **Volume name**: copied from the Btrfs label (up to 16 chars).
 - **Flex BG**: 16 groups per flex (log₂ = 4).
@@ -402,7 +402,7 @@ A number of critical optimisations have been extensively implemented:
 
 **Problem**: Mechanical hard drives idle their read heads between synchronous block fetches and B-tree hops.
 
-**Solution**: Added `io_uring` support for deeply queued asynchronous reads, and `POSIX_FADV_SEQUENTIAL` before major tree walks, prompting the Linux kernel to hyper-aggressively pre-fetch blocks.
+**Solution (partial)**: `io_uring` batch read/write APIs exist in `device_io.c` and are used on select hot paths (e.g. inode decompression writes, journal block flushes) when `liburing` is available at build time. Most I/O still uses synchronous `pread`/`pwrite`. `POSIX_FADV_SEQUENTIAL` and `POSIX_FADV_WILLNEED` hints are issued before major tree walks.
 
 ### #17 — Ext4 Journal Tail Placement (`journal_writer.c`)
 
@@ -414,7 +414,16 @@ A number of critical optimisations have been extensively implemented:
 
 ## 9. Crash-Recovery Journal
 
-The journal (`journal.c`) provides a basic write-ahead log for block relocations:
+> **Status (v0.2):** `journal.c` is implemented but **not wired** into the live conversion path — `journal_init()` is never called from `btrfs2ext4_convert()` or `relocator_execute()`. **`migration_map_save()` is the primary recovery checkpoint** (see [§10](#10-rollback-mechanism)). The relocation journal code remains for future integration and unit-level testing.
+
+Two separate persistence mechanisms exist:
+
+| Mechanism | File | Purpose |
+| --------- | ---- | ------- |
+| **Relocation journal** | `journal.c` | Write-ahead log during Pass 2 block moves (`journal_log_move`, `journal_mark_complete`) |
+| **Migration map** | `migration_map.c` | Persistent checkpoint saved before Pass 3: Btrfs superblock backup + relocation entries for `--rollback` |
+
+The relocation journal (`journal.c`) provides a basic write-ahead log for block relocations:
 
 ```
 ┌─────────────────────────┐
@@ -442,13 +451,13 @@ The journal (`journal.c`) provides a basic write-ahead log for block relocations
 
 ## 10. Rollback Mechanism
 
-Before any block relocations, `btrfs2ext4_convert()` copies the original Btrfs superblock to the last aligned 4 KiB slot on the device:
+Before Pass 3 writes begin, `migration_map_save()` (called unconditionally from `btrfs2ext4_convert()`) persists the relocation plan and copies the original Btrfs superblock to the last aligned 4 KiB slot on the device:
 
 ```
 backup_offset = (device_size − 4096) & ~4095
 ```
 
-`btrfs2ext4_rollback()` reads this backup, verifies its `BTRFS_MAGIC`, and writes it back to `0x10000`. After rollback, `btrfs check` should be run to verify integrity, since relocated data blocks remain at their new positions.
+`btrfs2ext4_rollback()` reads this backup via `migration_map_rollback()`, verifies its `BTRFS_MAGIC`, reverses completed relocations, and writes the superblock back to `0x10000`. After rollback, `btrfs check` should be run to verify integrity, since any partially completed moves may need manual attention.
 
 ---
 
@@ -482,5 +491,5 @@ All reads/writes use absolute byte offsets. Writes are automatically followed by
 | --- | --------------------------------- | ------------------------------------------------ |
 | 1   | Vectored I/O (`preadv`/`pwritev`) | Reduced syscall count for multi-block operations |
 | 5   | `mmap()` for metadata read        | Faster Btrfs tree traversal on large filesystems |
-| 6   | Asynchronous I/O (`io_uring`)     | Overlapped read/write during relocation          |
+| 6   | Full `io_uring` relocation path   | Extend partial batch I/O to all relocation reads/writes |
 | 9   | Parallel inode table write        | Multi-threaded Pass 3 for multi-core CPUs        |

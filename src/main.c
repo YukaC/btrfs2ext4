@@ -209,12 +209,15 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   struct ext4_layout layout;
   struct relocation_plan reloc_plan;
   struct inode_map ino_map;
-  int ret = -1;
+  struct ext4_block_allocator alloc;
+  int alloc_initialized = 0;
+  int ret = 1;
 
   memset(&fs_info, 0, sizeof(fs_info));
   memset(&layout, 0, sizeof(layout));
   memset(&reloc_plan, 0, sizeof(reloc_plan));
   memset(&ino_map, 0, sizeof(ino_map));
+  memset(&alloc, 0, sizeof(alloc));
 
   printf("==============================================\n");
   printf("   btrfs2ext4 v" VERSION "\n");
@@ -285,7 +288,7 @@ int btrfs2ext4_convert(const struct convert_options *opts,
 
   /* Open device */
   if (device_open(&dev, opts->device_path, opts->dry_run) < 0)
-    return -1;
+    return 1;
 
   printf("Device: %s (%.1f GiB)\n\n", opts->device_path,
          (double)dev.size / (1024.0 * 1024.0 * 1024.0));
@@ -572,7 +575,7 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   }
 
   if (!opts->dry_run && !check_battery_safe()) {
-    ret = -1;
+    ret = 1;
     goto cleanup;
   }
 
@@ -601,8 +604,8 @@ int btrfs2ext4_convert(const struct convert_options *opts,
 
   /* Inicializar el allocator global de bloques Ext4 y marcar bloques de datos
    * ya usados por Btrfs (tras la relocación) para que no se reutilicen. */
-  struct ext4_block_allocator alloc;
   ext4_block_alloc_init(&alloc, &layout);
+  alloc_initialized = 1;
   ext4_block_alloc_mark_fs_data(&alloc, &layout, &fs_info);
 
   /* Link adaptive memory management to the Ext4 inode map */
@@ -690,7 +693,8 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   ret = 0;
 
 cleanup:
-  ext4_block_alloc_free(&alloc);
+  if (alloc_initialized)
+    ext4_block_alloc_free(&alloc);
   inode_map_free(&ino_map);
   relocator_free(&reloc_plan);
   ext4_free_layout(&layout);
@@ -706,12 +710,12 @@ int btrfs2ext4_rollback(const char *device_path) {
   printf("Attempting rollback of %s...\n", device_path);
 
   if (device_open(&dev, device_path, 0) < 0)
-    return -1;
+    return 1;
 
   if (migration_map_rollback(&dev) < 0) {
     fprintf(stderr, "btrfs2ext4: Rollback failed.\n");
     device_close(&dev);
-    return -1;
+    return 1;
   }
 
   device_close(&dev);
