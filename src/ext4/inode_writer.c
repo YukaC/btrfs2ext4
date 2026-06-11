@@ -437,6 +437,7 @@ int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
         for (uint32_t e = 0; e < fe_mut->extent_count; e++) {
           if (fe_mut->extents[e].compression != BTRFS_COMPRESS_NONE &&
               fe_mut->extents[e].type != BTRFS_FILE_EXTENT_INLINE &&
+              fe_mut->extents[e].type != BTRFS_FILE_EXTENT_PREALLOC &&
               fe_mut->extents[e].disk_bytenr != 0) {
             has_compressed = 1;
             break;
@@ -452,7 +453,8 @@ int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
           for (uint32_t e = 0; e < fe_mut->extent_count; e++) {
             struct file_extent *ext = &fe_mut->extents[e];
             if (ext->compression == BTRFS_COMPRESS_NONE ||
-                ext->type == BTRFS_FILE_EXTENT_INLINE || ext->disk_bytenr == 0)
+                ext->type == BTRFS_FILE_EXTENT_INLINE ||
+                ext->type == BTRFS_FILE_EXTENT_PREALLOC || ext->disk_bytenr == 0)
               continue;
 
             jobs[e].dev = dev;
@@ -477,7 +479,8 @@ int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
           for (uint32_t e = 0; e < fe_mut->extent_count; e++) {
             struct file_extent *ext = &fe_mut->extents[e];
             if (ext->compression == BTRFS_COMPRESS_NONE ||
-                ext->type == BTRFS_FILE_EXTENT_INLINE || ext->disk_bytenr == 0)
+                ext->type == BTRFS_FILE_EXTENT_INLINE ||
+                ext->type == BTRFS_FILE_EXTENT_PREALLOC || ext->disk_bytenr == 0)
               continue;
 
             if (jobs[e].status < 0) {

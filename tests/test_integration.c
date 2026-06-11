@@ -36,6 +36,7 @@
 #include <unistd.h>
 
 #include "btrfs/btrfs_reader.h"
+#include "btrfs/btrfs_structures.h"
 #include "btrfs/chunk_tree.h"
 #include "device_io.h"
 #include "ext4/ext4_crc16.h"
@@ -1667,6 +1668,35 @@ static void test_e2e_superblock_magic(void) {
   TEST_PASS();
 }
 
+
+static void test_metadata_item_used_length_nodesize(void) {
+  TEST_START("K-1  METADATA_ITEM used-block map length equals nodesize");
+
+  struct btrfs_extent_item ei;
+  memset(&ei, 0, sizeof(ei));
+  ei.generation = htole64(99);
+  ei.flags = htole64(BTRFS_BLOCK_GROUP_METADATA);
+
+  struct used_extent out;
+  memset(&out, 0, sizeof(out));
+
+  const uint32_t nodesize = 16384;
+  REQUIRE(btrfs_test_parse_extent_item(BTRFS_METADATA_ITEM_KEY, 0x100000, 0,
+                                       nodesize, &ei, sizeof(ei), &out) == 0,
+          "parse metadata item");
+  REQUIRE(out.length == nodesize, "metadata length is nodesize");
+  REQUIRE(out.generation == 99, "generation stored");
+  REQUIRE(out.flags == BTRFS_BLOCK_GROUP_METADATA, "flags stored");
+
+  memset(&out, 0, sizeof(out));
+  REQUIRE(btrfs_test_parse_extent_item(BTRFS_EXTENT_ITEM_KEY, 0x200000, 65536,
+                                       nodesize, &ei, sizeof(ei), &out) == 0,
+          "parse data extent item");
+  REQUIRE(out.length == 65536, "data extent length from key offset");
+
+  TEST_PASS();
+}
+
 /* =========================================================================
  * GROUP J — Block Bitmap Post-Pass3 (Phase 1 two-phase bitmap)
  *
@@ -2098,6 +2128,10 @@ int main(void) {
   test_journal_jbd2_magic();
   test_journal_blocks_zeroed();
   test_journal_zeroing_speed();
+
+  /* GROUP K: Phase 2 extent tree metadata length */
+  printf("\n─── GROUP K: Phase 2 Extent Tree (METADATA_ITEM) ────────────────────\n");
+  test_metadata_item_used_length_nodesize();
 
   /* GROUP J: Block bitmap post-Pass3 */
   printf("\n─── GROUP J: Block Bitmap Post-Pass3 (Phase 1) "
