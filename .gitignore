@@ -1,6 +1,10 @@
 # Build and IDE files
 build/
 .cursor/
+
+# npx skills CLI — canonical store and non-Cursor agent installs
+/skills/
+/data/
 btrfs2ext4
 test_stress
 test_fuzz
