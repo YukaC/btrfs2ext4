@@ -1,0 +1,45 @@
+name: Reusable Build and Test
+
+on:
+  workflow_call:
+    inputs:
+      compiler:
+        required: true
+        type: string
+      build_type:
+        required: true
+        type: string
+      enable_sanitizers:
+        required: true
+        type: boolean
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build pkg-config \
+            gcc clang \
+            uuid-dev zlib1g-dev \
+            liblzo2-dev libzstd-dev \
+            libssl-dev libxxhash-dev liburing-dev
+
+      - name: Configure
+        env:
+          CC: ${{ inputs.compiler == 'clang' && 'clang' || 'gcc' }}
+          CXX: ${{ inputs.compiler == 'clang' && 'clang++' || 'g++' }}
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ inputs.build_type }} \
+            -DENABLE_SANITIZERS=${{ inputs.enable_sanitizers && 'ON' || 'OFF' }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: cd build && ctest --output-on-failure

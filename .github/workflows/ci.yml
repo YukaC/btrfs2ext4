@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            build_type: Debug
+            enable_sanitizers: true
+          - compiler: clang
+            build_type: Debug
+            enable_sanitizers: true
+          - compiler: gcc
+            build_type: Release
+            enable_sanitizers: false
+    uses: ./.github/workflows/reusable-build-test.yml
+    with:
+      compiler: ${{ matrix.compiler }}
+      build_type: ${{ matrix.build_type }}
+      enable_sanitizers: ${{ matrix.enable_sanitizers }}
