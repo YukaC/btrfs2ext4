@@ -43,11 +43,15 @@ Print the software version.
 .BR \-h ", " \-\-help
 Print the help menu and exit.
 .SH EXIT STATUS
+The program exits with a conventional Unix status: \fB0\fR on success, \fB1\fR on any failure.
+.TP
 .B 0
-Success or successful dry-run equivalent.
-.br
+Conversion, rollback, dry-run, or help/version completed successfully.
+.TP
 .B 1
-General failure, unrecoverable I/O error, invalid CLI flags, or Viability Audit rejection.
+General failure: unrecoverable I/O error, invalid CLI flags, viability audit rejection, or rollback error.
+.PP
+Library callers using \fBbtrfs2ext4_convert()\fR or \fBbtrfs2ext4_rollback()\fR receive \fB0\fR on success and \fB-1\fR on error; the CLI maps any non-zero API result to exit status \fB1\fR.
 .SH EXAMPLES
 Safely dry-run a volume to ensure successful mathematical conversion:
 .RS

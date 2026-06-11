@@ -402,7 +402,7 @@ A number of critical optimisations have been extensively implemented:
 
 **Problem**: Mechanical hard drives idle their read heads between synchronous block fetches and B-tree hops.
 
-**Solution**: Added `io_uring` support for deeply queued asynchronous reads, and `POSIX_FADV_SEQUENTIAL` before major tree walks, prompting the Linux kernel to hyper-aggressively pre-fetch blocks.
+**Solution**: `POSIX_FADV_SEQUENTIAL` before major tree walks prompts the kernel to pre-fetch blocks. **`io_uring` support is partial**: when `liburing` is available at build time, `device_io.c` can queue batch reads, but relocation and Pass 3 writes remain predominantly synchronous.
 
 ### #17 — Ext4 Journal Tail Placement (`journal_writer.c`)
 
@@ -414,7 +414,9 @@ A number of critical optimisations have been extensively implemented:
 
 ## 9. Crash-Recovery Journal
 
-The journal (`journal.c`) provides a basic write-ahead log for block relocations:
+> **Status (v0.2):** `journal.c` is implemented but **not wired** into the live conversion path — `journal_init()` is never called from `btrfs2ext4_convert()` or `relocator_execute()`. **`migration_map_save()` is the primary recovery checkpoint** (see [§10](#10-rollback-mechanism)). The relocation journal code remains for future integration.
+
+The journal (`journal.c`) was designed as a write-ahead log for block relocations:
 
 ```
 ┌─────────────────────────┐
@@ -442,7 +444,9 @@ The journal (`journal.c`) provides a basic write-ahead log for block relocations
 
 ## 10. Rollback Mechanism
 
-Before any block relocations, `btrfs2ext4_convert()` copies the original Btrfs superblock to the last aligned 4 KiB slot on the device:
+**Primary recovery path:** `migration_map_save()` runs unconditionally at the end of Pass 2 (even when `reloc_plan.count == 0`), persisting every relocated block mapping and a Btrfs superblock backup. `btrfs2ext4_rollback()` / `migration_map_rollback()` reverses block moves and restores the superblock from this map.
+
+Before any block relocations, `btrfs2ext4_convert()` also copies the original Btrfs superblock to the last aligned 4 KiB slot on the device:
 
 ```
 backup_offset = (device_size − 4096) & ~4095

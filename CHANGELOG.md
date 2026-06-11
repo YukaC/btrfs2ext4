@@ -5,6 +5,21 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **CI reusable workflow** — `.github/workflows/reusable-build-test.yml` with matrix builds (GCC/Clang × Debug/Release) and optional sanitizers
+- **`BTRFS2EXT4_ENABLE_SANITIZERS` CMake option** — enables ASan+UBSan on all four test targets (default ON in Debug, OFF in Release; CI overrides explicitly)
+- **`convert_state` cleanup context** — centralizes teardown in `convert_state_init()` / `convert_state_cleanup()`, fixing conditional `ext4_block_alloc_free` on early-exit paths
+
+### Changed
+
+- **CLI exit codes** — `main()` maps API return values to exit status 0 (success) or 1 (failure); documented in `btrfs2ext4.h` and `btrfs2ext4.8`
+- **TECHNICAL.md** — documents `journal.c` as stub/unwired, migration map as primary recovery, and `io_uring` as partial
+
+---
+
 ## [0.2.0-alpha] - 2026-02-27
 
 ### Added

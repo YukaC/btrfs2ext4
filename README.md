@@ -1,5 +1,7 @@
 # btrfs2ext4
 
+[![CI](https://github.com/YukaC/btrfs2ext4/actions/workflows/ci.yml/badge.svg)](https://github.com/YukaC/btrfs2ext4/actions/workflows/ci.yml)
+
 **In-place Btrfs → Ext4 filesystem converter**
 
 > [!CAUTION]
@@ -107,6 +109,10 @@ cmake -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j$(nproc)
 cd build && ctest --output-on-failure
 ```
+
+### Continuous integration
+
+GitHub Actions builds and tests every push/PR to `main` on Ubuntu with GCC and Clang in Debug (ASan+UBSan) and Release configurations (see `.github/workflows/ci.yml`).
 
 ---
 

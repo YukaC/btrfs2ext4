@@ -27,12 +27,8 @@ typedef void (*progress_callback)(const char *phase, uint32_t percent,
 /*
  * Perform the in-place btrfs → ext4 conversion.
  *
- * This is the main entry point that orchestrates all three passes:
- *   Pass 1: Read btrfs metadata
- *   Pass 2: Plan ext4 layout + relocate conflicting blocks
- *   Pass 3: Write ext4 structures
- *
- * Returns 0 on success, -1 on error.
+ * Internal return convention: 0 on success, -1 on error.
+ * The CLI maps this to process exit codes: 0 success, 1 failure.
  */
 int btrfs2ext4_convert(const struct convert_options *opts,
                        progress_callback progress);
@@ -40,7 +36,9 @@ int btrfs2ext4_convert(const struct convert_options *opts,
 /*
  * Rollback a previous conversion.
  * Restores the btrfs superblock from backup.
- * Returns 0 on success, -1 on error.
+ *
+ * Internal return convention: 0 on success, -1 on error.
+ * The CLI maps this to process exit codes: 0 success, 1 failure.
  */
 int btrfs2ext4_rollback(const char *device_path);
 
