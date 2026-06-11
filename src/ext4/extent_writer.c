@@ -227,6 +227,7 @@ static int resolve_extents(struct ext4_block_allocator *alloc,
     uint64_t phys = extent_resolve_phys(bext, chunk_map, device_size);
     if (phys == (uint64_t)-1)
       continue;
+    phys += bext->offset;
 
     uint32_t file_block_start = (uint32_t)(bext->file_offset / block_size);
     uint64_t extent_bytes =

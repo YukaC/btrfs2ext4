@@ -39,6 +39,7 @@
 #include "btrfs/chunk_tree.h"
 #include "device_io.h"
 #include "ext4/ext4_crc16.h"
+#include "ext4/ext4_metadata_csum.h"
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_structures.h"
 #include "ext4/ext4_writer.h"
@@ -138,20 +139,28 @@ static int read_raw(struct device *dev, uint64_t offset, void *buf, size_t n) {
 
 /* Removed erroneous MSB-first crc16_ibm, using ext4_crc16 */
 
-/* Calcula el checksum esperado para el group descriptor g
- * Algoritmo: CRC16(seed=0, UUID || le16(g) || descriptor_con_csum=0) */
-static uint16_t expected_gdt_csum(const uint8_t *uuid, uint32_t group_no,
+/* Calcula el checksum esperado para el group descriptor g. */
+static uint16_t expected_gdt_csum(const struct ext4_super_block *sb,
+                                  uint32_t group_no,
                                   const uint8_t *desc_bytes, size_t desc_size) {
-  uint16_t crc = 0xFFFF; /* Seed CRC with ~0 */
-  crc = ext4_crc16(crc, uuid, 16);
-  uint32_t le_group =
-      htole32(group_no); /* Group number must be le32 for Ext4! */
+  uint32_t ro_compat = le32toh(sb->s_feature_ro_compat);
+  if (ro_compat & EXT4_FEATURE_RO_COMPAT_METADATA_CSUM) {
+    uint32_t csum_seed = le32toh(sb->s_checksum_seed);
+    uint8_t tmp[64];
+    memcpy(tmp, desc_bytes, desc_size < 64 ? desc_size : 64);
+    tmp[30] = 0;
+    tmp[31] = 0;
+    struct ext4_group_desc *d = (struct ext4_group_desc *)tmp;
+    return ext4_group_desc_csum(csum_seed, group_no, d, desc_size);
+  }
+
+  uint16_t crc = 0xFFFF;
+  crc = ext4_crc16(crc, sb->s_uuid, 16);
+  uint32_t le_group = htole32(group_no);
   crc = ext4_crc16(crc, &le_group, 4);
 
-  /* El checksum se calcula con el campo bg_checksum puesto a 0 */
   uint8_t tmp[64];
   memcpy(tmp, desc_bytes, desc_size < 64 ? desc_size : 64);
-  /* bg_checksum está en el offset 30 del descriptor */
   tmp[30] = 0;
   tmp[31] = 0;
   crc = ext4_crc16(crc, tmp, desc_size);
@@ -682,8 +691,8 @@ static void test_tail_blocks_marked_used(void) {
 
   struct ext4_block_allocator alloc;
   ext4_block_alloc_init(&alloc, &layout);
-  REQUIRE(ext4_rewrite_block_bitmaps(&dev, &layout, &alloc) == 0,
-          "rewrite_block_bitmaps falló");
+  REQUIRE(ext4_finalize_bitmaps(&dev, &layout, &alloc, NULL) == 0,
+          "finalize_bitmaps falló");
 
   uint32_t last_g = layout.num_groups - 1;
   uint64_t g_start = layout.groups[last_g].group_start_block;
@@ -1107,8 +1116,8 @@ static void test_bitmap_reflects_dir_blocks(void) {
           "write_directories falló");
   REQUIRE(ext4_write_journal(&dev, &layout, &alloc, TEST_IMG_SIZE) == 0,
           "write_journal falló");
-  REQUIRE(ext4_rewrite_block_bitmaps(&dev, &layout, &alloc) == 0,
-          "rewrite_block_bitmaps falló");
+  REQUIRE(ext4_finalize_bitmaps(&dev, &layout, &alloc, NULL) == 0,
+          "finalize_bitmaps falló");
 
   uint32_t ino_group = (EXT4_ROOT_INO - 1) / layout.inodes_per_group;
   uint32_t ino_local = (EXT4_ROOT_INO - 1) % layout.inodes_per_group;
@@ -1342,7 +1351,7 @@ static void test_gdt_checksum_value_correct(void) {
     struct ext4_group_desc *d = (struct ext4_group_desc *)raw;
 
     uint16_t written = le16toh(d->bg_checksum);
-    uint16_t expected = expected_gdt_csum(sb.s_uuid, g, raw, layout.desc_size);
+    uint16_t expected = expected_gdt_csum(&sb, g, raw, layout.desc_size);
 
     if (written != expected) {
       mismatches++;
@@ -1661,8 +1670,8 @@ static void test_e2e_superblock_magic(void) {
 /* =========================================================================
  * GROUP J — Block Bitmap Post-Pass3 (Phase 1 two-phase bitmap)
  *
- * After directories/journal allocate blocks, ext4_rewrite_block_bitmaps
- * must mark every reserved block in the on-disk block bitmap.
+ * After directories/journal allocate blocks, ext4_finalize_bitmaps
+ * must mark every reserved block in the on-disk block bitmap from memory.
  * ======================================================================= */
 
 static int block_bitmap_bit_set(const uint8_t *bbm, uint64_t local_bit) {
@@ -1692,8 +1701,8 @@ static void test_block_bitmap_allocated_blocks_marked(void) {
   }
   REQUIRE(n_alloc >= 4, "allocator no asignó bloques suficientes");
 
-  REQUIRE(ext4_rewrite_block_bitmaps(&dev, &layout, &alloc) == 0,
-          "rewrite_block_bitmaps falló");
+  REQUIRE(ext4_finalize_bitmaps(&dev, &layout, &alloc, NULL) == 0,
+          "finalize_bitmaps falló");
 
   int unmarked = 0;
   for (int i = 0; i < n_alloc; i++) {
@@ -1752,9 +1761,8 @@ static void test_block_bitmap_free_counts_match(void) {
 
   ext4_write_superblock(&dev, &layout, fs);
   ext4_write_gdt(&dev, &layout);
-  ext4_write_bitmaps(&dev, &layout, &alloc, NULL);
-  REQUIRE(ext4_rewrite_block_bitmaps(&dev, &layout, &alloc) == 0,
-          "rewrite_block_bitmaps falló");
+  REQUIRE(ext4_finalize_bitmaps(&dev, &layout, &alloc, NULL) == 0,
+          "finalize_bitmaps falló");
   REQUIRE(ext4_update_free_counts(&dev, &layout) == 0,
           "update_free_counts falló");
 
@@ -1817,8 +1825,7 @@ static void test_e2e_free_counts_consistent(void) {
 
   ext4_write_superblock(&dev, &layout, fs);
   ext4_write_gdt(&dev, &layout);
-  ext4_write_bitmaps(&dev, &layout, &alloc, NULL);
-  ext4_rewrite_block_bitmaps(&dev, &layout, &alloc);
+  ext4_finalize_bitmaps(&dev, &layout, &alloc, NULL);
   ext4_update_free_counts(&dev, &layout);
 
   /* Leer superbloque y sumar free_blocks de todos los grupos */

@@ -436,6 +436,7 @@ static int fs_tree_callback(const struct btrfs_disk_key *key, const void *data,
         ext.disk_bytenr = le64toh(fi->disk_bytenr);
         ext.disk_num_bytes = le64toh(fi->disk_num_bytes);
         ext.num_bytes = le64toh(fi->num_bytes);
+        ext.offset = le64toh(fi->offset);
 
         if (ext.disk_bytenr != 0 &&
             chunk_map_resolve(fs_info->chunk_map, ext.disk_bytenr) ==

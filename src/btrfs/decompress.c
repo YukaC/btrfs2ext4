@@ -195,6 +195,7 @@ int btrfs_decompress_extent(struct device *dev,
       }
     }
   }
+  phys += ext->offset;
 
   /* Read compressed data from disk */
   static __thread uint8_t *shared_comp_buf = NULL;

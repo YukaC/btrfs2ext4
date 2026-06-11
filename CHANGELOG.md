@@ -9,7 +9,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
-- **Phase 1 (P0 Ext4 integrity, Approach C)** — two-phase block/inode bitmap strategy (`ext4_rewrite_block_bitmaps` after Pass 3 allocations), single-source directory inodes (inode_writer writes complete metadata; dir_writer patches extent tree only), inode metadata checksums via `ext4_inode_set_checksum`, `file_extent.is_physical` fallback for post-relocation extents, integration tests for post-Pass3 block bitmap correctness (Group J)
+- **Phase 1 (P0 Ext4 integrity, Approach B)** — `ext4_finalize_bitmaps()` writes block+inode bitmaps from in-memory state as the last metadata write before free counts; full directory inode metadata via `ext4_build_dir_inode_from_entry()` with half-MD4 HTree hashing; METADATA_CSUM (superblock, GDT, inode checksums); `file_extent.offset` and physical fallback for relocated extents; integration tests E-4/E-5/E-6 and Group J
 
 - **CI reusable workflow** — `.github/workflows/reusable-build-test.yml` with matrix builds (GCC/Clang × Debug/Release) and optional sanitizers
 - **`BTRFS2EXT4_ENABLE_SANITIZERS` CMake option** — enables ASan+UBSan on all four test targets (default ON in Debug, OFF in Release; CI overrides explicitly)

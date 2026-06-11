@@ -22,6 +22,7 @@
 #include "btrfs/chunk_tree.h"
 #include "btrfs/decompress.h"
 #include "device_io.h"
+#include "ext4/ext4_metadata_csum.h"
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_structures.h"
 #include "ext4/ext4_writer.h"
@@ -276,6 +277,8 @@ int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
   if (device_read(dev, EXT4_SUPER_OFFSET, &sb, sizeof(sb)) < 0)
     return -1;
 
+  uint32_t csum_seed = ext4_csum_seed_from_uuid(sb.s_uuid);
+
   g_decomp_pool = thread_pool_create(4, 1024);
 
   /* Step 1: Assign ext4 inode numbers to btrfs inodes.
@@ -368,7 +371,7 @@ int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
                 htole16(jnl_blocks > 32768 ? 32768 : (uint16_t)jnl_blocks);
             jext->ee_start_lo = htole32((uint32_t)(jnl_start & 0xFFFFFFFF));
             jext->ee_start_hi = htole16((uint16_t)(jnl_start >> 32));
-            ext4_inode_set_checksum(sb.s_uuid, jnl_inode, inode_size);
+            ext4_inode_set_checksum_ino(csum_seed, jnl_inode, inode_size, ino);
           }
           continue;
         } else {
@@ -842,7 +845,7 @@ int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
       }
 
       ext_inode->i_generation = htole32(1); /* Generation number */
-      ext4_inode_set_checksum(sb.s_uuid, ext_inode, inode_size);
+      ext4_inode_set_checksum_ino(csum_seed, ext_inode, inode_size, ino);
     }
 
     /* Write the inode table for this group */

@@ -4,6 +4,7 @@
 
 #include "device_io.h"
 #include "ext4/ext4_crc16.h"
+#include "ext4/ext4_metadata_csum.h"
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_structures.h"
 #include <endian.h>
@@ -63,13 +64,19 @@ int ext4_write_gdt(struct device *dev, const struct ext4_layout *layout) {
      * re-zeroing, which speeds up the first mount dramatically. */
     desc->bg_flags = htole16(EXT4_BG_INODE_ZEROED);
 
-    /* Bug B-6 fix: calculate initial checksums for the empty descriptors */
     desc->bg_checksum = 0;
-    uint16_t crc = ext4_crc16(~0, sb.s_uuid, sizeof(sb.s_uuid));
-    uint32_t le_group = htole32(g);
-    crc = ext4_crc16(crc, &le_group, sizeof(le_group));
-    crc = ext4_crc16(crc, desc, layout->desc_size);
-    desc->bg_checksum = htole16(crc);
+    uint32_t ro_compat = le32toh(sb.s_feature_ro_compat);
+    if (ro_compat & EXT4_FEATURE_RO_COMPAT_METADATA_CSUM) {
+      uint32_t csum_seed = le32toh(sb.s_checksum_seed);
+      desc->bg_checksum =
+          htole16(ext4_group_desc_csum(csum_seed, g, desc, layout->desc_size));
+    } else {
+      uint16_t crc = ext4_crc16((uint16_t)~0, sb.s_uuid, sizeof(sb.s_uuid));
+      uint32_t le_group = htole32(g);
+      crc = ext4_crc16(crc, &le_group, sizeof(le_group));
+      crc = ext4_crc16(crc, desc, layout->desc_size);
+      desc->bg_checksum = htole16(crc);
+    }
   }
 
   printf("Writing GDT (%u groups, %u blocks)...\n", layout->num_groups,

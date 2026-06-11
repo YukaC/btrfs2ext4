@@ -11,12 +11,10 @@
 
 #include "btrfs/btrfs_reader.h"
 #include "device_io.h"
+#include "ext4/ext4_metadata_csum.h"
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_structures.h"
 #include "ext4/ext4_writer.h"
-
-/* CRC32C from superblock.c */
-extern uint32_t crc32c(uint32_t crc, const void *buf, size_t len);
 
 int ext4_write_superblock(struct device *dev, const struct ext4_layout *layout,
                           const struct btrfs_fs_info *fs_info) {
@@ -91,6 +89,8 @@ int ext4_write_superblock(struct device *dev, const struct ext4_layout *layout,
 
   /* Generate UUID */
   uuid_generate(sb.s_uuid);
+  sb.s_checksum_seed = htole32(ext4_csum_seed_from_uuid(sb.s_uuid));
+  sb.s_checksum_type = EXT4_CRC32C_CHKSUM;
 
   /* Volume name — copy from btrfs label if available */
   if (fs_info->sb.label[0]) {
@@ -99,7 +99,7 @@ int ext4_write_superblock(struct device *dev, const struct ext4_layout *layout,
 
   /* Hash seed for htree directories */
   uuid_generate((unsigned char *)sb.s_hash_seed);
-  sb.s_def_hash_version = EXT4_HASH_LEGACY;
+  sb.s_def_hash_version = EXT4_HASH_HALF_MD4;
 
   /* Journal configuration */
   sb.s_journal_inum = htole32(EXT4_JOURNAL_INO);
@@ -120,6 +120,8 @@ int ext4_write_superblock(struct device *dev, const struct ext4_layout *layout,
   /* Reserved GDT blocks */
   sb.s_reserved_gdt_blocks =
       htole16((uint16_t)layout->groups[0].reserved_gdt_blocks);
+
+  ext4_superblock_csum_set(&sb);
 
   /* Write primary superblock at offset 1024 */
   printf("Writing ext4 superblock at offset %u...\n", EXT4_SUPER_OFFSET);
@@ -144,6 +146,7 @@ int ext4_write_superblock(struct device *dev, const struct ext4_layout *layout,
       continue;
 
     sb.s_block_group_nr = htole16((uint16_t)g);
+    ext4_superblock_csum_set(&sb);
 
     memset(sb_buf, 0, block_size);
     memcpy(sb_buf, &sb,

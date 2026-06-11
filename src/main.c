@@ -646,16 +646,6 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   }
 
   if (progress)
-    progress("Pass 3", 48, "Writing inode bitmaps...");
-
-  /* Phase A: inode bitmaps only — block bitmaps deferred until all
-   * ext4_alloc_block calls (dirs, journal, extent trees) complete. */
-  if (ext4_write_bitmaps(&st.dev, &st.layout, &st.alloc, &st.ino_map) < 0) {
-    fprintf(stderr, "btrfs2ext4: failed to write inode bitmaps\n");
-    goto cleanup;
-  }
-
-  if (progress)
     progress("Pass 3", 55, "Writing directory entries...");
 
   if (ext4_write_directories(&st.dev, &st.layout, &st.fs_info, &st.ino_map, &st.alloc) < 0) {
@@ -677,11 +667,10 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   }
 
   if (progress)
-    progress("Pass 3", 88, "Rewriting block bitmaps...");
+    progress("Pass 3", 88, "Finalizing block and inode bitmaps...");
 
-  /* Phase B: block bitmaps from alloc->reserved_bitmap after all allocations. */
-  if (ext4_rewrite_block_bitmaps(&st.dev, &st.layout, &st.alloc) < 0) {
-    fprintf(stderr, "btrfs2ext4: failed to rewrite block bitmaps\n");
+  if (ext4_finalize_bitmaps(&st.dev, &st.layout, &st.alloc, &st.ino_map) < 0) {
+    fprintf(stderr, "btrfs2ext4: failed to finalize bitmaps\n");
     goto cleanup;
   }
 

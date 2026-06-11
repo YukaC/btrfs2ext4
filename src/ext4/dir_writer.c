@@ -13,10 +13,114 @@
 
 #include "btrfs/btrfs_reader.h"
 #include "device_io.h"
-#include "ext4/ext4_crc16.h"
+#include "ext4/ext4_metadata_csum.h"
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_structures.h"
 #include "ext4/ext4_writer.h"
+
+#define EXT4_HTREE_EOF_32BIT 0x7fffffffU
+
+static inline uint32_t rol32(uint32_t word, unsigned int shift) {
+  return (word << shift) | (word >> (32 - shift));
+}
+
+#define MD4_F(x, y, z) ((z) ^ ((x) & ((y) ^ (z))))
+#define MD4_G(x, y, z) (((x) & (y)) + (((x) ^ (y)) & (z)))
+#define MD4_H(x, y, z) ((x) ^ (y) ^ (z))
+#define MD4_ROUND(f, a, b, c, d, x, s) \
+  (a += f(b, c, d) + x, a = rol32(a, s))
+#define MD4_K1 0U
+#define MD4_K2 013240474631UL
+#define MD4_K3 015666365641UL
+
+static uint32_t half_md4_transform(uint32_t buf[4], const uint32_t in[8]) {
+  uint32_t a = buf[0], b = buf[1], c = buf[2], d = buf[3];
+
+  MD4_ROUND(MD4_F, a, b, c, d, in[0] + MD4_K1, 3);
+  MD4_ROUND(MD4_F, d, a, b, c, in[1] + MD4_K1, 7);
+  MD4_ROUND(MD4_F, c, d, a, b, in[2] + MD4_K1, 11);
+  MD4_ROUND(MD4_F, b, c, d, a, in[3] + MD4_K1, 19);
+  MD4_ROUND(MD4_F, a, b, c, d, in[4] + MD4_K1, 3);
+  MD4_ROUND(MD4_F, d, a, b, c, in[5] + MD4_K1, 7);
+  MD4_ROUND(MD4_F, c, d, a, b, in[6] + MD4_K1, 11);
+  MD4_ROUND(MD4_F, b, c, d, a, in[7] + MD4_K1, 19);
+
+  MD4_ROUND(MD4_G, a, b, c, d, in[1] + MD4_K2, 3);
+  MD4_ROUND(MD4_G, d, a, b, c, in[3] + MD4_K2, 5);
+  MD4_ROUND(MD4_G, c, d, a, b, in[5] + MD4_K2, 9);
+  MD4_ROUND(MD4_G, b, c, d, a, in[7] + MD4_K2, 13);
+  MD4_ROUND(MD4_G, a, b, c, d, in[0] + MD4_K2, 3);
+  MD4_ROUND(MD4_G, d, a, b, c, in[2] + MD4_K2, 5);
+  MD4_ROUND(MD4_G, c, d, a, b, in[4] + MD4_K2, 9);
+  MD4_ROUND(MD4_G, b, c, d, a, in[6] + MD4_K2, 13);
+
+  MD4_ROUND(MD4_H, a, b, c, d, in[3] + MD4_K3, 3);
+  MD4_ROUND(MD4_H, d, a, b, c, in[7] + MD4_K3, 9);
+  MD4_ROUND(MD4_H, c, d, a, b, in[2] + MD4_K3, 11);
+  MD4_ROUND(MD4_H, b, c, d, a, in[6] + MD4_K3, 15);
+  MD4_ROUND(MD4_H, a, b, c, d, in[1] + MD4_K3, 3);
+  MD4_ROUND(MD4_H, d, a, b, c, in[5] + MD4_K3, 9);
+  MD4_ROUND(MD4_H, c, d, a, b, in[0] + MD4_K3, 11);
+  MD4_ROUND(MD4_H, b, c, d, a, in[4] + MD4_K3, 15);
+
+  buf[0] += a;
+  buf[1] += b;
+  buf[2] += c;
+  buf[3] += d;
+
+  return buf[1];
+}
+
+static void str2hashbuf_signed(const char *msg, int len, uint32_t *buf, int num) {
+  uint32_t pad, val;
+  const signed char *scp = (const signed char *)msg;
+
+  pad = (uint32_t)len | ((uint32_t)len << 8);
+  pad |= pad << 16;
+
+  val = pad;
+  if (len > num * 4)
+    len = num * 4;
+  for (int i = 0; i < len; i++) {
+    val = ((int)scp[i]) + (val << 8);
+    if ((i % 4) == 3) {
+      *buf++ = val;
+      val = pad;
+      num--;
+    }
+  }
+  if (--num >= 0)
+    *buf++ = val;
+  while (--num >= 0)
+    *buf++ = pad;
+}
+
+static uint32_t ext4_hash_half_md4(const char *name, uint8_t len,
+                                   const uint32_t seed[4]) {
+  uint32_t buf[4] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476};
+  uint32_t in[8];
+  int remain = len;
+  const char *p = name;
+
+  for (int i = 0; i < 4; i++) {
+    if (seed[i]) {
+      memcpy(buf, seed, sizeof(buf));
+      break;
+    }
+  }
+
+  while (remain > 0) {
+    str2hashbuf_signed(p, remain, in, 8);
+    half_md4_transform(buf, in);
+    remain -= 32;
+    p += 32;
+  }
+
+  uint32_t hash = buf[1] & ~1U;
+  if (hash == (EXT4_HTREE_EOF_32BIT << 1))
+    hash = (EXT4_HTREE_EOF_32BIT - 1) << 1;
+  return hash;
+}
 
 /*
  * Calculate the actual record length for a directory entry.
@@ -70,14 +174,13 @@ static uint32_t write_dir_entry(uint8_t *block, uint32_t offset,
 }
 
 /*
- * Patch an on-disk directory inode: update extent tree, size, flags, and
- * block count. Preserves metadata (uid/gid/mode/times/nlink) from inode_writer.
+ * Build a complete directory inode from file_entry metadata and extent blocks.
  */
-static int patch_dir_inode(struct device *dev, const uint8_t uuid[16],
-                           const struct ext4_layout *layout,
-                           struct ext4_block_allocator *alloc,
-                           uint32_t dir_ino, int use_htree,
-                           const uint64_t *dir_block_nums, uint32_t num_blocks) {
+static int ext4_build_dir_inode_from_entry(
+    struct device *dev, uint32_t csum_seed, const struct file_entry *dir,
+    const struct ext4_layout *layout, struct ext4_block_allocator *alloc,
+    uint32_t dir_ino, int use_htree, const uint64_t *dir_block_nums,
+    uint32_t num_blocks) {
   uint32_t block_size = layout->block_size;
   uint32_t ino_group = (dir_ino - 1) / layout->inodes_per_group;
   uint32_t ino_local = (dir_ino - 1) % layout->inodes_per_group;
@@ -93,19 +196,37 @@ static int patch_dir_inode(struct device *dev, const uint8_t uuid[16],
   if (!inode_buf)
     return -1;
 
-  if (device_read(dev, inode_offset, inode_buf, layout->inode_size) < 0) {
-    free(inode_buf);
-    return -1;
-  }
-
   struct ext4_inode *inode = (struct ext4_inode *)inode_buf;
 
-  uint32_t flags = le32toh(inode->i_flags);
-  flags |= EXT4_EXTENTS_FL;
+  inode->i_mode = htole16((uint16_t)dir->mode);
+  inode->i_uid = htole16((uint16_t)(dir->uid & 0xFFFF));
+  inode->i_uid_high = htole16((uint16_t)(dir->uid >> 16));
+  inode->i_gid = htole16((uint16_t)(dir->gid & 0xFFFF));
+  inode->i_gid_high = htole16((uint16_t)(dir->gid >> 16));
+  inode->i_links_count = htole16((uint16_t)dir->nlink);
+
+  inode->i_atime = htole32((uint32_t)dir->atime_sec);
+  inode->i_ctime = htole32((uint32_t)dir->ctime_sec);
+  inode->i_mtime = htole32((uint32_t)dir->mtime_sec);
+  inode->i_crtime = htole32((uint32_t)dir->crtime_sec);
+  inode->i_atime_extra =
+      htole32(((uint32_t)dir->atime_nsec << 2) |
+              ((uint32_t)((dir->atime_sec >> 32) & 0x3)));
+  inode->i_mtime_extra =
+      htole32(((uint32_t)dir->mtime_nsec << 2) |
+              ((uint32_t)((dir->mtime_sec >> 32) & 0x3)));
+  inode->i_ctime_extra =
+      htole32(((uint32_t)dir->ctime_nsec << 2) |
+              ((uint32_t)((dir->ctime_sec >> 32) & 0x3)));
+  inode->i_crtime_extra =
+      htole32(((uint32_t)dir->crtime_nsec << 2) |
+              ((uint32_t)((dir->crtime_sec >> 32) & 0x3)));
+  inode->i_extra_isize = htole16(32);
+  inode->i_generation = htole32(1);
+
+  uint32_t flags = EXT4_EXTENTS_FL;
   if (use_htree)
     flags |= EXT4_INDEX_FL;
-  else
-    flags &= ~EXT4_INDEX_FL;
   inode->i_flags = htole32(flags);
 
   uint64_t dir_bytes = (uint64_t)num_blocks * block_size;
@@ -227,7 +348,7 @@ static int patch_dir_inode(struct device *dev, const uint8_t uuid[16],
     inode->i_blocks_high = htole16((uint16_t)(sectors_including_leaf >> 32));
   }
 
-  ext4_inode_set_checksum(uuid, inode, layout->inode_size);
+  ext4_inode_set_checksum_ino(csum_seed, inode, layout->inode_size, dir_ino);
 
   int ret = device_write(dev, inode_offset, inode_buf, layout->inode_size);
   free(exts);
@@ -262,61 +383,15 @@ static void finalize_dir_block(uint8_t *block, uint32_t used,
   last_de->rec_len = htole16((uint16_t)(block_size - last_offset));
 }
 
-/*
- * Ext4 Legacy Hash Algorithm for HTree directories
- */
-static uint32_t ext4_legacy_hash(const char *name, uint8_t len) {
-  uint32_t hash = 0x12a3fe2d, padding = 0x37abe8f9;
-  for (int i = 0; i < len; i++) {
-    uint32_t p0 = padding;
-    padding += hash;
-    hash = (hash << 8) | (hash >> 24); /* ROTL 8 */
-    hash ^= p0 ^ ((unsigned char)name[i]);
-  }
-  return hash;
-}
-
-/* Increment bg_used_dirs_count in the on-disk GDT for a block group. */
-static int ext4_gdt_inc_used_dirs(struct device *dev,
-                                  const struct ext4_layout *layout,
-                                  uint32_t group) {
-  if (group >= layout->num_groups)
-    return -1;
-
-  uint64_t gdt_offset = layout->groups[0].gdt_start_block * layout->block_size +
-                        (uint64_t)group * layout->desc_size;
-
-  uint8_t gd_buf[64];
-  memset(gd_buf, 0, sizeof(gd_buf));
-  if (device_read(dev, gdt_offset, gd_buf, layout->desc_size) < 0)
-    return -1;
-
-  struct ext4_group_desc *desc = (struct ext4_group_desc *)gd_buf;
-  uint32_t used_dirs = le16toh(desc->bg_used_dirs_count_lo) |
-                       ((uint32_t)le16toh(desc->bg_used_dirs_count_hi) << 16);
-  used_dirs++;
-  desc->bg_used_dirs_count_lo = htole16((uint16_t)(used_dirs & 0xFFFF));
-  desc->bg_used_dirs_count_hi = htole16((uint16_t)(used_dirs >> 16));
-
-  struct ext4_super_block sb;
-  if (device_read(dev, EXT4_SUPER_OFFSET, &sb, sizeof(sb)) < 0)
-    return -1;
-
-  desc->bg_checksum = 0;
-  uint16_t crc = ext4_crc16(~0, sb.s_uuid, sizeof(sb.s_uuid));
-  uint32_t le_group = htole32(group);
-  crc = ext4_crc16(crc, &le_group, sizeof(le_group));
-  crc = ext4_crc16(crc, desc, layout->desc_size);
-  desc->bg_checksum = htole16(crc);
-
-  return device_write(dev, gdt_offset, gd_buf, layout->desc_size) < 0 ? -1 : 0;
-}
+static uint32_t g_hash_seed[4];
 
 static int compare_file_entry_hash(const void *a, const void *b) {
   const struct dir_entry_link *la = (const struct dir_entry_link *)a;
   const struct dir_entry_link *lb = (const struct dir_entry_link *)b;
-  uint32_t ha = ext4_legacy_hash(la->name, (uint8_t)la->name_len);
-  uint32_t hb = ext4_legacy_hash(lb->name, (uint8_t)lb->name_len);
+  uint32_t ha =
+      ext4_hash_half_md4(la->name, (uint8_t)la->name_len, g_hash_seed);
+  uint32_t hb =
+      ext4_hash_half_md4(lb->name, (uint8_t)lb->name_len, g_hash_seed);
   if (ha < hb)
     return -1;
   if (ha > hb)
@@ -324,7 +399,7 @@ static int compare_file_entry_hash(const void *a, const void *b) {
   return 0;
 }
 
-int ext4_write_directories(struct device *dev, const struct ext4_layout *layout,
+int ext4_write_directories(struct device *dev, struct ext4_layout *layout,
                            const struct btrfs_fs_info *fs_info,
                            const struct inode_map *inode_map,
                            struct ext4_block_allocator *alloc) {
@@ -335,6 +410,10 @@ int ext4_write_directories(struct device *dev, const struct ext4_layout *layout,
   struct ext4_super_block sb;
   if (device_read(dev, EXT4_SUPER_OFFSET, &sb, sizeof(sb)) < 0)
     return -1;
+
+  for (int i = 0; i < 4; i++)
+    g_hash_seed[i] = le32toh(sb.s_hash_seed[i]);
+  uint32_t csum_seed = ext4_csum_seed_from_uuid(sb.s_uuid);
 
   /* For each directory in the filesystem */
   for (uint32_t i = 0; i < fs_info->inode_count; i++) {
@@ -428,7 +507,7 @@ int ext4_write_directories(struct device *dev, const struct ext4_layout *layout,
       dotdot->name[1] = '.';
 
       struct ext4_dx_root_info *info = (void *)(dir_blocks[0] + 24);
-      info->hash_version = EXT4_HASH_LEGACY; /* matches ext4_legacy_hash() */
+      info->hash_version = EXT4_HASH_HALF_MD4;
       info->info_length = 8;
       info->indirect_levels = 1; /* 2-level HTree */
       info->unused_flags = 0;
@@ -534,7 +613,9 @@ int ext4_write_directories(struct device *dev, const struct ext4_layout *layout,
           max_dir_blocks = new_max;
         }
 
-        uint32_t h = use_htree ? ext4_legacy_hash(link->name, name_len) : 0;
+        uint32_t h = use_htree
+                         ? ext4_hash_half_md4(link->name, name_len, g_hash_seed)
+                         : 0;
 
         if (use_htree && node_count >= le16toh(node_limit->limit)) {
           /* Node block is full, spawn a new Node Block! */
@@ -655,10 +736,11 @@ int ext4_write_directories(struct device *dev, const struct ext4_layout *layout,
       }
     }
 
-    if (patch_dir_inode(dev, sb.s_uuid, layout, alloc, dir_ino, use_htree,
-                        dir_block_nums, num_blocks) < 0) {
+    if (ext4_build_dir_inode_from_entry(dev, csum_seed, dir, layout, alloc,
+                                        dir_ino, use_htree, dir_block_nums,
+                                        num_blocks) < 0) {
       fprintf(stderr,
-              "btrfs2ext4: failed to patch directory inode %u\n", dir_ino);
+              "btrfs2ext4: failed to write directory inode %u\n", dir_ino);
       for (uint32_t j = 0; j < num_blocks; j++)
         free(dir_blocks[j]);
       free(dir_blocks);
@@ -668,20 +750,10 @@ int ext4_write_directories(struct device *dev, const struct ext4_layout *layout,
 
     {
       uint32_t ino_group = (dir_ino - 1) / layout->inodes_per_group;
-      if (ext4_gdt_inc_used_dirs(dev, layout, ino_group) < 0) {
-        fprintf(stderr,
-                "btrfs2ext4: failed to update bg_used_dirs_count (ino %u)\n",
-                dir_ino);
-        for (uint32_t j = 0; j < num_blocks; j++)
-          free(dir_blocks[j]);
-        free(dir_blocks);
-        free(dir_block_nums);
-        return -1;
-      }
+      if (ino_group < layout->num_groups)
+        layout->groups[ino_group].used_dirs_count++;
     }
 
-  cleanup:
-    /* Cleanup */
     for (uint32_t b = 0; b < num_blocks; b++)
       free(dir_blocks[b]);
     free(dir_blocks);
