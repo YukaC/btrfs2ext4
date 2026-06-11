@@ -20,6 +20,7 @@
 
 #define _GNU_SOURCE
 #include <assert.h>
+#include <endian.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,7 +31,9 @@
 
 #include "btrfs/btrfs_reader.h"
 #include "btrfs/btrfs_structures.h"
+#include "btrfs/checksum.h"
 #include "btrfs/chunk_tree.h"
+#include "btrfs/tree_walk.h"
 #include "device_io.h"
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_structures.h"
@@ -89,6 +92,85 @@ static int create_temp_device(const char *path, uint64_t size) {
   }
   close(fd);
   return 0;
+}
+
+static void seal_btree_node_crc32(uint8_t *buf, uint32_t nodesize) {
+  uint32_t crc =
+      btrfs_crc32c(~0U, buf + BTRFS_CSUM_SIZE, nodesize - BTRFS_CSUM_SIZE);
+  uint32_t le_crc = htole32(crc);
+  memcpy(buf, &le_crc, 4);
+}
+
+static enum btrfs_walk_error noop_tree_walk_cb(const struct btrfs_disk_key *key,
+                                               const void *data,
+                                               uint32_t data_size, void *ctx) {
+  (void)key;
+  (void)data;
+  (void)data_size;
+  (void)ctx;
+  return BTRFS_WALK_CONTINUE;
+}
+
+static void test_tree_walk_corrupt_bytenr(void) {
+  TEST_START("Shared tree walk: corrupt bytenr rejected");
+
+  const char *path = "/tmp/btrfs2ext4_test_badbytenr.img";
+  if (create_temp_device(path, 16 * 1024 * 1024) < 0) {
+    TEST_FAIL("couldn't create temp file");
+    return;
+  }
+
+  struct device dev;
+  if (device_open(&dev, path, 0) < 0) {
+    TEST_FAIL("device_open failed");
+    unlink(path);
+    return;
+  }
+
+  struct chunk_map map;
+  memset(&map, 0, sizeof(map));
+  map.capacity = 1;
+  map.entries = calloc(1, sizeof(struct chunk_mapping));
+  map.entries[0].logical = 0;
+  map.entries[0].physical = 0;
+  map.entries[0].length = 16 * 1024 * 1024;
+  map.count = 1;
+
+  const uint32_t nodesize = 4096;
+  uint8_t *node = calloc(1, nodesize);
+  if (!node) {
+    TEST_FAIL("OOM");
+    chunk_map_free(&map);
+    device_close(&dev);
+    unlink(path);
+    return;
+  }
+
+  struct btrfs_header *hdr = (struct btrfs_header *)node;
+  hdr->bytenr = htole64(0xDEADBEEFULL);
+  hdr->level = 0;
+  hdr->nritems = htole32(0);
+  seal_btree_node_crc32(node, nodesize);
+
+  if (device_write(&dev, 0, node, nodesize) < 0) {
+    TEST_FAIL("device_write failed");
+    free(node);
+    chunk_map_free(&map);
+    device_close(&dev);
+    unlink(path);
+    return;
+  }
+  free(node);
+
+  int ret =
+      btrfs_tree_walk(&dev, &map, 0, 0, nodesize, BTRFS_CSUM_TYPE_CRC32,
+                      noop_tree_walk_cb, NULL);
+  ASSERT_TRUE(ret < 0, "should reject bytenr mismatch");
+
+  chunk_map_free(&map);
+  device_close(&dev);
+  unlink(path);
+  TEST_PASS();
 }
 
 /* ========================================================================
@@ -1145,9 +1227,12 @@ int main(void) {
       "╚══════════════════════════════════════════════════════════════════╝\n");
   printf("\n");
 
-  /* Group 1: Corrupted superblock */
   printf(
-      "─── GROUP 1: Corrupted Superblock ────────────────────────────────\n");
+      "─── GROUP 0: Shared Tree Walk Hardening ──────────────────────────\n");
+  test_tree_walk_corrupt_bytenr();
+
+  printf(
+      "\n─── GROUP 1: Corrupted Superblock ────────────────────────────────\n");
   test_corrupted_superblock_bad_magic();
   test_corrupted_superblock_zeroed();
   test_corrupted_superblock_bad_csum();

@@ -89,7 +89,8 @@ static int free_space_init(struct free_space *fs,
     const struct file_entry *fe = fs_info->inode_table[i];
     for (uint32_t j = 0; j < fe->extent_count; j++) {
       const struct file_extent *ext = &fe->extents[j];
-      if (ext->type == BTRFS_FILE_EXTENT_INLINE || ext->disk_bytenr == 0)
+      if (ext->type == BTRFS_FILE_EXTENT_INLINE ||
+          ext->type == BTRFS_FILE_EXTENT_PREALLOC || ext->disk_bytenr == 0)
         continue;
 
       uint64_t phys = chunk_map_resolve(fs_info->chunk_map, ext->disk_bytenr);
@@ -233,7 +234,8 @@ static int extent_hash_init(struct extent_hash *eh,
     const struct file_entry *fe = fs_info->inode_table[i];
     for (uint32_t j = 0; j < fe->extent_count; j++) {
       const struct file_extent *ext = &fe->extents[j];
-      if (ext->type == BTRFS_FILE_EXTENT_INLINE || ext->disk_bytenr == 0)
+      if (ext->type == BTRFS_FILE_EXTENT_INLINE ||
+          ext->type == BTRFS_FILE_EXTENT_PREALLOC || ext->disk_bytenr == 0)
         continue;
 
       uint64_t phys = chunk_map_resolve(fs_info->chunk_map, ext->disk_bytenr);
@@ -317,7 +319,8 @@ int relocator_plan(struct relocation_plan *plan,
     struct file_entry *fe = fs_info->inode_table[i];
     for (uint32_t j = 0; j < fe->extent_count; j++) {
       struct file_extent *ext = &fe->extents[j];
-      if (ext->type == BTRFS_FILE_EXTENT_INLINE || ext->disk_bytenr == 0)
+      if (ext->type == BTRFS_FILE_EXTENT_INLINE ||
+          ext->type == BTRFS_FILE_EXTENT_PREALLOC || ext->disk_bytenr == 0)
         continue;
 
       uint64_t phys = chunk_map_resolve(fs_info->chunk_map, ext->disk_bytenr);
@@ -592,7 +595,8 @@ int relocator_execute(struct relocation_plan *plan, struct device *dev,
           struct file_entry *fe = fs_info->inode_table[fi];
           for (uint32_t ej = 0; ej < fe->extent_count; ej++) {
             struct file_extent *ext = &fe->extents[ej];
-            if (ext->type == BTRFS_FILE_EXTENT_INLINE || ext->disk_bytenr == 0)
+            if (ext->type == BTRFS_FILE_EXTENT_INLINE ||
+          ext->type == BTRFS_FILE_EXTENT_PREALLOC || ext->disk_bytenr == 0)
               continue;
             uint64_t phys =
                 chunk_map_resolve(fs_info->chunk_map, ext->disk_bytenr);

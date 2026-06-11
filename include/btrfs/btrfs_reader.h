@@ -110,9 +110,10 @@ struct file_entry {
  * ======================================================================== */
 
 struct used_extent {
-  uint64_t start;  /* physical byte offset */
-  uint64_t length; /* length in bytes */
-  uint64_t flags;  /* BTRFS_BLOCK_GROUP_DATA/METADATA/SYSTEM */
+  uint64_t start;       /* physical byte offset */
+  uint64_t length;      /* length in bytes */
+  uint64_t flags;       /* BTRFS_BLOCK_GROUP_DATA/METADATA/SYSTEM */
+  uint64_t generation;  /* btrfs_extent_item.generation */
 };
 
 struct used_block_map {
@@ -220,5 +221,13 @@ void btrfs_free_fs(struct btrfs_fs_info *fs_info);
  */
 struct file_entry *btrfs_find_inode(struct btrfs_fs_info *fs_info,
                                     uint64_t ino);
+
+#ifdef BTRFS_TESTING
+void btrfs_test_set_malloc_fail_at(size_t size);
+void btrfs_test_cow_hash_reset(void);
+int btrfs_test_cow_hash_check_and_add(uint64_t bytenr, uint64_t num_bytes);
+void btrfs_test_apply_prealloc_rules(struct file_extent *ext);
+int btrfs_test_alloc_inline_data(size_t len, uint8_t **out);
+#endif
 
 #endif /* BTRFS_READER_H */

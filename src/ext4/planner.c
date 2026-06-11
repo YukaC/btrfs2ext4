@@ -112,7 +112,8 @@ int ext4_plan_layout(struct ext4_layout *layout, uint64_t device_size,
         /* Actual data blocks (ignoring sparse holes) */
         for (uint32_t e = 0; e < fe->extent_count; e++) {
           struct file_extent *ext = &fe->extents[e];
-          if (ext->type != BTRFS_FILE_EXTENT_INLINE && ext->disk_bytenr != 0) {
+          if (ext->type != BTRFS_FILE_EXTENT_INLINE &&
+              ext->type != BTRFS_FILE_EXTENT_PREALLOC && ext->disk_bytenr != 0) {
             data_blocks_required +=
                 (ext->num_bytes + block_size - 1) / block_size;
           }
@@ -329,7 +330,8 @@ uint32_t ext4_find_conflicts(const struct ext4_layout *layout,
     const struct file_entry *fe = fs_info->inode_table[i];
     for (uint32_t j = 0; j < fe->extent_count; j++) {
       const struct file_extent *ext = &fe->extents[j];
-      if (ext->type == BTRFS_FILE_EXTENT_INLINE || ext->disk_bytenr == 0)
+      if (ext->type == BTRFS_FILE_EXTENT_INLINE ||
+          ext->type == BTRFS_FILE_EXTENT_PREALLOC || ext->disk_bytenr == 0)
         continue;
 
       /* Convert the extent's logical address to physical */

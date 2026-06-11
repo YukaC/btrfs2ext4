@@ -154,7 +154,8 @@ void ext4_block_alloc_mark_fs_data(struct ext4_block_allocator *alloc,
     const struct file_entry *fe = fs_info->inode_table[i];
     for (uint32_t j = 0; j < fe->extent_count; j++) {
       const struct file_extent *ext = &fe->extents[j];
-      if (ext->type == BTRFS_FILE_EXTENT_INLINE || ext->disk_bytenr == 0)
+      if (ext->type == BTRFS_FILE_EXTENT_INLINE ||
+          ext->type == BTRFS_FILE_EXTENT_PREALLOC || ext->disk_bytenr == 0)
         continue;
 
       uint64_t device_size = (uint64_t)layout->total_blocks * block_size;
@@ -221,7 +222,8 @@ static int resolve_extents(struct ext4_block_allocator *alloc,
   uint32_t count = 0;
   for (uint32_t i = 0; i < fe->extent_count; i++) {
     const struct file_extent *bext = &fe->extents[i];
-    if (bext->type == BTRFS_FILE_EXTENT_INLINE || bext->disk_bytenr == 0)
+    if (bext->type == BTRFS_FILE_EXTENT_INLINE ||
+        bext->type == BTRFS_FILE_EXTENT_PREALLOC || bext->disk_bytenr == 0)
       continue;
 
     uint64_t phys = extent_resolve_phys(bext, chunk_map, device_size);
