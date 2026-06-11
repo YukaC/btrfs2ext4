@@ -1,6 +1,8 @@
 # Build and IDE files
 build/
-.cursor/
+.cursor/*
+!.cursor/skills/
+!.cursor/skills/**
 btrfs2ext4
 test_stress
 test_fuzz
