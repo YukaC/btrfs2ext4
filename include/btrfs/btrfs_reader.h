@@ -228,6 +228,10 @@ void btrfs_test_cow_hash_reset(void);
 int btrfs_test_cow_hash_check_and_add(uint64_t bytenr, uint64_t num_bytes);
 void btrfs_test_apply_prealloc_rules(struct file_extent *ext);
 int btrfs_test_alloc_inline_data(size_t len, uint8_t **out);
+int btrfs_test_parse_extent_item(uint8_t key_type, uint64_t key_objectid,
+                                 uint64_t key_offset, uint32_t nodesize,
+                                 const void *data, uint32_t data_size,
+                                 struct used_extent *out);
 #endif
 
 #endif /* BTRFS_READER_H */

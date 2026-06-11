@@ -51,6 +51,7 @@ static int file_entry_add_extent(struct file_entry *fe,
         last->offset == 0 && ext->offset == 0 &&
         last->file_offset + last->num_bytes == ext->file_offset &&
         last->disk_bytenr != 0 && ext->disk_bytenr != 0 &&
+        last->is_physical == ext->is_physical &&
         last->disk_bytenr + last->disk_num_bytes == ext->disk_bytenr) {
 
       last->num_bytes += ext->num_bytes;
@@ -320,11 +321,22 @@ static int cow_hash_rehash(struct cow_hash *h) {
  * Treat disk_bytenr==0 or unwritten prealloc as a sparse hole — never read
  * uninitialized on-disk blocks as file content.
  */
+static int btrfs_extent_is_sparse(const struct btrfs_file_extent_item *fi,
+                                  const struct file_extent *ext) {
+  if (ext->type != BTRFS_FILE_EXTENT_PREALLOC)
+    return 0;
+  if (ext->num_bytes == 0)
+    return 1;
+  /* Btrfs PREALLOC may reserve blocks (fi->disk_bytenr) without writing data. */
+  if (fi && le64toh(fi->disk_bytenr) == 0)
+    return 1;
+  (void)fi;
+  return 1;
+}
+
 static void apply_prealloc_hole_rules(struct file_extent *ext) {
-  if (ext->disk_bytenr == 0 || ext->num_bytes == 0) {
-    ext->disk_bytenr = 0;
-    ext->disk_num_bytes = 0;
-  } else {
+  if (btrfs_extent_is_sparse(NULL, ext) || ext->disk_bytenr == 0 ||
+      ext->num_bytes == 0) {
     ext->disk_bytenr = 0;
     ext->disk_num_bytes = 0;
   }
@@ -355,6 +367,7 @@ static int cow_hash_check_and_add(struct cow_hash *h, uint64_t bytenr,
 struct fs_tree_ctx {
   struct btrfs_fs_info *fs_info;
   struct cow_hash cow_track;
+  uint64_t prealloc_skipped;
 };
 
 static int fs_tree_callback(const struct btrfs_disk_key *key, const void *data,
@@ -484,7 +497,10 @@ static int fs_tree_callback(const struct btrfs_disk_key *key, const void *data,
         ext.disk_num_bytes = le64toh(fi->disk_num_bytes);
         ext.offset = le64toh(fi->offset);
       }
-      apply_prealloc_hole_rules(&ext);
+      if (btrfs_extent_is_sparse(fi, &ext)) {
+        apply_prealloc_hole_rules(&ext);
+        fctx->prealloc_skipped++;
+      }
     } else {
       /* Regular extent */
       if (data_size >= sizeof(struct btrfs_file_extent_item)) {
@@ -634,7 +650,8 @@ struct extent_tree_ctx {
 };
 
 static int used_block_map_add(struct used_block_map *map, uint64_t start,
-                              uint64_t length, uint64_t flags) {
+                              uint64_t length, uint64_t flags,
+                              uint64_t generation) {
   if (map->count >= map->capacity) {
     uint32_t new_cap = map->capacity ? map->capacity * 2 : 256;
     struct used_extent *new_ext =
@@ -649,6 +666,7 @@ static int used_block_map_add(struct used_block_map *map, uint64_t start,
   map->extents[map->count].start = start;
   map->extents[map->count].length = length;
   map->extents[map->count].flags = flags;
+  map->extents[map->count].generation = generation;
   map->count++;
   return 0;
 }
@@ -674,7 +692,9 @@ static int extent_tree_callback(const struct btrfs_disk_key *key,
       }
 
       uint64_t flags = le64toh(ei->flags);
-      used_block_map_add(ectx->map, start, length, flags);
+      uint64_t generation = le64toh(ei->generation);
+      if (used_block_map_add(ectx->map, start, length, flags, generation) < 0)
+        return -1;
     }
   }
 
@@ -753,6 +773,11 @@ int btrfs_read_fs(struct device *dev, struct btrfs_fs_info *fs_info) {
 
   free(fctx.cow_track.buckets);
 
+  if (fctx.prealloc_skipped > 0) {
+    printf("  Skipped %lu sparse PREALLOC extent(s) (unwritten holes)\n",
+           (unsigned long)fctx.prealloc_skipped);
+  }
+
   /* Step 6: Walk extent tree to build used-block map */
   printf("Step 6/6: Walking extent tree...\n");
 
@@ -782,7 +807,7 @@ int btrfs_read_fs(struct device *dev, struct btrfs_fs_info *fs_info) {
         if (ext->type == BTRFS_FILE_EXTENT_INLINE || ext->disk_bytenr == 0)
           continue;
         used_block_map_add(&fs_info->used_blocks, ext->disk_bytenr,
-                           ext->disk_num_bytes, BTRFS_BLOCK_GROUP_DATA);
+                           ext->disk_num_bytes, BTRFS_BLOCK_GROUP_DATA, 0);
       }
     }
   }
@@ -955,5 +980,26 @@ void btrfs_test_apply_prealloc_rules(struct file_extent *ext) {
 int btrfs_test_alloc_inline_data(size_t len, uint8_t **out) {
   *out = btrfs_test_malloc(len);
   return *out ? 0 : -1;
+}
+
+int btrfs_test_parse_extent_item(uint8_t key_type, uint64_t key_objectid,
+                                 uint64_t key_offset, uint32_t nodesize,
+                                 const void *data, uint32_t data_size,
+                                 struct used_extent *out) {
+  if (!out || data_size < sizeof(struct btrfs_extent_item))
+    return -1;
+
+  const struct btrfs_extent_item *ei = (const struct btrfs_extent_item *)data;
+  out->start = key_objectid;
+  if (key_type == BTRFS_EXTENT_ITEM_KEY)
+    out->length = key_offset;
+  else if (key_type == BTRFS_METADATA_ITEM_KEY)
+    out->length = nodesize;
+  else
+    return -1;
+
+  out->flags = le64toh(ei->flags);
+  out->generation = le64toh(ei->generation);
+  return 0;
 }
 #endif /* BTRFS_TESTING */

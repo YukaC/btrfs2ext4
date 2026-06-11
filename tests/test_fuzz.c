@@ -12,10 +12,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <endian.h>
 
 #include "../include/btrfs/btrfs_reader.h"
 #include "../include/btrfs/btrfs_structures.h"
 #include "../include/btrfs/chunk_tree.h"
+#include "../include/btrfs/checksum.h"
+#include "../include/btrfs/tree_walk.h"
 #include "../include/btrfs/decompress.h"
 #include "../include/device_io.h"
 #include "../include/ext4/ext4_planner.h"
@@ -320,6 +323,71 @@ static void test_inline_extent_oom_propagation(void) {
   printf("OK\n");
 }
 
+
+static void seal_fuzz_btree_node(uint8_t *buf, uint32_t nodesize) {
+  uint32_t crc =
+      btrfs_crc32c(~0U, buf + BTRFS_CSUM_SIZE, nodesize - BTRFS_CSUM_SIZE);
+  uint32_t le_crc = htole32(crc);
+  memcpy(buf, &le_crc, 4);
+}
+
+static enum btrfs_walk_error fuzz_noop_cb(const struct btrfs_disk_key *key,
+                                          const void *data, uint32_t data_size,
+                                          void *ctx) {
+  (void)key;
+  (void)data;
+  (void)data_size;
+  (void)ctx;
+  return BTRFS_WALK_CONTINUE;
+}
+
+static void test_malicious_chunk_tree_nritems(void) {
+  printf("  [7/7] Malicious chunk tree: absurd nritems rejected... ");
+
+  const char *path = "/tmp/btrfs2ext4_fuzz_badnritems.img";
+  FILE *f = fopen(path, "wb");
+  if (!f) {
+    fprintf(stderr, "FAIL: fopen\n");
+    assert(0);
+  }
+  uint8_t zero[4096] = {0};
+  for (int i = 0; i < 4096; i++)
+    fwrite(zero, 1, sizeof(zero), f);
+  fclose(f);
+
+  struct device dev;
+  assert(device_open(&dev, path, 0) == 0);
+
+  struct chunk_map map;
+  memset(&map, 0, sizeof(map));
+  map.capacity = 1;
+  map.entries = calloc(1, sizeof(struct chunk_mapping));
+  map.entries[0].logical = 0;
+  map.entries[0].physical = 0;
+  map.entries[0].length = 16 * 1024 * 1024;
+  map.count = 1;
+
+  const uint32_t nodesize = 4096;
+  uint8_t *node = calloc(1, nodesize);
+  struct btrfs_header *hdr = (struct btrfs_header *)node;
+  hdr->bytenr = htole64(0);
+  hdr->level = 0;
+  hdr->generation = htole64(42);
+  hdr->nritems = htole32(0x7fffffff);
+  seal_fuzz_btree_node(node, nodesize);
+  assert(device_write(&dev, 0, node, nodesize) == 0);
+  free(node);
+
+  int ret = btrfs_tree_walk(&dev, &map, 0, 0, nodesize, BTRFS_CSUM_TYPE_CRC32,
+                            fuzz_noop_cb, NULL);
+  ASSERT_TRUE(ret < 0, "malicious nritems must fail walk");
+
+  chunk_map_free(&map);
+  device_close(&dev);
+  unlink(path);
+  printf("OK\n");
+}
+
 int main() {
   printf("=== BTRFS2EXT4 FUZZ & EDGE CASE TESTS ===\n\n");
   test_decompress_bombs();
@@ -328,6 +396,7 @@ int main() {
   test_cow_hash_bytenr_and_length();
   test_prealloc_disk_bytenr_zero_skipped();
   test_inline_extent_oom_propagation();
+  test_malicious_chunk_tree_nritems();
   /* test_extent_tree_depth();  // opcional, sólo profundidad/extents */
   printf("\nAll extreme edge case tests passed.\n");
   return 0;

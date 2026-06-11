@@ -113,6 +113,14 @@ int btrfs_tree_walk(struct device *dev, const struct chunk_map *chunk_map,
       break;
     }
 
+    if (le64toh(hdr->generation) == 0) {
+      fprintf(stderr,
+              "btrfs2ext4: btree node generation=0 at logical 0x%lx\n",
+              (unsigned long)node_logical);
+      ret = -1;
+      break;
+    }
+
     if (level > 0) {
       const struct btrfs_key_ptr *ptrs =
           (const struct btrfs_key_ptr *)(node_buf +

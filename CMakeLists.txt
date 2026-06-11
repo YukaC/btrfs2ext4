@@ -256,6 +256,7 @@ endif()
 
 # --- Integration Test ---
 add_executable(test_integration tests/test_integration.c ${BTRFS2EXT4_LIB_SOURCES})
+target_compile_definitions(test_integration PRIVATE BTRFS_TESTING=1)
 target_link_libraries(test_integration
     ${UUID_LIBRARIES}
     ${ZLIB_LIBRARIES}
