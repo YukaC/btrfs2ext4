@@ -1,6 +1,8 @@
 # Build and IDE files
 build/
-.cursor/
+.cursor/*
+!.cursor/skills/
+!.cursor/skills/**
 
 # npx skills CLI — canonical store and non-Cursor agent installs
 /skills/
