@@ -205,10 +205,11 @@ static int resolve_extents(struct ext4_block_allocator *alloc,
 
     uint64_t phys = chunk_map_resolve(chunk_map, bext->disk_bytenr);
     if (phys == (uint64_t)-1)
-      continue;
+      phys = bext->disk_bytenr;
 
     uint32_t file_block_start = (uint32_t)(bext->file_offset / block_size);
-    uint32_t num_blocks = (uint32_t)(bext->num_bytes / block_size);
+    uint32_t num_blocks =
+        (uint32_t)((bext->num_bytes + block_size - 1) / block_size);
     uint64_t phys_block_start = phys / block_size;
 
     if (num_blocks == 0)

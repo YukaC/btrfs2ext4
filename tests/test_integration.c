@@ -163,6 +163,24 @@ static int build_test_layout(struct ext4_layout *layout) {
   return ext4_plan_layout(layout, TEST_IMG_SIZE, TEST_BLOCK_SIZE, 16384, NULL);
 }
 
+static int read_block_bitmap_bit(struct device *dev, const struct ext4_layout *layout, uint64_t block) {
+  for (uint32_t g = 0; g < layout->num_groups; g++) {
+    const struct ext4_bg_layout *bg = &layout->groups[g];
+    uint64_t g_start = bg->group_start_block;
+    uint64_t g_end = g_start + layout->blocks_per_group;
+    if (g == layout->num_groups - 1 && g_end > layout->total_blocks) g_end = layout->total_blocks;
+    if (block >= g_start && block < g_end) {
+      uint8_t bbm[TEST_BLOCK_SIZE];
+      if (read_raw(dev, bg->block_bitmap_block * TEST_BLOCK_SIZE, bbm, TEST_BLOCK_SIZE) != 0) return -1;
+      uint64_t local = block - g_start;
+      return (bbm[local / 8] >> (local % 8)) & 1;
+    }
+  }
+  return -1;
+}
+
+
+
 /* =========================================================================
  * GROUP A — device_batch API
  *
@@ -1067,6 +1085,44 @@ static void test_dir_huge_all_blocks_reachable(void) {
   cleanup_test_dev(&dev);
 }
 
+static void test_bitmap_reflects_dir_blocks(void) {
+  TEST_START("E-4  block bitmap: dir blocks marcados tras secuencia Pass 3");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "bmDir", TEST_IMG_SIZE) == 0, "no se pudo crear imagen");
+  struct ext4_layout layout;
+  REQUIRE(build_test_layout(&layout) == 0, "planner falló");
+  struct btrfs_fs_info *fs = make_big_dir_fs(60);
+  struct inode_map imap; memset(&imap, 0, sizeof(imap));
+  inode_map_add(&imap, 256, EXT4_ROOT_INO);
+  for (int i = 0; i < 60; i++) inode_map_add(&imap, (uint64_t)(257 + i), (uint32_t)(EXT4_GOOD_OLD_FIRST_INO + i));
+  struct ext4_block_allocator alloc; ext4_block_alloc_init(&alloc, &layout);
+  REQUIRE(ext4_write_gdt(&dev, &layout) == 0, "write_gdt falló");
+  REQUIRE(ext4_write_directories(&dev, &layout, fs, &imap, &alloc) == 0, "write_directories falló");
+  REQUIRE(ext4_write_bitmaps(&dev, &layout, &alloc, &imap) == 0, "write_bitmaps falló");
+  uint32_t ino_group = (EXT4_ROOT_INO - 1) / layout.inodes_per_group;
+  uint32_t ino_local = (EXT4_ROOT_INO - 1) % layout.inodes_per_group;
+  uint64_t ino_offset = layout.groups[ino_group].inode_table_start * TEST_BLOCK_SIZE + (uint64_t)ino_local * layout.inode_size;
+  struct ext4_inode inode;
+  REQUIRE(read_raw(&dev, ino_offset, &inode, sizeof(inode)) == 0, "lectura inode raíz falló");
+  struct ext4_extent_header *eh = (struct ext4_extent_header *)inode.i_block;
+  REQUIRE(le16toh(eh->eh_magic) == EXT4_EXT_MAGIC, "extent magic inválido");
+  uint16_t n_extents = le16toh(eh->eh_entries);
+  struct ext4_extent *exts = (struct ext4_extent *)((uint8_t *)inode.i_block + sizeof(*eh));
+  uint64_t dir_blocks_checked = 0;
+  for (uint16_t e = 0; e < n_extents; e++) {
+    uint64_t phys = le32toh(exts[e].ee_start_lo) | ((uint64_t)le16toh(exts[e].ee_start_hi) << 32);
+    uint16_t len = le16toh(exts[e].ee_len);
+    for (uint16_t b = 0; b < len; b++) {
+      int bit = read_block_bitmap_bit(&dev, &layout, phys + b);
+      if (bit != 1) { TEST_FAIL("bloque de directorio no marcado en block bitmap"); inode_map_free(&imap); free_big_dir_fs(fs); ext4_free_layout(&layout); ext4_block_alloc_free(&alloc); cleanup_test_dev(&dev); return; }
+      dir_blocks_checked++;
+    }
+  }
+  CHECK(dir_blocks_checked > 0, "ningún bloque de directorio referenciado");
+  inode_map_free(&imap); free_big_dir_fs(fs); ext4_free_layout(&layout); ext4_block_alloc_free(&alloc); cleanup_test_dev(&dev); TEST_PASS();
+}
+
+
 /* =========================================================================
  * GROUP F — GDT Checksums (Bug B-6)
  *
@@ -1733,6 +1789,7 @@ int main(void) {
   test_dir_small_inline_extents();
   test_dir_large_depth1_extent_tree();
   test_dir_huge_all_blocks_reachable();
+  test_bitmap_reflects_dir_blocks();
 
   /* GROUP F: GDT Checksums */
   printf("\n─── GROUP F: GDT Checksums (Bug B-6) "

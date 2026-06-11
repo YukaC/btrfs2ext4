@@ -646,17 +646,7 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   }
 
   if (progress)
-    progress("Pass 3", 55, "Writing bitmaps...");
-
-  /* Bug A fix: bitmaps are written AFTER inode tables so the inode_map
-   * is fully populated and ext4_write_bitmaps can mark active inodes. */
-  if (ext4_write_bitmaps(&st.dev, &st.layout, &st.alloc, &st.ino_map) < 0) {
-    fprintf(stderr, "btrfs2ext4: failed to write bitmaps\n");
-    goto cleanup;
-  }
-
-  if (progress)
-    progress("Pass 3", 60, "Writing directory entries...");
+    progress("Pass 3", 55, "Writing directory entries...");
 
   if (ext4_write_directories(&st.dev, &st.layout, &st.fs_info, &st.ino_map, &st.alloc) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to write directories\n");
@@ -664,7 +654,7 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   }
 
   if (progress)
-    progress("Pass 3", 85, "Writing journal...");
+    progress("Pass 3", 70, "Writing journal...");
 
   if (ext4_write_journal(&st.dev, &st.layout, &st.alloc, st.dev.size) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to write journal\n");
@@ -673,6 +663,16 @@ int btrfs2ext4_convert(const struct convert_options *opts,
 
   if (ext4_finalize_journal_inode(&st.dev, &st.layout) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to finalize journal inode\n");
+    goto cleanup;
+  }
+
+  if (progress)
+    progress("Pass 3", 80, "Writing bitmaps...");
+
+  /* Bitmaps must run after all ext4_alloc_block calls (dirs, journal,
+   * extent trees) so every allocated block is marked used on disk. */
+  if (ext4_write_bitmaps(&st.dev, &st.layout, &st.alloc, &st.ino_map) < 0) {
+    fprintf(stderr, "btrfs2ext4: failed to write bitmaps\n");
     goto cleanup;
   }
 

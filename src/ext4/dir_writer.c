@@ -13,6 +13,7 @@
 
 #include "btrfs/btrfs_reader.h"
 #include "device_io.h"
+#include "ext4/ext4_crc16.h"
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_structures.h"
 #include "ext4/ext4_writer.h"
@@ -109,6 +110,44 @@ static uint32_t ext4_legacy_hash(const char *name, uint8_t len) {
   return hash;
 }
 
+static int ext4_gdt_inc_used_dirs(struct device *dev,
+                                  const struct ext4_layout *layout,
+                                  uint32_t group) {
+  if (group >= layout->num_groups)
+    return -1;
+  uint64_t gdt_offset = layout->groups[0].gdt_start_block * layout->block_size +
+                        (uint64_t)group * layout->desc_size;
+  uint8_t gd_buf[64];
+  memset(gd_buf, 0, sizeof(gd_buf));
+  if (device_read(dev, gdt_offset, gd_buf, layout->desc_size) < 0)
+    return -1;
+  struct ext4_group_desc *desc = (struct ext4_group_desc *)gd_buf;
+  uint32_t used_dirs = le16toh(desc->bg_used_dirs_count_lo) |
+                       ((uint32_t)le16toh(desc->bg_used_dirs_count_hi) << 16);
+  used_dirs++;
+  desc->bg_used_dirs_count_lo = htole16((uint16_t)(used_dirs & 0xFFFF));
+  desc->bg_used_dirs_count_hi = htole16((uint16_t)(used_dirs >> 16));
+  struct ext4_super_block sb;
+  if (device_read(dev, EXT4_SUPER_OFFSET, &sb, sizeof(sb)) < 0)
+    return -1;
+  desc->bg_checksum = 0;
+  uint16_t crc = ext4_crc16(~0, sb.s_uuid, sizeof(sb.s_uuid));
+  uint32_t le_group = htole32(group);
+  crc = ext4_crc16(crc, &le_group, sizeof(le_group));
+  crc = ext4_crc16(crc, desc, layout->desc_size);
+  desc->bg_checksum = htole16(crc);
+  return device_write(dev, gdt_offset, gd_buf, layout->desc_size) < 0 ? -1 : 0;
+}
+
+static uint32_t count_subdirectories(const struct file_entry *dir) {
+  uint32_t n = 0;
+  for (uint32_t c = 0; c < dir->child_count; c++) {
+    if (S_ISDIR(dir->children[c].target->mode))
+      n++;
+  }
+  return n;
+}
+
 static int compare_file_entry_hash(const void *a, const void *b) {
   const struct dir_entry_link *la = (const struct dir_entry_link *)a;
   const struct dir_entry_link *lb = (const struct dir_entry_link *)b;
@@ -161,8 +200,6 @@ int ext4_write_directories(struct device *dev, const struct ext4_layout *layout,
 
     int use_htree = (dir_size > block_size);
     if (use_htree) {
-      /* Signal to inode_writer that this directory needs EXT4_INDEX_FL */
-      ((struct file_entry *)dir)->ext4_flags |= EXT4_INDEX_FL;
       qsort(((struct file_entry *)dir)->children, dir->child_count,
             sizeof(struct dir_entry_link), compare_file_entry_hash);
     }
@@ -223,8 +260,7 @@ int ext4_write_directories(struct device *dev, const struct ext4_layout *layout,
       dotdot->name[1] = '.';
 
       struct ext4_dx_root_info *info = (void *)(dir_blocks[0] + 24);
-      info->hash_version =
-          EXT4_HASH_HALF_MD4; /* Must match sb.s_def_hash_version */
+      info->hash_version = EXT4_HASH_LEGACY; /* matches ext4_legacy_hash() */
       info->info_length = 8;
       info->indirect_levels = 1; /* 2-level HTree */
       info->unused_flags = 0;
@@ -471,10 +507,26 @@ int ext4_write_directories(struct device *dev, const struct ext4_layout *layout,
       if (inode_buf) {
         struct ext4_inode *tmp_inode = (struct ext4_inode *)inode_buf;
 
-        /* Set directory inode fields */
-        tmp_inode->i_mode = htole16(040755);   /* Directory, rwxr-xr-x */
-        tmp_inode->i_links_count = htole16(2); /* . and .. */
-        tmp_inode->i_flags = htole32(EXT4_EXTENTS_FL | EXT4_INDEX_FL);
+        tmp_inode->i_mode = htole16((uint16_t)dir->mode);
+        tmp_inode->i_uid = htole16((uint16_t)(dir->uid & 0xFFFF));
+        tmp_inode->i_uid_high = htole16((uint16_t)(dir->uid >> 16));
+        tmp_inode->i_gid = htole16((uint16_t)(dir->gid & 0xFFFF));
+        tmp_inode->i_gid_high = htole16((uint16_t)(dir->gid >> 16));
+        uint32_t num_subdirs = count_subdirectories(dir);
+        tmp_inode->i_links_count = htole16((uint16_t)(2 + num_subdirs));
+        tmp_inode->i_atime = htole32((uint32_t)dir->atime_sec);
+        tmp_inode->i_ctime = htole32((uint32_t)dir->ctime_sec);
+        tmp_inode->i_mtime = htole32((uint32_t)dir->mtime_sec);
+        tmp_inode->i_crtime = htole32((uint32_t)dir->crtime_sec);
+        tmp_inode->i_atime_extra = htole32(((uint32_t)dir->atime_nsec << 2) | ((uint32_t)((dir->atime_sec >> 32) & 0x3)));
+        tmp_inode->i_mtime_extra = htole32(((uint32_t)dir->mtime_nsec << 2) | ((uint32_t)((dir->mtime_sec >> 32) & 0x3)));
+        tmp_inode->i_ctime_extra = htole32(((uint32_t)dir->ctime_nsec << 2) | ((uint32_t)((dir->ctime_sec >> 32) & 0x3)));
+        tmp_inode->i_crtime_extra = htole32(((uint32_t)dir->crtime_nsec << 2) | ((uint32_t)((dir->crtime_sec >> 32) & 0x3)));
+        tmp_inode->i_extra_isize = htole16(32);
+        uint32_t flags = EXT4_EXTENTS_FL;
+        if (use_htree && num_blocks > 1)
+          flags |= EXT4_INDEX_FL;
+        tmp_inode->i_flags = htole32(flags);
 
         /* Directory size = num_blocks * block_size */
         uint64_t dir_size = (uint64_t)num_blocks * block_size;
@@ -602,6 +654,11 @@ int ext4_write_directories(struct device *dev, const struct ext4_layout *layout,
         device_write(dev, inode_offset, inode_buf, layout->inode_size);
         free(exts);
         free(inode_buf);
+      }
+      if (ext4_gdt_inc_used_dirs(dev, layout, ino_group) < 0) {
+        fprintf(stderr, "btrfs2ext4: failed to update bg_used_dirs_count (ino %u)\n", dir_ino);
+        for (uint32_t j = 0; j < num_blocks; j++) free(dir_blocks[j]);
+        free(dir_blocks); free(dir_block_nums); return -1;
       }
     }
 
