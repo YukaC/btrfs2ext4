@@ -436,7 +436,16 @@ static int fs_tree_callback(const struct btrfs_disk_key *key, const void *data,
         ext.disk_bytenr = le64toh(fi->disk_bytenr);
         ext.disk_num_bytes = le64toh(fi->disk_num_bytes);
         ext.num_bytes = le64toh(fi->num_bytes);
-        /* fi->offset is the offset within the extent */
+
+        if (ext.disk_bytenr != 0 &&
+            chunk_map_resolve(fs_info->chunk_map, ext.disk_bytenr) ==
+                (uint64_t)-1) {
+          uint64_t dev_size =
+              fs_info->dev ? fs_info->dev->size
+                           : le64toh(fs_info->sb.total_bytes);
+          if (dev_size > 0 && ext.disk_bytenr < dev_size)
+            ext.is_physical = 1;
+        }
 
         /* CoW Deduplication Tracking (Phase 4.1) */
         if (ext.disk_bytenr != 0 && ext.type != BTRFS_FILE_EXTENT_INLINE) {

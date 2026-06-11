@@ -28,6 +28,16 @@
 #include "relocator.h"
 #include "thread_pool.h"
 
+static int dir_needs_htree(const struct file_entry *dir, uint32_t block_size) {
+  uint32_t dir_size = 24;
+  for (uint32_t c = 0; c < dir->child_count; c++) {
+    uint8_t nl = (uint8_t)dir->children[c].name_len;
+    if (nl > 0)
+      dir_size += (uint8_t)((8 + nl + 3) & ~3);
+  }
+  return dir_size > block_size;
+}
+
 /* Global decomp pool */
 static struct thread_pool *g_decomp_pool = NULL;
 
@@ -262,6 +272,10 @@ int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
 
   printf("Writing inode tables...\n");
 
+  struct ext4_super_block sb;
+  if (device_read(dev, EXT4_SUPER_OFFSET, &sb, sizeof(sb)) < 0)
+    return -1;
+
   g_decomp_pool = thread_pool_create(4, 1024);
 
   /* Step 1: Assign ext4 inode numbers to btrfs inodes.
@@ -354,6 +368,7 @@ int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
                 htole16(jnl_blocks > 32768 ? 32768 : (uint16_t)jnl_blocks);
             jext->ee_start_lo = htole32((uint32_t)(jnl_start & 0xFFFFFFFF));
             jext->ee_start_hi = htole16((uint16_t)(jnl_start >> 32));
+            ext4_inode_set_checksum(sb.s_uuid, jnl_inode, inode_size);
           }
           continue;
         } else {
@@ -687,14 +702,17 @@ int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
                                  layout);
         }
       } else if (S_ISDIR(fe->mode)) {
-        /* Directories will have their data blocks set during dir writing */
-        ext_inode->i_flags |= htole32(EXT4_EXTENTS_FL | fe->ext4_flags);
+        uint32_t dir_flags = EXT4_EXTENTS_FL;
+        if (dir_needs_htree(fe, block_size))
+          dir_flags |= EXT4_INDEX_FL;
+        ext_inode->i_flags |= htole32(dir_flags);
         struct ext4_extent_header *eh =
             (struct ext4_extent_header *)ext_inode->i_block;
         eh->eh_magic = htole16(EXT4_EXT_MAGIC);
         eh->eh_entries = htole16(0);
         eh->eh_max = htole16(4);
         eh->eh_depth = htole16(0);
+        eh->eh_generation = htole32(0);
       } else if (S_ISLNK(fe->mode) && fe->symlink_target) {
         /* Symlinks: store target in i_block if short enough (<60 bytes),
          * otherwise need an extent-based data block */
@@ -824,6 +842,7 @@ int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
       }
 
       ext_inode->i_generation = htole32(1); /* Generation number */
+      ext4_inode_set_checksum(sb.s_uuid, ext_inode, inode_size);
     }
 
     /* Write the inode table for this group */

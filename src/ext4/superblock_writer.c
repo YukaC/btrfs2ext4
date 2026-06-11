@@ -70,13 +70,12 @@ int ext4_write_superblock(struct device *dev, const struct ext4_layout *layout,
 
   /* Feature flags:
    * - COMPAT: EXT_ATTR, DIR_INDEX, HAS_JOURNAL
-   * - INCOMPAT: FILETYPE, EXTENTS, 64BIT, FLEX_BG
+   * - INCOMPAT: FILETYPE, EXTENTS, 64BIT, FLEX_BG (CSUM_SEED disabled)
    * - RO_COMPAT: SPARSE_SUPER, LARGE_FILE, HUGE_FILE, GDT_CSUM,
-   *              DIR_NLINK, EXTRA_ISIZE
+   *              DIR_NLINK, EXTRA_ISIZE, METADATA_CSUM
    *
-   * CSUM_SEED and METADATA_CSUM are intentionally disabled: btrfs2ext4 does
-   * not yet compute inode/block-bitmap/metadata checksums on write. Enabling
-   * those flags would make e2fsck reject or corrupt-fix valid structures.
+   * Phase 1: METADATA_CSUM for inode checksums; CSUM_SEED disabled (seed from
+   * UUID). Superblock checksum itself is deferred to a later phase.
    */
   sb.s_feature_compat = htole32(
       EXT4_FEATURE_COMPAT_EXT_ATTR | EXT4_FEATURE_COMPAT_DIR_INDEX |
@@ -87,7 +86,8 @@ int ext4_write_superblock(struct device *dev, const struct ext4_layout *layout,
   sb.s_feature_ro_compat = htole32(
       EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER | EXT4_FEATURE_RO_COMPAT_LARGE_FILE |
       EXT4_FEATURE_RO_COMPAT_HUGE_FILE | EXT4_FEATURE_RO_COMPAT_GDT_CSUM |
-      EXT4_FEATURE_RO_COMPAT_DIR_NLINK | EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE);
+      EXT4_FEATURE_RO_COMPAT_DIR_NLINK | EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE |
+      EXT4_FEATURE_RO_COMPAT_METADATA_CSUM);
 
   /* Generate UUID */
   uuid_generate(sb.s_uuid);

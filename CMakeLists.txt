@@ -111,6 +111,7 @@ set(BTRFS2EXT4_SOURCES
     src/ext4/superblock_writer.c
     src/ext4/gdt_writer.c
     src/ext4/bitmap_writer.c
+    src/ext4/inode_checksum.c
     src/ext4/inode_writer.c
     src/ext4/dir_writer.c
     src/ext4/extent_writer.c
@@ -174,6 +175,7 @@ set(BTRFS2EXT4_LIB_SOURCES
     src/ext4/superblock_writer.c
     src/ext4/gdt_writer.c
     src/ext4/bitmap_writer.c
+    src/ext4/inode_checksum.c
     src/ext4/inode_writer.c
     src/ext4/dir_writer.c
     src/ext4/extent_writer.c

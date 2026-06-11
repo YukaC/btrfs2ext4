@@ -71,8 +71,13 @@ int ext4_write_gdt(struct device *dev, const struct ext4_layout *layout);
 int ext4_write_bitmaps(struct device *dev, const struct ext4_layout *layout,
                        const struct ext4_block_allocator *alloc,
                        const struct inode_map *inode_map);
+int ext4_rewrite_block_bitmaps(struct device *dev,
+                               const struct ext4_layout *layout,
+                               const struct ext4_block_allocator *alloc);
 int ext4_update_free_counts(struct device *dev,
                             const struct ext4_layout *layout);
+void ext4_inode_set_checksum(const uint8_t uuid[16], struct ext4_inode *inode,
+                             uint32_t inode_size);
 int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
                            const struct btrfs_fs_info *fs_info,
                            struct inode_map *inode_map,

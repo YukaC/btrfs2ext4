@@ -26,12 +26,14 @@
 
 struct file_extent {
   uint64_t file_offset;    /* offset within the file */
+  uint64_t offset;         /* fi->offset: offset within extent on disk */
   uint64_t disk_bytenr;    /* physical byte address on disk (0=hole) */
   uint64_t disk_num_bytes; /* size on disk */
   uint64_t num_bytes;      /* logical bytes in file */
   uint64_t ram_bytes;      /* decompressed size */
   uint8_t compression;     /* BTRFS_COMPRESS_* */
   uint8_t type;            /* BTRFS_FILE_EXTENT_INLINE/REG/PREALLOC */
+  uint8_t is_physical;   /* 1 = disk_bytenr is already a physical byte offset */
   /* For inline extents, data is stored separately */
   uint8_t *inline_data;
   uint32_t inline_data_len;
