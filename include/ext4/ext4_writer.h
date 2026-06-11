@@ -8,6 +8,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "ext4/ext4_structures.h"
+
 struct device;
 struct ext4_layout;
 struct btrfs_fs_info;
