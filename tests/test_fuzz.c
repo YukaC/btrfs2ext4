@@ -253,11 +253,82 @@ __attribute__((unused)) static void test_extent_tree_depth() {
   printf("OK\n");
 }
 
+
+/* ========================================================================
+ * Group 4: Phase 2 Btrfs reader hardening
+ * ======================================================================== */
+
+static void test_cow_hash_bytenr_and_length(void) {
+  printf("  [4/6] CoW hash: same start, different length... ");
+
+  btrfs_test_cow_hash_reset();
+
+  ASSERT_TRUE(btrfs_test_cow_hash_check_and_add(0x1000, 4096) == 0,
+              "first extent is new");
+  ASSERT_TRUE(btrfs_test_cow_hash_check_and_add(0x1000, 8192) == 0,
+              "same start different length is not a duplicate");
+  ASSERT_TRUE(btrfs_test_cow_hash_check_and_add(0x1000, 4096) == 1,
+              "exact pair is a duplicate");
+
+  btrfs_test_cow_hash_reset();
+  printf("OK\n");
+}
+
+static void test_prealloc_disk_bytenr_zero_skipped(void) {
+  printf("  [5/6] PREALLOC: disk_bytenr=0 treated as sparse hole... ");
+
+  struct file_extent ext;
+  memset(&ext, 0, sizeof(ext));
+  ext.type = BTRFS_FILE_EXTENT_PREALLOC;
+  ext.disk_bytenr = 0;
+  ext.disk_num_bytes = 4096;
+  ext.num_bytes = 4096;
+
+  btrfs_test_apply_prealloc_rules(&ext);
+
+  ASSERT_TRUE(ext.disk_bytenr == 0, "prealloc hole has zero disk_bytenr");
+  ASSERT_TRUE(ext.disk_num_bytes == 0, "prealloc hole has zero disk_num_bytes");
+  ASSERT_TRUE(ext.num_bytes == 4096, "logical size preserved");
+
+  memset(&ext, 0, sizeof(ext));
+  ext.type = BTRFS_FILE_EXTENT_PREALLOC;
+  ext.disk_bytenr = 0x20000;
+  ext.disk_num_bytes = 8192;
+  ext.num_bytes = 8192;
+  btrfs_test_apply_prealloc_rules(&ext);
+  ASSERT_TRUE(ext.disk_bytenr == 0,
+              "allocated-but-unwritten prealloc is not disk-backed");
+
+  printf("OK\n");
+}
+
+static void test_inline_extent_oom_propagation(void) {
+  printf("  [6/6] Inline extent: OOM propagates as error... ");
+
+  uint8_t *data = NULL;
+  btrfs_test_set_malloc_fail_at(64);
+
+  ASSERT_TRUE(btrfs_test_alloc_inline_data(128, &data) < 0,
+              "large inline alloc should fail under OOM mock");
+  ASSERT_TRUE(data == NULL, "failed alloc must not return a pointer");
+
+  btrfs_test_set_malloc_fail_at(0);
+  ASSERT_TRUE(btrfs_test_alloc_inline_data(32, &data) == 0,
+              "small inline alloc should succeed after reset");
+  ASSERT_TRUE(data != NULL, "successful alloc returns data");
+
+  free(data);
+  printf("OK\n");
+}
+
 int main() {
   printf("=== BTRFS2EXT4 FUZZ & EDGE CASE TESTS ===\n\n");
   test_decompress_bombs();
   test_relocator_wraparound();
   test_superblock_and_btree_validation();
+  test_cow_hash_bytenr_and_length();
+  test_prealloc_disk_bytenr_zero_skipped();
+  test_inline_extent_oom_propagation();
   /* test_extent_tree_depth();  // opcional, sólo profundidad/extents */
   printf("\nAll extreme edge case tests passed.\n");
   return 0;

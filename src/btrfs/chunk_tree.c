@@ -185,6 +185,7 @@ int chunk_map_populate(struct chunk_map *map, struct device *dev,
   while (stack_top > 0) {
     stack_top--;
     uint64_t node_logical = stack[stack_top].logical;
+    uint8_t expected_level = stack[stack_top].level;
 
     /* Resolve logical → physical */
     uint64_t node_physical = chunk_map_resolve(map, node_logical);
@@ -205,6 +206,25 @@ int chunk_map_populate(struct chunk_map *map, struct device *dev,
     const struct btrfs_header *hdr = (const struct btrfs_header *)node_buf;
     uint32_t nritems = le32toh(hdr->nritems);
     uint8_t level = hdr->level;
+
+    uint64_t bytenr = le64toh(hdr->bytenr);
+    if (bytenr != node_logical) {
+      fprintf(stderr,
+              "btrfs2ext4: chunk tree node bytenr mismatch: expected 0x%lx, "
+              "got 0x%lx\n",
+              (unsigned long)node_logical, (unsigned long)bytenr);
+      free(node_buf);
+      return -1;
+    }
+
+    if (level != expected_level) {
+      fprintf(stderr,
+              "btrfs2ext4: chunk tree node level mismatch/cycle detected: "
+              "expected %u, got %u at 0x%lx\n",
+              expected_level, level, (unsigned long)node_logical);
+      free(node_buf);
+      return -1;
+    }
 
     /* Validate checksum for chunk tree nodes as well */
     if (btrfs_verify_checksum(csum_type, hdr->csum,
