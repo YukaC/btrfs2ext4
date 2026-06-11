@@ -36,7 +36,7 @@ jobs:
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ inputs.build_type }} \
-            -DENABLE_SANITIZERS=${{ inputs.enable_sanitizers && 'ON' || 'OFF' }}
+            -DBTRFS2EXT4_ENABLE_SANITIZERS=${{ inputs.enable_sanitizers && 'ON' || 'OFF' }}
 
       - name: Build
         run: cmake --build build

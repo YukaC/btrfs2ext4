@@ -39,11 +39,11 @@ cmake --build build -j$(nproc)
 **Debug build with sanitizers (recommended for development):**
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=ON
+cmake -B build -DCMAKE_BUILD_TYPE=Debug -DBTRFS2EXT4_ENABLE_SANITIZERS=ON
 cmake --build build -j$(nproc)
 ```
 
-Sanitizers are controlled by `-DENABLE_SANITIZERS=ON|OFF` (default OFF) via `btrfs2ext4_apply_sanitizers()` in `CMakeLists.txt`, applied to all four test targets independently of `CMAKE_BUILD_TYPE`.
+Sanitizers are controlled by `-DBTRFS2EXT4_ENABLE_SANITIZERS=ON|OFF` (default ON in Debug, OFF in Release) via `btrfs2ext4_enable_sanitizers()` in `CMakeLists.txt`, applied to all four test targets.
 
 **Dependencies:** CMake ≥ 3.16, GCC or Clang, `libuuid-dev`, `zlib1g-dev`. Optional: `libssl-dev`, `libxxhash-dev`, `liblzo2-dev`, `libzstd-dev`, `liburing-dev`.
 
@@ -58,6 +58,7 @@ GitHub Actions runs on every push/PR to `main` via `.github/workflows/ci.yml`, w
 | GCC      | Debug      | ON         |
 | Clang    | Debug      | ON         |
 | GCC      | Release    | OFF        |
+| Clang    | Release    | OFF        |
 
 All optional dependencies are installed in CI so feature-gated code paths are compiled.
 
@@ -83,7 +84,7 @@ The test suite (`test_stress.c`) covers:
 
 - Virtual loop device conversions with edge-case filesystems (massive inline files, millions of empty files, overlapping extents)
 - Fuzz inputs: malformed superblocks, truncated B-trees, looping symlinks, out-of-bounds references
-- ASan + UBSan traps on corrupted input (when built with `-DENABLE_SANITIZERS=ON`)
+- ASan + UBSan traps on corrupted input (when built with `-DBTRFS2EXT4_ENABLE_SANITIZERS=ON`)
 
 If your change touches Btrfs parsing, run the fuzz path and confirm no new ASan warnings appear.
 

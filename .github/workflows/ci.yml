@@ -21,6 +21,9 @@ jobs:
           - compiler: gcc
             build_type: Release
             enable_sanitizers: false
+          - compiler: clang
+            build_type: Release
+            enable_sanitizers: false
     uses: ./.github/workflows/reusable-build-test.yml
     with:
       compiler: ${{ matrix.compiler }}

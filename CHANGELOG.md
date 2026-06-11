@@ -10,7 +10,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 - **CI reusable workflow** — `.github/workflows/reusable-build-test.yml` with matrix builds (GCC/Clang × Debug/Release) and optional sanitizers
-- **`ENABLE_SANITIZERS` CMake option** — decouples ASan+UBSan from `CMAKE_BUILD_TYPE`; applied to all four test targets when enabled
+- **`BTRFS2EXT4_ENABLE_SANITIZERS` CMake option** — enables ASan+UBSan on all four test targets (default ON in Debug, OFF in Release; CI overrides explicitly)
 - **`convert_state` cleanup context** — centralizes teardown in `convert_state_init()` / `convert_state_cleanup()`, fixing conditional `ext4_block_alloc_free` on early-exit paths
 
 ### Changed
