@@ -182,8 +182,18 @@ For each block group, it lays out structures sequentially:
 
 Every non-data block is appended to the `reserved_blocks[]` array (a flat list of block numbers) for use by the conflict detector.
 
-**Deadlock & Hardware Pre-Calculation Engine (`The Viability Audit`)**:
-`planner.c` executes an exact calculation of physically required bounds mapping everything from symlinks > 59 bytes to B-Tree index routing nodes. It precisely calculates _decompression inflation_ of compressed blocks and strictly anticipates the extra block requirements of _Physical CoW Deduplication Cloning_. If the available free data blocks cannot satisfy the total expanded footprint, or if the host device is a laptop running on battery power below 20%, the system forcefully aborts the conversion. This safeguards against in-flight crashes due to 100% full drives or sudden power-loss.
+**Space budget (`struct ext4_space_budget`)** — computed inside `ext4_plan_layout()` before Pass 2 proceeds:
+
+| Field | Source |
+|-------|--------|
+| `data_blocks` | File extents, symlink blocks, extent-tree index nodes, directory base blocks |
+| `journal_blocks` | `ext4_journal_default_blocks()` (mke2fs heuristic); reserved contiguously at device tail |
+| `htree_blocks` | Per-directory HTree overhead (`dir_size/block_size + 10` when `dir_size > block_size`) |
+| `dedup_blocks` | `dedup_blocks_needed` plus decompression expansion |
+| `metadata_blocks` | `reserved_block_count` after journal tail reservation |
+| `safety_margin_blocks` | `total_blocks × safety_margin_percent / 100` (CLI `--safety-margin`, default 5%, range 1–25) |
+
+Viability requires `data + journal + htree + dedup < physically_usable` and remaining headroom ≥ safety margin. `main.c` prints the planner budget instead of duplicating the arithmetic.
 
 The `sparse_super` feature is applied: superblock + GDT copies exist only in groups 0, 1, and powers of 3, 5, and 7 (function `ext4_bg_has_super()`).
 
@@ -402,7 +412,7 @@ A number of critical optimisations have been extensively implemented:
 
 **Problem**: Mechanical hard drives idle their read heads between synchronous block fetches and B-tree hops.
 
-**Solution**: Added `io_uring` support for deeply queued asynchronous reads, and `POSIX_FADV_SEQUENTIAL` before major tree walks, prompting the Linux kernel to hyper-aggressively pre-fetch blocks.
+**Solution**: `POSIX_FADV_SEQUENTIAL` before major tree walks prompts the kernel to pre-fetch blocks. **`io_uring` support is partial**: when `liburing` is available at build time, `device_io.c` can queue batch reads, but relocation and Pass 3 writes remain predominantly synchronous.
 
 ### #17 — Ext4 Journal Tail Placement (`journal_writer.c`)
 
@@ -414,7 +424,9 @@ A number of critical optimisations have been extensively implemented:
 
 ## 9. Crash-Recovery Journal
 
-The journal (`journal.c`) provides a basic write-ahead log for block relocations:
+> **Status (v0.2):** `journal.c` is implemented but **not wired** into the live conversion path — `journal_init()` is never called from `btrfs2ext4_convert()` or `relocator_execute()`. **`migration_map_save()` is the primary recovery checkpoint** (see [§10](#10-rollback-mechanism)). The relocation journal code remains for future integration.
+
+The journal (`journal.c`) was designed as a write-ahead log for block relocations:
 
 ```
 ┌─────────────────────────┐
@@ -442,7 +454,9 @@ The journal (`journal.c`) provides a basic write-ahead log for block relocations
 
 ## 10. Rollback Mechanism
 
-Before any block relocations, `btrfs2ext4_convert()` copies the original Btrfs superblock to the last aligned 4 KiB slot on the device:
+**Primary recovery path:** `migration_map_save()` runs unconditionally at the end of Pass 2 (even when `reloc_plan.count == 0`), persisting every relocated block mapping and a Btrfs superblock backup. `btrfs2ext4_rollback()` / `migration_map_rollback()` reverses block moves and restores the superblock from this map.
+
+Before any block relocations, `btrfs2ext4_convert()` also copies the original Btrfs superblock to the last aligned 4 KiB slot on the device:
 
 ```
 backup_offset = (device_size − 4096) & ~4095

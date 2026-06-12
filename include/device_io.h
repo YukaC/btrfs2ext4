@@ -69,6 +69,10 @@ int device_write(struct device *dev, uint64_t offset, const void *buf,
  */
 int device_sync(struct device *dev);
 
+#ifdef BTRFS_TESTING
+void device_test_fail_next_sync(void);
+#endif
+
 /*
  * Get device size in bytes.
  */
