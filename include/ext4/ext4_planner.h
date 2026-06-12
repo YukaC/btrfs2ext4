@@ -7,6 +7,10 @@
 
 #include <stdint.h>
 
+#define EXT4_DEFAULT_SAFETY_MARGIN_PERCENT 5
+#define EXT4_MIN_SAFETY_MARGIN_PERCENT 1
+#define EXT4_MAX_SAFETY_MARGIN_PERCENT 25
+
 /* Represents one block group's metadata layout */
 struct ext4_bg_layout {
   uint64_t group_start_block;   /* first block of this group */
@@ -20,6 +24,7 @@ struct ext4_bg_layout {
   uint32_t inode_table_blocks;  /* blocks occupied by inode table */
   uint64_t data_start_block;    /* first usable data block */
   uint32_t data_blocks;         /* number of data blocks */
+  uint32_t used_dirs_count;     /* directories in this group (Pass 3) */
   int has_super;                /* does this group have a superblock? */
 };
 
@@ -40,6 +45,21 @@ struct ext4_layout {
   uint64_t *reserved_blocks; /* list of block numbers */
   uint32_t reserved_block_count;
   uint32_t reserved_block_capacity;
+
+  uint32_t journal_blocks;
+  uint64_t journal_start_block;
+  uint8_t safety_margin_percent;
+};
+
+struct ext4_space_budget {
+  uint32_t data_blocks;
+  uint32_t journal_blocks;
+  uint32_t htree_blocks;
+  uint32_t dedup_blocks;
+  uint32_t decompression_blocks;
+  uint32_t metadata_blocks;
+  uint32_t safety_margin_blocks;
+  uint32_t total_required;
 };
 
 struct btrfs_fs_info;
@@ -47,11 +67,15 @@ struct btrfs_fs_info;
 /*
  * Calculate the ext4 layout for a device.
  * device_size is in bytes, inode_ratio is bytes per inode.
+ * safety_margin_percent: 1–25 (0 selects default 5).
+ * budget may be NULL if the caller does not need the breakdown.
  * Returns 0 on success, -1 on error.
  */
-int ext4_plan_layout(struct ext4_layout *layout, uint64_t device_size,
-                     uint32_t block_size, uint32_t inode_ratio,
-                     const struct btrfs_fs_info *fs_info);
+int ext4_plan_layout(const struct btrfs_fs_info *fs_info,
+                     uint64_t device_size, uint32_t block_size,
+                     uint32_t inode_ratio, uint8_t safety_margin_percent,
+                     struct ext4_layout *layout,
+                     struct ext4_space_budget *budget);
 
 /*
  * Find all reserved (metadata) block numbers that conflict with

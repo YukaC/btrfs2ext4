@@ -20,6 +20,7 @@
 
 #define _GNU_SOURCE
 #include <assert.h>
+#include <endian.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,7 +31,9 @@
 
 #include "btrfs/btrfs_reader.h"
 #include "btrfs/btrfs_structures.h"
+#include "btrfs/checksum.h"
 #include "btrfs/chunk_tree.h"
+#include "btrfs/tree_walk.h"
 #include "device_io.h"
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_structures.h"
@@ -89,6 +92,176 @@ static int create_temp_device(const char *path, uint64_t size) {
   }
   close(fd);
   return 0;
+}
+
+
+static void seal_btree_node_crc32(uint8_t *buf, uint32_t nodesize) {
+  uint32_t crc =
+      btrfs_crc32c(~0U, buf + BTRFS_CSUM_SIZE, nodesize - BTRFS_CSUM_SIZE);
+  uint32_t le_crc = htole32(crc);
+  memcpy(buf, &le_crc, 4);
+}
+
+static enum btrfs_walk_error noop_tree_walk_cb(const struct btrfs_disk_key *key,
+                                               const void *data,
+                                               uint32_t data_size, void *ctx) {
+  (void)key;
+  (void)data;
+  (void)data_size;
+  (void)ctx;
+  return BTRFS_WALK_CONTINUE;
+}
+
+static void test_tree_walk_corrupt_bytenr(void) {
+  TEST_START("Shared tree walk: corrupt bytenr rejected");
+
+  const char *path = "/tmp/btrfs2ext4_test_badbytenr.img";
+  if (create_temp_device(path, 16 * 1024 * 1024) < 0) {
+    TEST_FAIL("couldn't create temp file");
+    return;
+  }
+
+  struct device dev;
+  if (device_open(&dev, path, 0) < 0) {
+    TEST_FAIL("device_open failed");
+    unlink(path);
+    return;
+  }
+
+  struct chunk_map map;
+  memset(&map, 0, sizeof(map));
+  map.capacity = 1;
+  map.entries = calloc(1, sizeof(struct chunk_mapping));
+  map.entries[0].logical = 0;
+  map.entries[0].physical = 0;
+  map.entries[0].length = 16 * 1024 * 1024;
+  map.count = 1;
+
+  const uint32_t nodesize = 4096;
+  uint8_t *node = calloc(1, nodesize);
+  if (!node) {
+    TEST_FAIL("OOM");
+    chunk_map_free(&map);
+    device_close(&dev);
+    unlink(path);
+    return;
+  }
+
+  struct btrfs_header *hdr = (struct btrfs_header *)node;
+  hdr->bytenr = htole64(0xDEADBEEFULL);
+  hdr->level = 0;
+  hdr->nritems = htole32(0);
+  seal_btree_node_crc32(node, nodesize);
+
+  if (device_write(&dev, 0, node, nodesize) < 0) {
+    TEST_FAIL("device_write failed");
+    free(node);
+    chunk_map_free(&map);
+    device_close(&dev);
+    unlink(path);
+    return;
+  }
+  free(node);
+
+  int ret =
+      btrfs_tree_walk(&dev, &map, 0, 0, nodesize, BTRFS_CSUM_TYPE_CRC32,
+                      noop_tree_walk_cb, NULL);
+  ASSERT_TRUE(ret < 0, "should reject bytenr mismatch");
+
+  chunk_map_free(&map);
+  device_close(&dev);
+  unlink(path);
+  TEST_PASS();
+}
+
+static void test_tree_walk_malicious_nritems(void) {
+  TEST_START("Chunk tree walk: malicious nritems rejected");
+
+  const char *path = "/tmp/btrfs2ext4_test_badnritems.img";
+  if (create_temp_device(path, 16 * 1024 * 1024) < 0) {
+    TEST_FAIL("couldn't create temp file");
+    return;
+  }
+
+  struct device dev;
+  if (device_open(&dev, path, 0) < 0) {
+    TEST_FAIL("device_open failed");
+    unlink(path);
+    return;
+  }
+
+  struct chunk_map map;
+  memset(&map, 0, sizeof(map));
+  map.capacity = 1;
+  map.entries = calloc(1, sizeof(struct chunk_mapping));
+  map.entries[0].logical = 0;
+  map.entries[0].physical = 0;
+  map.entries[0].length = 16 * 1024 * 1024;
+  map.count = 1;
+
+  const uint32_t nodesize = 4096;
+  uint8_t *node = calloc(1, nodesize);
+  if (!node) {
+    TEST_FAIL("OOM");
+    chunk_map_free(&map);
+    device_close(&dev);
+    unlink(path);
+    return;
+  }
+
+  struct btrfs_header *hdr = (struct btrfs_header *)node;
+  hdr->bytenr = htole64(0);
+  hdr->level = 0;
+  hdr->generation = htole64(1);
+  hdr->nritems = htole32(99999);
+  seal_btree_node_crc32(node, nodesize);
+
+  if (device_write(&dev, 0, node, nodesize) < 0) {
+    TEST_FAIL("device_write failed");
+    free(node);
+    chunk_map_free(&map);
+    device_close(&dev);
+    unlink(path);
+    return;
+  }
+  free(node);
+
+  int ret =
+      btrfs_tree_walk(&dev, &map, 0, 0, nodesize, BTRFS_CSUM_TYPE_CRC32,
+                      noop_tree_walk_cb, NULL);
+  ASSERT_TRUE(ret < 0, "should reject excessive nritems");
+
+  chunk_map_free(&map);
+  device_close(&dev);
+  unlink(path);
+  TEST_PASS();
+}
+
+static void test_phase2_cow_hash_128bit(void) {
+  TEST_START("Phase 2: CoW hash uses (bytenr, num_bytes) pair");
+
+  btrfs_test_cow_hash_reset();
+  ASSERT_TRUE(btrfs_test_cow_hash_check_and_add(0x5000, 8192) == 0, "first");
+  ASSERT_TRUE(btrfs_test_cow_hash_check_and_add(0x5000, 4096) == 0,
+              "same bytenr different length");
+  ASSERT_TRUE(btrfs_test_cow_hash_check_and_add(0x5000, 8192) == 1, "duplicate");
+  btrfs_test_cow_hash_reset();
+  TEST_PASS();
+}
+
+static void test_phase2_prealloc_sparse_holes(void) {
+  TEST_START("Phase 2: PREALLOC unwritten regions become holes");
+
+  struct file_extent ext;
+  memset(&ext, 0, sizeof(ext));
+  ext.type = BTRFS_FILE_EXTENT_PREALLOC;
+  ext.disk_bytenr = 0x30000;
+  ext.disk_num_bytes = 4096;
+  ext.num_bytes = 4096;
+  btrfs_test_apply_prealloc_rules(&ext);
+  ASSERT_TRUE(ext.disk_bytenr == 0, "hole");
+  ASSERT_TRUE(ext.disk_num_bytes == 0, "hole bytes");
+  TEST_PASS();
 }
 
 /* ========================================================================
@@ -398,7 +571,7 @@ static void test_planner_minimum_device(void) {
   TEST_START("Planner: minimum viable device (1 MiB)");
 
   struct ext4_layout layout;
-  int ret = ext4_plan_layout(&layout, 1 * 1024 * 1024, 4096, 16384, NULL);
+  int ret = ext4_plan_layout(NULL, 1 * 1024 * 1024, 4096, 16384, EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout, NULL);
   /* Should either succeed with 1 group or fail gracefully */
   if (ret == 0) {
     ASSERT_TRUE(layout.num_groups >= 1, "at least 1 group");
@@ -412,7 +585,7 @@ static void test_planner_tiny_device(void) {
   TEST_START("Planner: tiny device (4 KiB — too small)");
 
   struct ext4_layout layout;
-  int ret = ext4_plan_layout(&layout, 4096, 4096, 16384, NULL);
+  int ret = ext4_plan_layout(NULL, 4096, 4096, 16384, EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout, NULL);
   /* 4 KiB is too small for any valid ext4 — should fail */
   if (ret == 0) {
     ext4_free_layout(&layout);
@@ -426,7 +599,7 @@ static void test_planner_large_device(void) {
 
   struct ext4_layout layout;
   uint64_t size_16tb = 16ULL * 1024 * 1024 * 1024 * 1024;
-  int ret = ext4_plan_layout(&layout, size_16tb, 4096, 16384, NULL);
+  int ret = ext4_plan_layout(NULL, size_16tb, 4096, 16384, EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout, NULL);
 
   if (ret == 0) {
     /* Check for integer overflow in calculations */
@@ -444,7 +617,7 @@ static void test_planner_zero_size(void) {
   TEST_START("Planner: zero-size device");
 
   struct ext4_layout layout;
-  int ret = ext4_plan_layout(&layout, 0, 4096, 16384, NULL);
+  int ret = ext4_plan_layout(NULL, 0, 4096, 16384, EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout, NULL);
   ASSERT_TRUE(ret < 0, "zero size should fail");
   TEST_PASS();
 }
@@ -457,7 +630,7 @@ static void test_planner_block_sizes(void) {
 
   for (int i = 0; i < 3; i++) {
     struct ext4_layout layout;
-    int ret = ext4_plan_layout(&layout, dev_size, sizes[i], 16384, NULL);
+    int ret = ext4_plan_layout(NULL, dev_size, sizes[i], 16384, EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout, NULL);
     ASSERT_TRUE(ret == 0, "plan should succeed");
     ASSERT_TRUE(layout.block_size == sizes[i], "block size mismatch");
     ext4_free_layout(&layout);
@@ -982,7 +1155,7 @@ static void bench_planner_large(void) {
   double t0 = now_seconds();
   struct ext4_layout layout;
   uint64_t size_1tb = 1ULL * 1024 * 1024 * 1024 * 1024;
-  int ret = ext4_plan_layout(&layout, size_1tb, 4096, 16384, NULL);
+  int ret = ext4_plan_layout(NULL, size_1tb, 4096, 16384, EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout, NULL);
   double t1 = now_seconds();
 
   if (ret == 0) {
@@ -1046,7 +1219,7 @@ static void test_overflow_block_count(void) {
   struct ext4_layout layout;
   /* Device just under 16 TiB (max for ext4 with 4K blocks) */
   uint64_t size = (uint64_t)UINT32_MAX * 4096ULL;
-  int ret = ext4_plan_layout(&layout, size, 4096, 16384, NULL);
+  int ret = ext4_plan_layout(NULL, size, 4096, 16384, EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout, NULL);
   /* Must not crash, regardless of success/failure */
   if (ret == 0) {
     printf("(%u groups) ", layout.num_groups);
@@ -1059,7 +1232,7 @@ static void test_overflow_huge_inode_ratio(void) {
   TEST_START("Overflow: inode ratio = 1 (inode per byte)");
 
   struct ext4_layout layout;
-  int ret = ext4_plan_layout(&layout, 256 * 1024 * 1024, 4096, 1, NULL);
+  int ret = ext4_plan_layout(NULL, 256 * 1024 * 1024, 4096, 1, EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout, NULL);
   /* Ratio of 1 means 1 inode per byte = 256M inodes.
    * Should either succeed with massive inode table or fail gracefully */
   if (ret == 0) {
@@ -1073,8 +1246,8 @@ static void test_overflow_max_inode_ratio(void) {
   TEST_START("Overflow: inode ratio = UINT32_MAX");
 
   struct ext4_layout layout;
-  int ret = ext4_plan_layout(&layout, 1ULL * 1024 * 1024 * 1024, 4096,
-                             UINT32_MAX, NULL);
+  int ret = ext4_plan_layout(NULL, 1ULL * 1024 * 1024 * 1024, 4096, UINT32_MAX,
+                             EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout, NULL);
   /* Huge ratio = very few inodes. Should succeed. */
   if (ret == 0) {
     printf("(%u inodes) ", layout.total_inodes);
@@ -1144,6 +1317,13 @@ int main(void) {
   printf(
       "╚══════════════════════════════════════════════════════════════════╝\n");
   printf("\n");
+
+  printf(
+      "─── GROUP 11: Phase 2 Btrfs Reader Hardening ─────────────────────\n");
+  test_tree_walk_corrupt_bytenr();
+  test_tree_walk_malicious_nritems();
+  test_phase2_cow_hash_128bit();
+  test_phase2_prealloc_sparse_holes();
 
   /* Group 1: Corrupted superblock */
   printf(

@@ -94,7 +94,8 @@
 #define EXT4_BG_BLOCK_UNINIT 0x0002 /* Block bitmap not initialized */
 #define EXT4_BG_INODE_ZEROED 0x0004 /* Inode table zeroed */
 
-/* Default hash algorithm */
+/* Default hash algorithm (EXT4_HASH_LEGACY matches ext4_legacy_hash()) */
+#define EXT4_HASH_LEGACY 0
 #define EXT4_HASH_HALF_MD4 1
 #define EXT4_HASH_TEA 2
 
