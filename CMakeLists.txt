@@ -109,6 +109,7 @@ set(BTRFS2EXT4_SOURCES
     src/btrfs/fs_tree.c
     src/btrfs/decompress.c
     src/ext4/planner.c
+    src/ext4/space_budget.c
     src/ext4/superblock_writer.c
     src/ext4/gdt_writer.c
     src/ext4/bitmap_writer.c
@@ -175,6 +176,7 @@ set(BTRFS2EXT4_LIB_SOURCES
     src/btrfs/fs_tree.c
     src/btrfs/decompress.c
     src/ext4/planner.c
+    src/ext4/space_budget.c
     src/ext4/superblock_writer.c
     src/ext4/gdt_writer.c
     src/ext4/bitmap_writer.c

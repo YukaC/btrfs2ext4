@@ -87,45 +87,8 @@ int ext4_plan_layout(struct ext4_layout *layout, uint64_t device_size,
     return -1;
   }
 
-  /*
-   * Pre-calculate actual utilized space & Data blocks scaling footprint:
-   * Ext4 requires physically allocating blocks for index trees and
-   * long symlinks, while ignoring sparse holes.
-   */
-  uint64_t data_blocks_required = 0;
-  if (fs_info) {
-    for (uint32_t i = 0; i < fs_info->inode_count; i++) {
-      struct file_entry *fe = fs_info->inode_table[i];
+  printf("=== Ext4 Layout Plan ===\n");
 
-      if (fe->mode & S_IFLNK) {
-        if (fe->size > 59) {
-          data_blocks_required++; /* Symlinks > 59B take 1 data block */
-        }
-      } else if (fe->mode & S_IFREG) {
-        /* Extent tree index blocks for fragmented files */
-        if (fe->extent_count > 4) {
-          /* Each extent node takes roughly 340 extents (4096 / 12) */
-          uint32_t index_blocks = (fe->extent_count + 339) / 340;
-          data_blocks_required += index_blocks;
-        }
-
-        /* Actual data blocks (ignoring sparse holes) */
-        for (uint32_t e = 0; e < fe->extent_count; e++) {
-          struct file_extent *ext = &fe->extents[e];
-          if (ext->type != BTRFS_FILE_EXTENT_INLINE &&
-              ext->type != BTRFS_FILE_EXTENT_PREALLOC && ext->disk_bytenr != 0) {
-            data_blocks_required +=
-                (ext->num_bytes + block_size - 1) / block_size;
-          }
-        }
-      } else if (fe->mode & S_IFDIR) {
-        /* Base directory size */
-        data_blocks_required += (fe->size + block_size - 1) / block_size;
-      }
-    }
-  }
-
-  printf("=== Ext4 Constraints & Pre-Calculation ===\n");
   printf("  Device size:       %lu bytes (%.1f GiB)\n",
          (unsigned long)device_size,
          (double)device_size / (1024.0 * 1024.0 * 1024.0));
@@ -256,47 +219,6 @@ int ext4_plan_layout(struct ext4_layout *layout, uint64_t device_size,
 
   printf("  Reserved blocks:   %u (metadata zones)\n",
          layout->reserved_block_count);
-  printf("  Data blocks req:   %lu (files, index, dirs)\n",
-         (unsigned long)data_blocks_required);
-
-  /*
-   * Phase 2.2: Deadlock Prevention (The 5% Rule)
-   * Verify we have enough actual physical Free Space to proceed safely.
-   */
-  uint64_t physically_usable =
-      layout->total_blocks - layout->reserved_block_count;
-  if (data_blocks_required >= physically_usable) {
-    fprintf(stderr,
-            "\n[FATAL] btrfs2ext4: Insufficient space for conversion!\n");
-    fprintf(stderr, "  Total blocks: %lu\n",
-            (unsigned long)layout->total_blocks);
-    fprintf(stderr, "  Metadata rsrv:%u\n", layout->reserved_block_count);
-    fprintf(stderr, "  Data to write:%lu\n",
-            (unsigned long)data_blocks_required);
-    free(layout->groups);
-    free(layout->reserved_blocks);
-    return -1;
-  }
-
-  uint64_t free_blocks = physically_usable - data_blocks_required;
-  uint64_t margin = layout->total_blocks / 20; /* 5% */
-
-  if (free_blocks < margin && margin > 0) {
-    fprintf(stderr, "\n[FATAL] btrfs2ext4: Conversion blocked by Deadlock "
-                    "Prevention Rule!\n");
-    fprintf(stderr,
-            "Calculated free space (%lu MiB) falls below the safety margin of "
-            "5%% (%lu MiB).\n",
-            (unsigned long)(free_blocks * block_size) / (1024 * 1024),
-            (unsigned long)(margin * block_size) / (1024 * 1024));
-    free(layout->groups);
-    free(layout->reserved_blocks);
-    return -1;
-  }
-
-  printf("  Free Space Margin: %lu blocks (%.1f MiB)\n",
-         (unsigned long)free_blocks,
-         (double)(free_blocks * block_size) / (1024.0 * 1024.0));
   printf("========================\n\n");
 
   return 0;

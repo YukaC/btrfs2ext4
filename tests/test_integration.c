@@ -42,6 +42,7 @@
 #include "ext4/ext4_crc16.h"
 #include "ext4/ext4_metadata_csum.h"
 #include "ext4/ext4_planner.h"
+#include "ext4/ext4_space.h"
 #include "ext4/ext4_structures.h"
 #include "ext4/ext4_writer.h"
 #include "migration_map.h"
@@ -2769,6 +2770,50 @@ static void test_pass3_crash_each_step(void) {
  * Main
  * ======================================================================= */
 
+static void test_space_budget_basic(void) {
+  TEST_START("T-4.1  space budget: campos basicos en layout de prueba");
+  struct ext4_layout layout; REQUIRE(build_test_layout(&layout)==0,"plan");
+  struct ext4_space_budget budget; REQUIRE(ext4_space_budget(&layout,NULL,TEST_IMG_SIZE,5,&budget)==0,"b");
+  CHECK(budget.metadata_reserved==layout.reserved_block_count,"meta");
+  CHECK(budget.margin_percent==5,"pct"); CHECK(budget.margin_blocks==layout.total_blocks*5/100,"mb");
+  CHECK(budget.total_required==budget.journal_blocks+budget.htree_blocks+budget.dedup_blocks,"tot");
+  CHECK(budget.free_available>budget.total_required+budget.margin_blocks,"ok");
+  ext4_free_layout(&layout); TEST_PASS();
+}
+static void test_space_budget_journal_blocks(void) {
+  TEST_START("T-4.2  space budget: journal 4 MiB en dispositivo <512 MiB");
+  struct ext4_layout layout; REQUIRE(build_test_layout(&layout)==0,"plan");
+  struct ext4_space_budget budget; REQUIRE(ext4_space_budget(&layout,NULL,TEST_IMG_SIZE,5,&budget)==0,"b");
+  CHECK(budget.journal_blocks==(4U*1024U*1024U)/TEST_BLOCK_SIZE,"j");
+  ext4_free_layout(&layout); TEST_PASS();
+}
+static void test_space_budget_htree_blocks(void) {
+  TEST_START("T-4.3  space budget: HTree reservado para directorio grande");
+  struct btrfs_fs_info *fs=make_big_dir_fs(300); struct ext4_layout layout;
+  REQUIRE(ext4_plan_layout(&layout,TEST_IMG_SIZE,TEST_BLOCK_SIZE,16384,fs)==0,"plan");
+  struct ext4_space_budget budget; REQUIRE(ext4_space_budget(&layout,fs,TEST_IMG_SIZE,5,&budget)==0,"b");
+  CHECK(budget.htree_blocks>0,"h"); ext4_free_layout(&layout); free_big_dir_fs(fs); TEST_PASS();
+}
+static void test_space_budget_validate_fails(void) {
+  TEST_START("T-4.4  space budget: validate falla con espacio insuficiente");
+  struct ext4_layout layout; uint64_t tiny=4ULL*1024*1024;
+  REQUIRE(ext4_plan_layout(&layout,tiny,TEST_BLOCK_SIZE,16384,NULL)==0,"plan");
+  struct ext4_space_budget budget; REQUIRE(ext4_space_budget(&layout,NULL,tiny,5,&budget)==0,"b");
+  CHECK(ext4_space_budget_validate(&budget)<0,"fail"); ext4_free_layout(&layout); TEST_PASS();
+}
+static void test_space_budget_env_margin(void) {
+  TEST_START("T-4.5  space budget: BTRFS2EXT4_SAFETY_MARGIN override");
+  const char *old=getenv("BTRFS2EXT4_SAFETY_MARGIN"); char saved[32]; int had=old!=NULL;
+  if(had){strncpy(saved,old,sizeof(saved)-1);saved[sizeof(saved)-1]=0;}
+  setenv("BTRFS2EXT4_SAFETY_MARGIN","20",1); CHECK(ext4_space_margin_from_env()==20,"e");
+  struct ext4_layout layout; REQUIRE(build_test_layout(&layout)==0,"plan");
+  struct ext4_space_budget b5,b20; REQUIRE(ext4_space_budget(&layout,NULL,TEST_IMG_SIZE,5,&b5)==0,"b5");
+  REQUIRE(ext4_space_budget(&layout,NULL,TEST_IMG_SIZE,20,&b20)==0,"b20");
+  CHECK(b20.margin_blocks>b5.margin_blocks,"m"); CHECK(b20.margin_blocks==layout.total_blocks*20/100,"p");
+  if(had)setenv("BTRFS2EXT4_SAFETY_MARGIN",saved,1); else unsetenv("BTRFS2EXT4_SAFETY_MARGIN");
+  ext4_free_layout(&layout); TEST_PASS();
+}
+
 int main(void) {
   printf("\n");
   printf("╔════════════════════════════════════════════════════════════════════"
@@ -2874,6 +2919,9 @@ int main(void) {
   test_emergency_no_markers();
   test_pass3_finalize_wipes_footer();
   test_pass3_crash_each_step();
+
+  printf("\n--- GROUP N: Phase 4 Space Budget (Approach C) ---\n");
+  test_space_budget_basic(); test_space_budget_journal_blocks(); test_space_budget_htree_blocks(); test_space_budget_validate_fails(); test_space_budget_env_margin();
 
   /* GROUP K: Phase 2 extent tree metadata length */
   printf("\n─── GROUP K: Phase 2 Extent Tree (METADATA_ITEM) ────────────────────\n");

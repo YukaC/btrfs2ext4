@@ -20,6 +20,7 @@
 #include "btrfs2ext4.h"
 #include "device_io.h"
 #include "ext4/ext4_planner.h"
+#include "ext4/ext4_space.h"
 #include "ext4/ext4_writer.h"
 #include "mem_tracker.h"
 #include "migration_map.h"
@@ -340,6 +341,19 @@ int btrfs2ext4_convert(const struct convert_options *opts,
     goto cleanup;
   }
 
+  {
+    uint32_t margin_pct = ext4_space_margin_from_env();
+    struct ext4_space_budget budget;
+    if (ext4_space_budget(&st.layout, &st.fs_info, st.dev.size, margin_pct, &budget) < 0) {
+      fprintf(stderr, "btrfs2ext4: failed to compute space budget\n");
+      goto cleanup;
+    }
+    if (ext4_space_budget_validate(&budget) < 0) {
+      fprintf(stderr, "btrfs2ext4: space budget validation failed\n");
+      goto cleanup;
+    }
+  }
+
   if (progress)
     progress("Pass 2", 30, "Detecting conflicts...");
 
@@ -409,64 +423,15 @@ int btrfs2ext4_convert(const struct convert_options *opts,
              ? " (mmap WILL BE USED)"
              : " (in-memory)");
 
-  uint64_t expansion =
-      st.fs_info.compressed_extent_count > 0
-          ? (st.fs_info.total_decompressed_bytes - st.fs_info.total_compressed_bytes)
-          : 0;
-  uint64_t expansion_blocks =
-      (expansion + st.layout.block_size - 1) / st.layout.block_size;
-
-  /* Count available data blocks */
-  uint64_t free_data_blocks = 0;
-  for (uint32_t g = 0; g < st.layout.num_groups; g++) {
-    free_data_blocks += st.layout.groups[g].data_blocks;
-  }
-
-  /* Subtract blocks already used by existing data */
-  uint64_t used_data_blocks = 0;
-  for (uint32_t i = 0; i < st.fs_info.inode_count; i++) {
-    const struct file_entry *fe = st.fs_info.inode_table[i];
-    for (uint32_t j = 0; j < fe->extent_count; j++) {
-      if (fe->extents[j].type != BTRFS_FILE_EXTENT_INLINE &&
-          fe->extents[j].type != BTRFS_FILE_EXTENT_PREALLOC &&
-          fe->extents[j].disk_bytenr != 0) {
-        used_data_blocks +=
-            (fe->extents[j].disk_num_bytes + st.layout.block_size - 1) /
-            st.layout.block_size;
-      }
+  {
+    uint32_t margin_pct = ext4_space_margin_from_env();
+    struct ext4_space_budget budget;
+    if (ext4_space_budget(&st.layout, &st.fs_info, st.dev.size, margin_pct,
+                          &budget) == 0) {
+      printf("\n  --- Ext4 Space Budget ---\n");
+      ext4_space_budget_print(&budget, st.layout.block_size);
     }
   }
-
-  uint64_t available = free_data_blocks > used_data_blocks
-                           ? free_data_blocks - used_data_blocks
-                           : 0;
-
-  uint64_t dedup_bytes = st.fs_info.dedup_blocks_needed * st.layout.block_size;
-  uint64_t total_needed = expansion_blocks + st.fs_info.dedup_blocks_needed;
-
-  printf("  Decompression Expansion:%lu blocks (%.1f MiB)\n",
-         (unsigned long)expansion_blocks,
-         (double)expansion / (1024.0 * 1024.0));
-  printf("  CoW Physical Cloning:   %lu extra blocks (%.1f MiB)\n",
-         (unsigned long)st.fs_info.dedup_blocks_needed,
-         (double)dedup_bytes / (1024.0 * 1024.0));
-  printf("  Available Data Blocks:  %lu blocks (%.1f MiB)\n",
-         (unsigned long)available,
-         (double)available * st.layout.block_size / (1024.0 * 1024.0));
-
-  if (total_needed > available) {
-    fprintf(stderr,
-            "\nbtrfs2ext4: FATAL — Insufficient free space for conversion!\n"
-            "  Need %lu additional blocks but only %lu are free.\n"
-            "  Please free up at least %.1f MiB before retrying.\n\n",
-            (unsigned long)total_needed, (unsigned long)available,
-            (double)(total_needed - available) * st.layout.block_size /
-                (1024.0 * 1024.0));
-    goto cleanup;
-  }
-  printf("  Space viability check:  OK (%.1f%% headroom)\n",
-         available > 0 ? (double)(available - total_needed) * 100.0 / available
-                       : 0.0);
   printf("===================================================\n\n");
 
   /* ================================================
