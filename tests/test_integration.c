@@ -849,6 +849,25 @@ static void free_big_dir_fs(struct btrfs_fs_info *fs) {
   free(fs);
 }
 
+
+static struct btrfs_fs_info *make_single_file_fs(uint64_t data_blocks) {
+  struct btrfs_fs_info *fs = calloc(1, sizeof(*fs));
+  fs->inode_count = 1;
+  fs->inode_table = calloc(1, sizeof(*fs->inode_table));
+  struct file_entry *fe = calloc(1, sizeof(*fe));
+  fe->ino = 256;
+  fe->mode = S_IFDIR | 0755;
+  fe->size = data_blocks * TEST_BLOCK_SIZE;
+  fs->inode_table[0] = fe;
+  return fs;
+}
+static void free_single_file_fs(struct btrfs_fs_info *fs) {
+  if (!fs) return;
+  if (fs->inode_table && fs->inode_table[0]) free(fs->inode_table[0]);
+  free(fs->inode_table);
+  free(fs);
+}
+
 static void test_dir_small_inline_extents(void) {
   TEST_START("E-1  dir extent: directorio 3 bloques → depth=0, 3 extents");
 
@@ -2140,6 +2159,29 @@ static void test_rollback_restores_superblock(void) {
   CHECK(le64toh(restored.magic) == BTRFS_MAGIC, "magic Btrfs no restaurado");
   cleanup_test_dev(&dev); TEST_PASS();
 }
+
+static void test_planner_journal_space_reject(void) {
+  TEST_START("T-4.1  planner: journal+data excede espacio libre");
+  const uint64_t dev_size = 32ULL * 1024 * 1024;
+  struct btrfs_fs_info *fs = make_single_file_fs(7000);
+  struct ext4_layout layout;
+  int ret = ext4_plan_layout(&layout, dev_size, TEST_BLOCK_SIZE, 16384, fs);
+  CHECK(ret < 0, "planner debió rechazar por journal+data sin margen");
+  free_single_file_fs(fs);
+  TEST_PASS();
+}
+static void test_planner_dedup_tight_device(void) {
+  TEST_START("T-4.2  planner: dedup_blocks_needed en dispositivo ajustado");
+  const uint64_t dev_size = 32ULL * 1024 * 1024;
+  struct btrfs_fs_info *fs = calloc(1, sizeof(*fs));
+  fs->dedup_blocks_needed = 7000;
+  struct ext4_layout layout;
+  int ret = ext4_plan_layout(&layout, dev_size, TEST_BLOCK_SIZE, 16384, fs);
+  CHECK(ret < 0, "planner debió rechazar por dedup_blocks_needed");
+  free(fs);
+  TEST_PASS();
+}
+
 static void test_journal_deprecated(void) {
   TEST_START("T-3.5  journal.c deprecado: sin enlazar al flujo principal");
 #ifndef BTRFS2EXT4_NO_RELOC_JOURNAL
@@ -2838,6 +2880,10 @@ int main(void) {
   test_journal_jbd2_magic();
   test_journal_blocks_zeroed();
   test_journal_zeroing_speed();
+
+  printf("\n─── GROUP N: Phase 4 Planner Space Budget (Approach B) ─────────────────\n");
+  test_planner_journal_space_reject();
+  test_planner_dedup_tight_device();
 
   printf("\n─── GROUP L: Phase 3 Migration Map / Rollback ────────────────────────────\n");
   test_migration_map_zero_entries();

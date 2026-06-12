@@ -15,6 +15,25 @@
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_structures.h"
 
+/*
+ * Journal size heuristic (inline copy of journal_writer.c / mke2fs):
+ *   device < 512 MiB  ->  4 MiB
+ *   device < 1 GiB    -> 16 MiB
+ *   device < 2 GiB    -> 32 MiB
+ *   device < 4 GiB    -> 64 MiB
+ *   device >= 4 GiB   -> 128 MiB
+ */
+static uint32_t planner_journal_blocks(uint64_t device_size, uint32_t block_size) {
+  uint64_t mib = device_size / (1024 * 1024);
+  uint32_t journal_mib;
+  if (mib < 512) journal_mib = 4;
+  else if (mib < 1024) journal_mib = 16;
+  else if (mib < 2048) journal_mib = 32;
+  else if (mib < 4096) journal_mib = 64;
+  else journal_mib = 128;
+  return (journal_mib * 1024 * 1024) / block_size;
+}
+
 int ext4_plan_layout(struct ext4_layout *layout, uint64_t device_size,
                      uint32_t block_size, uint32_t inode_ratio,
                      const struct btrfs_fs_info *fs_info) {
@@ -93,10 +112,15 @@ int ext4_plan_layout(struct ext4_layout *layout, uint64_t device_size,
    * long symlinks, while ignoring sparse holes.
    */
   uint64_t data_blocks_required = 0;
+  uint64_t htree_blocks = 0;
+  uint64_t dedup_blocks = 0;
+  uint64_t journal_blocks = planner_journal_blocks(device_size, block_size);
+
   if (fs_info) {
+    dedup_blocks = fs_info->dedup_blocks_needed;
     for (uint32_t i = 0; i < fs_info->inode_count; i++) {
       struct file_entry *fe = fs_info->inode_table[i];
-
+      if (!fe) continue;
       if (fe->mode & S_IFLNK) {
         if (fe->size > 59) {
           data_blocks_required++; /* Symlinks > 59B take 1 data block */
@@ -119,12 +143,23 @@ int ext4_plan_layout(struct ext4_layout *layout, uint64_t device_size,
           }
         }
       } else if (fe->mode & S_IFDIR) {
-        /* Base directory size */
         data_blocks_required += (fe->size + block_size - 1) / block_size;
+        if (fe->child_count > 0) {
+          uint64_t name_sum = 0;
+          for (uint32_t c = 0; c < fe->child_count; c++)
+            name_sum += fe->children[c].name_len;
+          uint32_t avg_name = (uint32_t)(name_sum / fe->child_count);
+          if ((uint64_t)fe->child_count * avg_name > block_size) {
+            uint64_t est = (uint64_t)fe->child_count * 32 / block_size + 4;
+            htree_blocks += est;
+            data_blocks_required += est;
+          }
+        }
       }
     }
+    data_blocks_required += dedup_blocks;
   }
-
+  data_blocks_required += journal_blocks;
   printf("=== Ext4 Constraints & Pre-Calculation ===\n");
   printf("  Device size:       %lu bytes (%.1f GiB)\n",
          (unsigned long)device_size,
@@ -257,8 +292,12 @@ int ext4_plan_layout(struct ext4_layout *layout, uint64_t device_size,
   printf("  Reserved blocks:   %u (metadata zones)\n",
          layout->reserved_block_count);
   printf("  Data blocks req:   %lu (files, index, dirs)\n",
-         (unsigned long)data_blocks_required);
-
+         (unsigned long)(data_blocks_required - journal_blocks - htree_blocks - dedup_blocks));
+  printf("  Journal blocks:    %lu (%lu MiB)\n", (unsigned long)journal_blocks,
+         (unsigned long)(journal_blocks * block_size) / (1024 * 1024));
+  printf("  HTree estimate:    %lu\n", (unsigned long)htree_blocks);
+  printf("  Dedup blocks:      %lu\n", (unsigned long)dedup_blocks);
+  printf("  Total required:    %lu\n", (unsigned long)data_blocks_required);
   /*
    * Phase 2.2: Deadlock Prevention (The 5% Rule)
    * Verify we have enough actual physical Free Space to proceed safely.
