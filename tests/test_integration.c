@@ -2630,6 +2630,141 @@ static void test_chunk_size_consistency(void) {
   TEST_PASS();
 }
 
+
+/* GROUP M Phase 3.5 — Pass 3 emergency footer (Approach C) */
+static int capture_emergency_recover(struct device *dev, char *buf, size_t bufsz) {
+  char capfile[256];
+  snprintf(capfile, sizeof(capfile), "/tmp/b2e4_er_cap_%d.txt", (int)getpid());
+  int saved_stdout = dup(STDOUT_FILENO);
+  int saved_stderr = dup(STDERR_FILENO);
+  int capfd = open(capfile, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (capfd < 0) return -1;
+  dup2(capfd, STDOUT_FILENO); dup2(capfd, STDERR_FILENO); close(capfd);
+  int rc = migration_map_emergency_recover(dev);
+  fflush(stdout); fflush(stderr);
+  dup2(saved_stdout, STDOUT_FILENO); dup2(saved_stderr, STDERR_FILENO);
+  close(saved_stdout); close(saved_stderr);
+  FILE *in = fopen(capfile, "r");
+  if (in) { size_t n = fread(buf, 1, bufsz - 1, in); buf[n] = 0; fclose(in); unlink(capfile); }
+  return rc;
+}
+static void test_pass3_save_sets_phase2(void) {
+  TEST_START("T-3.5.1 save: phase=2 tras migration_map_save");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t351", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "save falló");
+  struct migration_footer footer;
+  REQUIRE(migration_map_read_footer(&dev, &footer) == 0, "read footer falló");
+  CHECK(footer.phase == MIGRATION_PHASE_PASS2_DONE, "phase debe ser 2");
+  CHECK(footer.pass3_step_mask == 0, "mask debe ser 0");
+  CHECK(footer.timestamp != 0, "timestamp establecido");
+  cleanup_test_dev(&dev); TEST_PASS();
+}
+static void test_pass3_set_step_updates_mask(void) {
+  TEST_START("T-3.5.2 set_pass3_step: actualiza bitmask y phase=3");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t352", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "save falló");
+  REQUIRE(migration_map_set_pass3_step(&dev, PASS3_STEP_SUPERBLOCK) == 0, "set sb");
+  REQUIRE(migration_map_set_pass3_step(&dev, PASS3_STEP_GDT) == 0, "set gdt");
+  struct migration_footer footer;
+  REQUIRE(migration_map_read_footer(&dev, &footer) == 0, "read footer");
+  CHECK(footer.phase == MIGRATION_PHASE_PASS3, "phase 3");
+  CHECK(footer.pass3_step_mask == (PASS3_STEP_SUPERBLOCK | PASS3_STEP_GDT), "mask");
+  cleanup_test_dev(&dev); TEST_PASS();
+}
+static void test_pass3_backward_compat_phase(void) {
+  TEST_START("T-3.5.3 footer legacy: phase=0 tratado como pass2_done");
+  struct migration_footer footer;
+  memset(&footer, 0, sizeof(footer));
+  memcpy(footer.magic, MIGRATION_MAGIC, 8);
+  CHECK(migration_map_footer_effective_phase(&footer) == MIGRATION_PHASE_PASS2_DONE, "legacy");
+  footer.phase = MIGRATION_PHASE_PASS3;
+  footer.pass3_step_mask = PASS3_STEP_GDT;
+  CHECK(migration_map_footer_effective_phase(&footer) == MIGRATION_PHASE_PASS3, "explicit");
+  TEST_PASS();
+}
+static void test_emergency_recover_gdt_crash(void) {
+  TEST_START("T-3.5.4 emergency-recover: crash en GDT restaura SB Btrfs");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t354", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0xBEEF);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "save falló");
+  REQUIRE(migration_map_set_pass3_step(&dev, PASS3_STEP_SUPERBLOCK) == 0, "sb");
+  REQUIRE(migration_map_set_pass3_step(&dev, PASS3_STEP_GDT) == 0, "gdt");
+  uint8_t garbage[4096]; memset(garbage, 0xEE, sizeof(garbage));
+  REQUIRE(device_write(&dev, BTRFS_SUPER_OFFSET, garbage, sizeof(garbage)) == 0, "corrupt");
+  char msg[4096] = {0};
+  REQUIRE(capture_emergency_recover(&dev, msg, sizeof(msg)) == 0, "recover");
+  CHECK(strstr(msg, "0x02") != NULL, "bit 0x02");
+  struct btrfs_super_block sb;
+  REQUIRE(read_raw(&dev, BTRFS_SUPER_OFFSET, &sb, sizeof(sb)) == 0, "read sb");
+  CHECK(le64toh(sb.magic) == (BTRFS_MAGIC ^ 0xBEEFULL), "sb restored");
+  CHECK(migration_map_footer_present(&dev) == 0, "footer wiped");
+  cleanup_test_dev(&dev); TEST_PASS();
+}
+static void test_emergency_pass2_only(void) {
+  TEST_START("T-3.5.4b emergency: phase<=2 sugiere --rollback");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t354b", TEST_IMG_SIZE) == 0, "dev");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "save");
+  char msg[4096] = {0};
+  CHECK(capture_emergency_recover(&dev, msg, sizeof(msg)) != 0, "fail expected");
+  CHECK(strstr(msg, "--rollback") != NULL, "rollback hint");
+  cleanup_test_dev(&dev); TEST_PASS();
+}
+static void test_emergency_no_markers(void) {
+  TEST_START("T-3.5.4c emergency: sin footer diagnostico");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t354c", TEST_IMG_SIZE) == 0, "dev");
+  char msg[4096] = {0};
+  CHECK(capture_emergency_recover(&dev, msg, sizeof(msg)) != 0, "fail expected");
+  CHECK(strstr(msg, "no interrupted conversion") != NULL, "diag");
+  cleanup_test_dev(&dev); TEST_PASS();
+}
+static void test_pass3_finalize_wipes_footer(void) {
+  TEST_START("T-3.5.5 finalize_success borra footer");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t355", TEST_IMG_SIZE) == 0, "dev");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "save");
+  REQUIRE(migration_map_set_pass3_step(&dev, PASS3_STEP_SUPERBLOCK) == 0, "step");
+  REQUIRE(migration_map_finalize_success(&dev) == 0, "finalize");
+  CHECK(migration_map_footer_present(&dev) == 0, "wiped");
+  cleanup_test_dev(&dev); TEST_PASS();
+}
+static void test_pass3_crash_each_step(void) {
+  TEST_START("T-3.5.6 crash simulado cada paso Pass3");
+  static const uint32_t steps[] = {PASS3_STEP_SUPERBLOCK, PASS3_STEP_GDT, PASS3_STEP_INODES,
+    PASS3_STEP_DIRS, PASS3_STEP_JOURNAL, PASS3_STEP_BITMAPS, PASS3_STEP_FREE_COUNTS};
+  for (size_t s = 0; s < sizeof(steps)/sizeof(steps[0]); s++) {
+    struct device dev; char suffix[16];
+    snprintf(suffix, sizeof(suffix), "t356_%zu", s);
+    REQUIRE(make_test_dev(&dev, suffix, TEST_IMG_SIZE) == 0, "dev");
+    write_test_btrfs_super(&dev, (uint64_t)(0x100+s));
+    struct relocation_plan plan = {0};
+    REQUIRE(migration_map_save(&dev, &plan) == 0, "save");
+    uint32_t mask = 0;
+    for (size_t i = 0; i <= s; i++) {
+      REQUIRE(migration_map_set_pass3_step(&dev, steps[i]) == 0, "step");
+      mask |= steps[i];
+    }
+    struct migration_footer footer;
+    REQUIRE(migration_map_read_footer(&dev, &footer) == 0, "read");
+    if (footer.pass3_step_mask != mask) { cleanup_test_dev(&dev); TEST_FAIL("mask"); return; }
+    cleanup_test_dev(&dev);
+  }
+  TEST_PASS();
+}
+
 /* =========================================================================
  * Main
  * ======================================================================= */
@@ -2729,6 +2864,16 @@ int main(void) {
   test_image_file_device();
   test_chunk_size_consistency();
   test_update_entry_reload();
+
+  printf("\n─── GROUP M: Phase 3.5 Pass 3 Emergency Footer (Approach C) ───────────\n");
+  test_pass3_save_sets_phase2();
+  test_pass3_set_step_updates_mask();
+  test_pass3_backward_compat_phase();
+  test_emergency_recover_gdt_crash();
+  test_emergency_pass2_only();
+  test_emergency_no_markers();
+  test_pass3_finalize_wipes_footer();
+  test_pass3_crash_each_step();
 
   /* GROUP K: Phase 2 extent tree metadata length */
   printf("\n─── GROUP K: Phase 2 Extent Tree (METADATA_ITEM) ────────────────────\n");

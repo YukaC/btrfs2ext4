@@ -6,12 +6,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "btrfs/btrfs_reader.h"
 #include "btrfs/btrfs_structures.h"
 #include "device_io.h"
 #include "migration_map.h"
 #include "relocator.h"
+
+_Static_assert(sizeof(struct migration_footer) == 64,
+               "migration_footer must remain 64 bytes on disk");
 
 extern uint32_t crc32c(uint32_t crc, const void *buf, size_t len);
 
@@ -44,15 +48,24 @@ static int read_footer(struct device *dev, struct migration_footer *footer,
   return device_read(dev, *footer_offset, footer, sizeof(*footer));
 }
 
+static uint64_t footer_timestamp_now(void) {
+  struct timespec ts;
+  if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
+    return 0;
+  return (uint64_t)ts.tv_sec;
+}
+
 static int write_footer(struct device *dev, uint64_t footer_offset,
-                        uint64_t map_offset, uint32_t entry_count,
-                        uint32_t crc) {
+                        const struct migration_footer *in) {
   struct migration_footer footer;
   memset(&footer, 0, sizeof(footer));
   memcpy(footer.magic, MIGRATION_MAGIC, 8);
-  footer.map_offset = map_offset;
-  footer.entry_count = entry_count;
-  footer.crc32 = crc;
+  footer.map_offset = in->map_offset;
+  footer.entry_count = in->entry_count;
+  footer.crc32 = in->crc32;
+  footer.phase = in->phase;
+  footer.pass3_step_mask = in->pass3_step_mask;
+  footer.timestamp = in->timestamp;
   return device_write(dev, footer_offset, &footer, sizeof(footer));
 }
 
@@ -279,8 +292,8 @@ int migration_map_update_entry(struct device *dev, uint32_t index,
     free(entries);
     return -1;
   }
-  if (write_footer(dev, footer_offset, footer.map_offset, footer.entry_count,
-                   crc32c(0, entries, (size_t)map_size)) < 0) {
+  footer.crc32 = crc32c(0, entries, (size_t)map_size);
+  if (write_footer(dev, footer_offset, &footer) < 0) {
     free(entries);
     return -1;
   }
@@ -313,11 +326,146 @@ int migration_map_save(struct device *dev, const struct relocation_plan *plan) {
       return -1;
   }
 
-  uint32_t crc = plan->count > 0 ? crc32c(0, plan->entries, map_size) : 0;
-  if (write_footer(dev, footer_offset, map_offset, plan->count, crc) < 0)
+  struct migration_footer footer;
+  memset(&footer, 0, sizeof(footer));
+  footer.map_offset = map_offset;
+  footer.entry_count = plan->count;
+  footer.crc32 = plan->count > 0 ? crc32c(0, plan->entries, map_size) : 0;
+  footer.phase = MIGRATION_PHASE_PASS2_DONE;
+  footer.timestamp = footer_timestamp_now();
+  if (write_footer(dev, footer_offset, &footer) < 0)
     return -1;
 
   return device_sync(dev) < 0 ? -1 : 0;
+}
+
+
+uint32_t migration_map_footer_effective_phase(
+    const struct migration_footer *footer) {
+  if (!footer)
+    return MIGRATION_PHASE_IDLE;
+  if (footer->phase != 0)
+    return footer->phase;
+  if (memcmp(footer->magic, MIGRATION_MAGIC, 8) == 0)
+    return MIGRATION_PHASE_PASS2_DONE;
+  return MIGRATION_PHASE_IDLE;
+}
+
+int migration_map_read_footer(struct device *dev,
+                              struct migration_footer *footer) {
+  uint64_t backup_offset, footer_offset;
+  if (!footer)
+    return -1;
+  return read_footer(dev, footer, &backup_offset, &footer_offset);
+}
+
+static const char *pass3_step_label(uint32_t bit) {
+  switch (bit) {
+  case PASS3_STEP_SUPERBLOCK: return "superblock";
+  case PASS3_STEP_GDT: return "GDT";
+  case PASS3_STEP_INODES: return "inode tables";
+  case PASS3_STEP_DIRS: return "directories";
+  case PASS3_STEP_JOURNAL: return "journal";
+  case PASS3_STEP_BITMAPS: return "bitmaps";
+  case PASS3_STEP_FREE_COUNTS: return "free counts";
+  case PASS3_STEP_COMPLETE: return "final sync";
+  default: return "unknown";
+  }
+}
+
+static void print_pass3_mask(uint32_t mask) {
+  static const uint32_t bits[] = {
+      PASS3_STEP_SUPERBLOCK, PASS3_STEP_GDT, PASS3_STEP_INODES,
+      PASS3_STEP_DIRS, PASS3_STEP_JOURNAL, PASS3_STEP_BITMAPS,
+      PASS3_STEP_FREE_COUNTS};
+  int first = 1;
+  for (size_t i = 0; i < sizeof(bits) / sizeof(bits[0]); i++) {
+    if ((mask & bits[i]) == 0) continue;
+    if (!first) printf(", ");
+    printf("0x%02X (%s)", bits[i], pass3_step_label(bits[i]));
+    first = 0;
+  }
+  if (first) printf("(none)");
+}
+
+int migration_map_set_pass3_step(struct device *dev, uint32_t mask_bit) {
+  struct migration_footer footer;
+  uint64_t backup_offset, footer_offset;
+  if (read_footer(dev, &footer, &backup_offset, &footer_offset) < 0)
+    return -1;
+  if (memcmp(footer.magic, MIGRATION_MAGIC, 8) != 0)
+    return -1;
+  footer.phase = MIGRATION_PHASE_PASS3;
+  footer.pass3_step_mask |= mask_bit;
+  footer.timestamp = footer_timestamp_now();
+  if (write_footer(dev, footer_offset, &footer) < 0)
+    return -1;
+  return device_sync(dev) < 0 ? -1 : 0;
+}
+
+int migration_map_wipe_footer(struct device *dev) {
+  uint64_t backup_offset, footer_offset;
+  tail_offsets(dev->size, &backup_offset, &footer_offset);
+  struct migration_footer footer;
+  memset(&footer, 0, sizeof(footer));
+  if (device_write(dev, footer_offset, &footer, sizeof(footer)) < 0)
+    return -1;
+  return device_sync(dev) < 0 ? -1 : 0;
+}
+
+int migration_map_finalize_success(struct device *dev) {
+  if (migration_map_set_pass3_step(dev, PASS3_STEP_COMPLETE) < 0)
+    return -1;
+  return migration_map_wipe_footer(dev);
+}
+
+int migration_map_emergency_recover(struct device *dev) {
+  struct migration_footer footer;
+  uint64_t backup_offset, footer_offset;
+  if (read_footer(dev, &footer, &backup_offset, &footer_offset) < 0)
+    return -1;
+  int cleared = 1;
+  for (int i = 0; i < 8; i++) {
+    if (footer.magic[i] != 0) { cleared = 0; break; }
+  }
+  if (cleared) {
+    fprintf(stderr, "btrfs2ext4: no interrupted conversion detected on this device\n");
+    return -1;
+  }
+  if (memcmp(footer.magic, MIGRATION_MAGIC, 8) != 0) {
+    fprintf(stderr, "btrfs2ext4: no interrupted conversion detected on this device\n");
+    return -1;
+  }
+  uint32_t phase = migration_map_footer_effective_phase(&footer);
+  uint32_t mask = footer.pass3_step_mask;
+  if ((mask & PASS3_STEP_COMPLETE) != 0) {
+    printf("Conversion already completed. Run: e2fsck -f <device>\n");
+    return 0;
+  }
+  if ((mask & PASS3_STEP_PARTIAL_MASK) != 0) {
+    printf("EMERGENCY: Pass 3 interrupted — hybrid Btrfs/Ext4 state detected.\n");
+    printf("Completed Pass 3 steps: ");
+    print_pass3_mask(mask);
+    printf("\nWARNING: Partial Ext4 metadata remains on disk.\n");
+    printf("Attempting automatic relocation rollback and Btrfs superblock restore...\n\n");
+    if (migration_map_rollback(dev) < 0) {
+      fprintf(stderr, "btrfs2ext4: emergency rollback failed\n");
+      return -1;
+    }
+    printf("\nEmergency recovery complete.\n");
+    printf("Recommendations:\n");
+    printf("  - Run 'btrfs check <device>' before remounting as Btrfs\n");
+    printf("  - For a clean retry, clone with ddrescue and convert the copy\n");
+    printf("  - Restore from an external backup if data integrity is critical\n");
+    printf("  - Do NOT run e2fsck on this device\n");
+    return 0;
+  }
+  if (phase <= MIGRATION_PHASE_PASS2_DONE) {
+    fprintf(stderr, "btrfs2ext4: Pass 2 checkpoint found (phase %u). Run: btrfs2ext4 --rollback <device>\n", phase);
+    return -1;
+  }
+  fprintf(stderr, "btrfs2ext4: unrecognized conversion state (phase %u)\n", phase);
+  return -1;
 }
 
 int migration_map_rollback(struct device *dev) {
