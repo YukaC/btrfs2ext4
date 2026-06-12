@@ -14,6 +14,8 @@ struct convert_options {
   int dry_run;              /* 1 = simulate only, don't write */
   int verbose;              /* 1 = detailed output */
   int rollback;             /* 1 = rollback a previous conversion */
+  int emergency_recover;    /* 1 = recover from interrupted Pass 3 */
+  int force;                /* 1 = resume conversion with existing map */
   int no_journal;           /* 1 = skip crash-recovery journal */
   uint32_t block_size;      /* ext4 block size (default 4096) */
   uint32_t inode_ratio;     /* bytes per inode (default 16384) */
@@ -27,12 +29,8 @@ typedef void (*progress_callback)(const char *phase, uint32_t percent,
 /*
  * Perform the in-place btrfs → ext4 conversion.
  *
- * This is the main entry point that orchestrates all three passes:
- *   Pass 1: Read btrfs metadata
- *   Pass 2: Plan ext4 layout + relocate conflicting blocks
- *   Pass 3: Write ext4 structures
- *
- * Returns 0 on success, -1 on error.
+ * Internal return convention: 0 on success, -1 on error.
+ * The CLI maps this to process exit codes: 0 success, 1 failure.
  */
 int btrfs2ext4_convert(const struct convert_options *opts,
                        progress_callback progress);
@@ -40,9 +38,13 @@ int btrfs2ext4_convert(const struct convert_options *opts,
 /*
  * Rollback a previous conversion.
  * Restores the btrfs superblock from backup.
- * Returns 0 on success, -1 on error.
+ *
+ * Internal return convention: 0 on success, -1 on error.
+ * The CLI maps this to process exit codes: 0 success, 1 failure.
  */
 int btrfs2ext4_rollback(const char *device_path);
+
+int btrfs2ext4_emergency_recover(const char *device_path);
 
 /*
  * Print version information.

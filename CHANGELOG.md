@@ -5,6 +5,28 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Phase 2 (Btrfs reader hardening, Approach B)** — dynamic `chunk_map_populate()` stack with bytenr/level/generation validation and cycle detection; PREALLOC sparse-hole handling via `btrfs_extent_is_sparse()`; 128-bit CoW dedup key `(bytenr, num_bytes)`; inline/find_or_create_inode OOM fail-fast through `btrfs_read_fs`; METADATA_ITEM used-block length = nodesize with extent generation/flags stored; extent coalescing guards for offset/compression/is_physical; tests in `test_stress`, `test_fuzz`, and `test_integration`
+
+- **Phase 1 (P0 Ext4 integrity, Approach B)** — `ext4_finalize_bitmaps()` writes block+inode bitmaps from in-memory state as the last metadata write before free counts; full directory inode metadata via `ext4_build_dir_inode_from_entry()` with half-MD4 HTree hashing; METADATA_CSUM (superblock, GDT, inode checksums); `file_extent.offset` and physical fallback for relocated extents; integration tests E-4/E-5/E-6 and Group J
+
+- **CI reusable workflow** — `.github/workflows/reusable-build-test.yml` with matrix builds (GCC/Clang × Debug/Release) and optional sanitizers
+- **`BTRFS2EXT4_ENABLE_SANITIZERS` CMake option** — enables ASan+UBSan on all four test targets (default ON in Debug, OFF in Release; CI overrides explicitly)
+- **`convert_state` cleanup context** — centralizes teardown in `convert_state_init()` / `convert_state_cleanup()`, fixing conditional `ext4_block_alloc_free` on early-exit paths
+
+### Changed
+
+- **Superblock feature flags** — `EXT4_FEATURE_INCOMPAT_CSUM_SEED` disabled; `EXT4_FEATURE_RO_COMPAT_METADATA_CSUM` enabled with inode-only checksum implementation (superblock checksum deferred)
+- **HTree directories** — `hash_version` set to `EXT4_HASH_LEGACY` to match `ext4_legacy_hash`; `EXT4_INDEX_FL` only on HTree directories
+
+- **CLI exit codes** — `main()` maps API return values to exit status 0 (success) or 1 (failure); documented in `btrfs2ext4.h` and `btrfs2ext4.8`
+- **TECHNICAL.md** — documents `journal.c` as stub/unwired, migration map as primary recovery, and `io_uring` as partial
+
+---
+
 ## [0.2.0-alpha] - 2026-02-27
 
 ### Added
