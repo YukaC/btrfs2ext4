@@ -117,16 +117,18 @@ static void planner_fail_cleanup(struct ext4_layout *layout)
 static void fill_budget(struct ext4_space_budget *budget,
                         uint32_t data_blocks, uint32_t journal_blocks,
                         uint32_t htree_blocks, uint32_t dedup_blocks,
-                        uint32_t metadata_blocks, uint32_t margin_blocks)
+                        uint32_t decompression_blocks, uint32_t metadata_blocks,
+                        uint32_t margin_blocks)
 {
   budget->data_blocks = data_blocks;
   budget->journal_blocks = journal_blocks;
   budget->htree_blocks = htree_blocks;
   budget->dedup_blocks = dedup_blocks;
+  budget->decompression_blocks = decompression_blocks;
   budget->metadata_blocks = metadata_blocks;
   budget->safety_margin_blocks = margin_blocks;
-  budget->total_required =
-      data_blocks + journal_blocks + htree_blocks + dedup_blocks;
+  budget->total_required = data_blocks + journal_blocks + htree_blocks +
+                           dedup_blocks + decompression_blocks;
 }
 
 static uint32_t compute_data_blocks(const struct btrfs_fs_info *fs_info,
@@ -158,8 +160,9 @@ static uint32_t compute_data_blocks(const struct btrfs_fs_info *fs_info,
         }
       }
     } else if (fe->mode & S_IFDIR) {
-      data_blocks_required +=
-          (uint32_t)((fe->size + block_size - 1) / block_size);
+      if (ext4_htree_extra_blocks(fe, block_size) == 0)
+        data_blocks_required +=
+            (uint32_t)((fe->size + block_size - 1) / block_size);
     }
   }
 
@@ -184,22 +187,25 @@ static uint32_t compute_htree_blocks(const struct btrfs_fs_info *fs_info,
   return htree_blocks;
 }
 
-static uint32_t compute_dedup_blocks(const struct btrfs_fs_info *fs_info,
-                                     uint32_t block_size)
+static uint32_t compute_dedup_blocks(const struct btrfs_fs_info *fs_info)
 {
-  uint64_t dedup = 0;
-
   if (!fs_info)
     return 0;
 
-  dedup = fs_info->dedup_blocks_needed;
-  if (fs_info->compressed_extent_count > 0) {
-    uint64_t expansion =
-        fs_info->total_decompressed_bytes - fs_info->total_compressed_bytes;
-    dedup += (expansion + block_size - 1) / block_size;
-  }
+  return (uint32_t)fs_info->dedup_blocks_needed;
+}
 
-  return (uint32_t)dedup;
+static uint32_t compute_decompression_blocks(const struct btrfs_fs_info *fs_info,
+                                             uint32_t block_size)
+{
+  uint64_t expansion;
+
+  if (!fs_info || fs_info->compressed_extent_count == 0)
+    return 0;
+
+  expansion =
+      fs_info->total_decompressed_bytes - fs_info->total_compressed_bytes;
+  return (uint32_t)((expansion + block_size - 1) / block_size);
 }
 
 int ext4_plan_layout(const struct btrfs_fs_info *fs_info, uint64_t device_size,
@@ -210,6 +216,7 @@ int ext4_plan_layout(const struct btrfs_fs_info *fs_info, uint64_t device_size,
   uint32_t htree_blocks;
   uint32_t journal_blocks;
   uint32_t dedup_blocks;
+  uint32_t decompression_blocks;
   uint32_t margin_blocks;
   uint64_t physically_usable;
   uint64_t total_required;
@@ -275,7 +282,8 @@ int ext4_plan_layout(const struct btrfs_fs_info *fs_info, uint64_t device_size,
   data_blocks_required = compute_data_blocks(fs_info, block_size);
   htree_blocks = compute_htree_blocks(fs_info, block_size);
   journal_blocks = ext4_journal_default_blocks(device_size, block_size);
-  dedup_blocks = compute_dedup_blocks(fs_info, block_size);
+  dedup_blocks = compute_dedup_blocks(fs_info);
+  decompression_blocks = compute_decompression_blocks(fs_info, block_size);
 
   printf("=== Ext4 Constraints & Pre-Calculation ===\n");
   printf("  Device size:       %lu bytes (%.1f GiB)\n",
@@ -388,6 +396,7 @@ int ext4_plan_layout(const struct btrfs_fs_info *fs_info, uint64_t device_size,
          (unsigned long)(layout->journal_start_block + layout->journal_blocks -
                          1));
   printf("  Dedup/CoW blocks:  %u\n", dedup_blocks);
+  printf("  Decompress blocks: %u\n", decompression_blocks);
   printf("  Safety margin:     %u%% (%u blocks)\n", margin_pct, margin_blocks);
 
   physically_usable =
@@ -396,7 +405,7 @@ int ext4_plan_layout(const struct btrfs_fs_info *fs_info, uint64_t device_size,
           : 0;
 
   total_required = (uint64_t)data_blocks_required + htree_blocks +
-                   journal_blocks + dedup_blocks;
+                   journal_blocks + dedup_blocks + decompression_blocks;
 
   if (total_required >= physically_usable) {
     fprintf(stderr,
@@ -408,6 +417,7 @@ int ext4_plan_layout(const struct btrfs_fs_info *fs_info, uint64_t device_size,
     fprintf(stderr, "  HTree overhead:    %u\n", htree_blocks);
     fprintf(stderr, "  Journal:           %u\n", journal_blocks);
     fprintf(stderr, "  Dedup/CoW:         %u\n", dedup_blocks);
+    fprintf(stderr, "  Decompression:     %u\n", decompression_blocks);
     fprintf(stderr, "  Physically usable: %lu\n",
             (unsigned long)physically_usable);
     planner_fail_cleanup(layout);
@@ -435,7 +445,8 @@ int ext4_plan_layout(const struct btrfs_fs_info *fs_info, uint64_t device_size,
 
   if (budget) {
     fill_budget(budget, data_blocks_required, journal_blocks, htree_blocks,
-                dedup_blocks, layout->reserved_block_count, margin_blocks);
+                dedup_blocks, decompression_blocks, layout->reserved_block_count,
+                margin_blocks);
   }
 
   return 0;

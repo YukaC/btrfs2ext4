@@ -42,6 +42,7 @@
 #include "ext4/ext4_crc16.h"
 #include "ext4/ext4_metadata_csum.h"
 #include "ext4/ext4_planner.h"
+#include "ext4/ext4_space.h"
 #include "ext4/ext4_structures.h"
 #include "ext4/ext4_writer.h"
 #include "migration_map.h"
@@ -2861,6 +2862,43 @@ static void test_planner_safety_margin(void) {
   TEST_PASS();
 }
 
+
+static void test_htree_full_block_count(void) {
+  TEST_START("T-4b.1  HTree block count (full, no subtract-base)");
+  const uint64_t dev_size = 64ULL * 1024 * 1024;
+  struct btrfs_fs_info *fs = make_big_dir_fs(800);
+  struct ext4_layout layout;
+  struct ext4_space_budget budget;
+  uint32_t expected = ext4_htree_extra_blocks(fs->root_dir, TEST_BLOCK_SIZE);
+  REQUIRE(ext4_plan_layout(fs, dev_size, TEST_BLOCK_SIZE, 16384,
+                           EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout,
+                           &budget) == 0, "plan");
+  CHECK(expected > 0, "synthetic dir needs HTree");
+  CHECK(budget.htree_blocks == expected, "htree budget matches full count");
+  ext4_free_layout(&layout);
+  free_big_dir_fs(fs);
+  TEST_PASS();
+}
+
+static void test_journal_uses_planner_tail(void) {
+  TEST_START("T-4b.2  journal: usa bloques reservados del planner");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "jrn4b2", TEST_IMG_SIZE) == 0, "image");
+  struct ext4_layout layout;
+  REQUIRE(build_test_layout(&layout) == 0, "planner");
+  REQUIRE(layout.journal_start_block > 0, "journal tail reserved");
+  struct ext4_block_allocator alloc;
+  ext4_block_alloc_init(&alloc, &layout);
+  REQUIRE(ext4_write_journal(&dev, &layout, &alloc, TEST_IMG_SIZE) == 0,
+          "write_journal");
+  CHECK(ext4_journal_start_block() == layout.journal_start_block,
+        "journal at planner tail");
+  ext4_block_alloc_free(&alloc);
+  ext4_free_layout(&layout);
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
 /* =========================================================================
  * Main
  * ======================================================================= */
@@ -2977,6 +3015,11 @@ int main(void) {
   test_planner_htree_budget();
   test_planner_dedup_budget();
   test_planner_safety_margin();
+
+  printf("\n─── GROUP N2: Phase 4b inline fixes (Approach B) "
+         "────────────────────────────\n");
+  test_htree_full_block_count();
+  test_journal_uses_planner_tail();
 
   /* GROUP K: Phase 2 extent tree metadata length */
   printf("\n─── GROUP K: Phase 2 Extent Tree (METADATA_ITEM) ────────────────────\n");

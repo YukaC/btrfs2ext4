@@ -36,7 +36,6 @@ uint32_t ext4_htree_extra_blocks(const struct file_entry *dir, uint32_t block_si
 {
     uint32_t dir_size;
     uint32_t htree_total;
-    uint32_t base_blocks;
 
     if (!dir || block_size == 0 || !(dir->mode & S_IFDIR))
         return 0;
@@ -55,8 +54,5 @@ uint32_t ext4_htree_extra_blocks(const struct file_entry *dir, uint32_t block_si
     if (htree_total < 4)
         htree_total = 4;
 
-    base_blocks = (uint32_t)((dir->size + block_size - 1) / block_size);
-    if (htree_total <= base_blocks)
-        return 0;
-    return htree_total - base_blocks;
+    return htree_total;
 }

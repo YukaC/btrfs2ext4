@@ -49,11 +49,34 @@ _Static_assert(sizeof(struct jbd2_superblock) == 1024,
 static uint64_t g_journal_start_block = 0;
 static uint32_t g_journal_block_count = 0;
 
+static int journal_range_valid(const struct ext4_layout *layout, uint64_t start,
+                               uint32_t count)
+{
+  if (count == 0 || start + count > layout->total_blocks)
+    return 0;
+  return 1;
+}
+
+static void journal_mark_range(struct ext4_block_allocator *alloc, uint64_t start,
+                               uint32_t count)
+{
+  if (!alloc->reserved_bitmap)
+    return;
+
+  for (uint32_t i = 0; i < count; i++) {
+    uint64_t blk = start + i;
+    alloc->reserved_bitmap[blk / 8] |= (1 << (blk % 8));
+  }
+}
+
 int ext4_write_journal(struct device *dev, const struct ext4_layout *layout,
                        struct ext4_block_allocator *alloc,
                        uint64_t device_size) {
   uint32_t block_size = layout->block_size;
-  uint32_t journal_blocks = ext4_journal_default_blocks(device_size, block_size);
+  uint32_t journal_blocks = layout->journal_blocks;
+
+  if (journal_blocks == 0)
+    journal_blocks = ext4_journal_default_blocks(device_size, block_size);
 
   /* Bug M fix: Reset globals before each invocation to avoid stale state */
   g_journal_start_block = 0;
@@ -63,12 +86,20 @@ int ext4_write_journal(struct device *dev, const struct ext4_layout *layout,
   printf("  Journal size: %u blocks (%u MiB)\n", journal_blocks,
          (journal_blocks * block_size) / (1024 * 1024));
 
-  /* Phase 3.3: Try to allocate journal sequentially at the absolute end of the
-   * device */
   uint64_t first_block = (uint64_t)-1;
   uint32_t got_blocks = 0;
 
-  if (alloc->reserved_bitmap) {
+  if (layout->journal_start_block > 0 && journal_blocks > 0) {
+    uint64_t start = layout->journal_start_block;
+    if (!journal_range_valid(layout, start, journal_blocks)) {
+      fprintf(stderr, "btrfs2ext4: planner journal range invalid at %lu\n",
+              (unsigned long)start);
+      return -1;
+    }
+    first_block = start;
+    got_blocks = journal_blocks;
+    journal_mark_range(alloc, start, journal_blocks);
+  } else if (alloc->reserved_bitmap) {
     uint64_t count = 0;
     for (uint64_t b = layout->total_blocks; b-- > 0;) {
       if (alloc->reserved_bitmap[b / 8] & (1 << (b % 8))) {
@@ -89,8 +120,8 @@ int ext4_write_journal(struct device *dev, const struct ext4_layout *layout,
     }
   }
 
-  /* Fallback: allocate from front if end-of-device search failed */
-  if (first_block == (uint64_t)-1) {
+  /* Fallback: allocate from front only when planner did not reserve tail journal */
+  if (first_block == (uint64_t)-1 && layout->journal_start_block == 0) {
     first_block = ext4_alloc_block(alloc, layout);
     if (first_block == (uint64_t)-1) {
       fprintf(stderr, "btrfs2ext4: no space for journal\n");

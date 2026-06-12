@@ -46,6 +46,7 @@ static void print_usage(const char *prog) {
       "cwd)\n"
       "  -m, --memory-limit N    Max RAM in MB (0=auto 60%% of physical)\n"
       "      --safety-margin N   Free-space headroom %% for planner (1-25, default 5)\n"
+      "      --assume-ssd        Dry-run ETA uses SSD speed (default: HDD)\n"
       "  -h, --help              Show this help\n"
       "  -V, --version           Show version\n"
       "\n"
@@ -428,6 +429,10 @@ int btrfs2ext4_convert(const struct convert_options *opts,
          space_budget.dedup_blocks,
          (double)space_budget.dedup_blocks * st.layout.block_size /
              (1024.0 * 1024.0));
+  printf("  Decompression reserve:  %u blocks (%.1f MiB)\n",
+         space_budget.decompression_blocks,
+         (double)space_budget.decompression_blocks * st.layout.block_size /
+             (1024.0 * 1024.0));
   printf("  Metadata reserved:      %u blocks\n",
          space_budget.metadata_blocks);
   printf("  Safety margin (%u%%):    %u blocks (%.1f MiB)\n",
@@ -451,78 +456,37 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   printf("===================================================\n\n");
 
   /* ================================================
-   * DRY-RUN Benchmark and ETA Estimation
+   * DRY-RUN ETA Estimation (budget-based, no I/O benchmark)
    * ================================================ */
   if (opts->dry_run) {
-    printf("=== DRY RUN: ETA Benchmark ===\n");
-    printf("  Benchmarking device read speed to estimate real conversion "
-           "time...\n");
-
-    /* Benchmark 128 MB or total device size, whichever is smaller */
-    uint64_t bench_size = 128ULL * 1024 * 1024;
-    if (bench_size > st.dev.size)
-      bench_size = st.dev.size;
-
-    uint32_t chunk = 1048576; /* 1 MB */
-    uint8_t *bench_buf = malloc(chunk);
-    if (!bench_buf) {
-      printf("  WARNING: Could not allocate benchmark buffer.\n");
-    } else {
-      struct timespec tb_start, tb_end;
-      clock_gettime(CLOCK_MONOTONIC, &tb_start);
-
-      uint64_t read_bytes = 0;
-      uint64_t offset = 0;
-
-      while (read_bytes < bench_size) {
-        if (device_read(&st.dev, offset, bench_buf, chunk) < 0)
-          break;
-        read_bytes += chunk;
-        offset += chunk;
-      }
-
-      clock_gettime(CLOCK_MONOTONIC, &tb_end);
-      free(bench_buf);
-
-      double elapsed_sec = (tb_end.tv_sec - tb_start.tv_sec) +
-                           (tb_end.tv_nsec - tb_start.tv_nsec) / 1e9;
-
-      if (elapsed_sec > 0.0 && read_bytes > 0) {
-        double speed_mb_s =
-            ((double)read_bytes / (1024.0 * 1024.0)) / elapsed_sec;
-        printf("  Read speed measured:    %.1f MB/s\n", speed_mb_s);
-
-        /* Calculate approximate write footprint to be deployed in Phase 3 */
-        uint64_t inode_tbl_bytes =
-            (uint64_t)st.layout.total_inodes * st.layout.inode_size;
-        uint64_t gdt_bytes = (uint64_t)st.layout.num_groups * st.layout.desc_size;
-        uint64_t bitmap_bytes =
-            (uint64_t)st.layout.num_groups * st.layout.block_size * 2;
-        uint64_t total_meta_write_bytes =
-            inode_tbl_bytes + gdt_bytes + bitmap_bytes;
-
-        /* Penalize speed: 40% efficiency for sequential-ish, 10% efficiency for
-         * scattered */
-        double write_speed_optimistic = speed_mb_s * 0.40;
-        double write_speed_pessimistic = speed_mb_s * 0.10;
-
-        double eta_min_sec =
-            ((double)total_meta_write_bytes / (1024.0 * 1024.0)) /
-            write_speed_optimistic;
-        double eta_max_sec =
-            ((double)total_meta_write_bytes / (1024.0 * 1024.0)) /
-            write_speed_pessimistic;
-
-        printf("  Phase 3 Write footprint:%.1f MB\n",
-               (double)total_meta_write_bytes / (1024.0 * 1024.0));
-        printf(
-            "\n  >> Estimated Real Conversion Time: %.0f to %.0f seconds <<\n",
-            eta_min_sec, eta_max_sec);
-      } else {
-        printf("  Benchmark failed to complete.\n");
-      }
-    }
-    printf("==============================\n\n");
+    uint32_t bs = st.layout.block_size;
+    uint64_t inode_table_bytes =
+        (uint64_t)st.layout.total_inodes * st.layout.inode_size;
+    uint64_t gdt_bytes =
+        (uint64_t)st.layout.num_groups * st.layout.desc_size;
+    uint64_t bitmap_bytes =
+        (uint64_t)st.layout.num_groups * st.layout.block_size * 2;
+    uint64_t pass3_bytes =
+        (uint64_t)(space_budget.total_required + space_budget.metadata_blocks) *
+            bs +
+        inode_table_bytes + gdt_bytes + bitmap_bytes;
+    uint64_t reloc_bytes = 0;
+    for (uint32_t i = 0; i < st.reloc_plan.count; i++)
+      reloc_bytes += st.reloc_plan.entries[i].length;
+    uint64_t total_write = pass3_bytes + reloc_bytes * 2;
+    double speed_mb_s = opts->assume_ssd ? 250.0 : 60.0;
+    double eta_min =
+        ((double)total_write / (1024.0 * 1024.0)) / speed_mb_s / 60.0;
+    printf("=== DRY RUN: Conversion ETA ===\n");
+    printf("  Pass 3 write estimate:  %.1f MiB\n",
+           (double)pass3_bytes / (1024.0 * 1024.0));
+    printf("  Relocation I/O:         %.1f MiB (read+write)\n",
+           (double)(reloc_bytes * 2) / (1024.0 * 1024.0));
+    printf("  Total write footprint:  %.1f MiB\n",
+           (double)total_write / (1024.0 * 1024.0));
+    printf("  Estimated time: %.0f min (%s assumption)\n", eta_min,
+           opts->assume_ssd ? "SSD" : "HDD");
+    printf("================================\n\n");
   }
 
   /* ================================================
@@ -801,6 +765,7 @@ int main(int argc, char **argv) {
       {"workdir", required_argument, NULL, 'w'},
       {"memory-limit", required_argument, NULL, 'm'},
       {"safety-margin", required_argument, NULL, 1002},
+      {"assume-ssd", no_argument, NULL, 1003},
       {"help", no_argument, NULL, 'h'},
       {"version", no_argument, NULL, 'V'},
       {NULL, 0, NULL, 0}};
@@ -854,6 +819,9 @@ int main(int argc, char **argv) {
       opts.safety_margin_percent = (uint8_t)margin;
       break;
     }
+    case 1003:
+      opts.assume_ssd = 1;
+      break;
     case 'h':
       print_usage(argv[0]);
       return 0;
