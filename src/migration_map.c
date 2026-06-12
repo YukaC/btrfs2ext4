@@ -1,7 +1,8 @@
 /*
- * migration_map.c — Persistent Block Relocation Journal
+ * migration_map.c — Persistent Block Relocation Journal (Phase 3 Approach A+)
  */
 
+#include <endian.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,146 +15,406 @@
 
 extern uint32_t crc32c(uint32_t crc, const void *buf, size_t len);
 
-int migration_map_save(struct device *dev, const struct relocation_plan *plan) {
-  /* Write btrfs superblock backup */
-  struct btrfs_super_block sb_backup;
-  if (device_read(dev, BTRFS_SUPER_OFFSET, &sb_backup, sizeof(sb_backup)) < 0)
-    return -1;
+static void tail_offsets(uint64_t dev_size, uint64_t *backup_offset,
+                         uint64_t *footer_offset) {
+  *backup_offset = (dev_size - SUPERBLOCK_BACKUP_OFFSET) & ~4095ULL;
+  *footer_offset = *backup_offset - MIGRATION_FOOTER_OFFSET;
+}
 
-  uint64_t backup_offset = (dev->size - SUPERBLOCK_BACKUP_OFFSET) & ~4095ULL;
-  if (device_write(dev, backup_offset, &sb_backup, sizeof(sb_backup)) < 0)
-    return -1;
-
-  /* Calculate map size and offset */
-  if (plan->count == 0)
+static int backup_is_btrfs(struct device *dev, uint64_t backup_offset) {
+  struct btrfs_super_block sb;
+  if (device_read(dev, backup_offset, &sb, sizeof(sb)) < 0)
     return 0;
+  return le64toh(sb.magic) == BTRFS_MAGIC;
+}
 
-  /* Hard upper bound to avoid pathological plans consuming absurd space */
-  const uint32_t MIGRATION_MAX_ENTRIES = 1024 * 1024; /* ~40–64 MiB of map */
-  if (plan->count > MIGRATION_MAX_ENTRIES) {
-    fprintf(stderr,
-            "btrfs2ext4: migration plan has %u entries, exceeds max %u — "
-            "refusing to save migration map\n",
-            plan->count, MIGRATION_MAX_ENTRIES);
+static int cmp_seq_desc(const void *a, const void *b) {
+  const struct relocation_entry *ea = a;
+  const struct relocation_entry *eb = b;
+  if (ea->seq > eb->seq)
     return -1;
-  }
+  if (ea->seq < eb->seq)
+    return 1;
+  return 0;
+}
 
-  uint64_t map_size = (uint64_t)plan->count * sizeof(struct relocation_entry);
+static int read_footer(struct device *dev, struct migration_footer *footer,
+                       uint64_t *backup_offset, uint64_t *footer_offset) {
+  tail_offsets(dev->size, backup_offset, footer_offset);
+  return device_read(dev, *footer_offset, footer, sizeof(*footer));
+}
 
-  /* Secondary safety cap: never try to reserve more than 1 GiB for the map */
-  if (map_size > 1024ULL * 1024 * 1024) {
-    fprintf(stderr,
-            "btrfs2ext4: migration map too large (%lu bytes) — corrupted plan "
-            "or unsupported scale\n",
-            (unsigned long)map_size);
-    return -1;
-  }
-
-  uint64_t map_offset = backup_offset - MIGRATION_FOOTER_OFFSET - map_size;
-  map_offset &= ~4095ULL; /* block aligned */
-
-  /* Write the entries array */
-  if (plan->count > 0) {
-    if (device_write(dev, map_offset, plan->entries, map_size) < 0)
-      return -1;
-  }
-
-  /* Create and write footer */
+static int write_footer(struct device *dev, uint64_t footer_offset,
+                        uint64_t map_offset, uint32_t entry_count,
+                        uint32_t crc) {
   struct migration_footer footer;
   memset(&footer, 0, sizeof(footer));
   memcpy(footer.magic, MIGRATION_MAGIC, 8);
   footer.map_offset = map_offset;
-  footer.entry_count = plan->count;
-  footer.crc32 = crc32c(0, plan->entries, map_size);
+  footer.entry_count = entry_count;
+  footer.crc32 = crc;
+  return device_write(dev, footer_offset, &footer, sizeof(footer));
+}
 
-  uint64_t footer_offset = backup_offset - MIGRATION_FOOTER_OFFSET;
-  if (device_write(dev, footer_offset, &footer, sizeof(footer)) < 0)
+static int verify_dst_checksum(struct device *dev,
+                               const struct relocation_entry *re) {
+  uint8_t *buf = malloc(1024 * 1024);
+  if (!buf)
     return -1;
-
-  device_sync(dev);
+  uint32_t calc = 0;
+  uint64_t off = re->dst_offset;
+  uint64_t rem = re->length;
+  while (rem > 0) {
+    uint32_t chunk = rem > 1024 * 1024 ? 1024 * 1024 : (uint32_t)rem;
+    if (device_read(dev, off, buf, chunk) < 0) {
+      free(buf);
+      return -1;
+    }
+    calc = crc32c(calc, buf, chunk);
+    off += chunk;
+    rem -= chunk;
+  }
+  free(buf);
+  if (calc != re->checksum) {
+    fprintf(stderr,
+            "btrfs2ext4: relocation dst checksum mismatch for seq %u — "
+            "rollback aborted\n",
+            re->seq);
+    return -1;
+  }
   return 0;
 }
 
+static int migration_map_validate_footer_bounds(struct device *dev,
+                                                const struct migration_footer *footer) {
+  if (footer->entry_count > MIGRATION_MAX_ENTRIES) {
+    fprintf(stderr,
+            "btrfs2ext4: migration map entry_count %u exceeds max %u — "
+            "refusing rollback\n",
+            footer->entry_count, MIGRATION_MAX_ENTRIES);
+    return -1;
+  }
+  uint64_t backup_offset, footer_offset;
+  tail_offsets(dev->size, &backup_offset, &footer_offset);
+  if (footer->map_offset > dev->size)
+    return -1;
+  if (footer->entry_count > 0) {
+    uint64_t map_size =
+        (uint64_t)footer->entry_count * sizeof(struct relocation_entry);
+    if (map_size > 1024ULL * 1024 * 1024)
+      return -1;
+    if (footer->map_offset + map_size > dev->size ||
+        footer->map_offset + map_size > footer_offset)
+      return -1;
+  }
+  return 0;
+}
+
+static int migration_map_validate_entry_bounds(struct device *dev,
+                                               const struct relocation_entry *re) {
+  if (re->length == 0)
+    return -1;
+  if (re->src_offset + re->length > dev->size ||
+      re->dst_offset + re->length > dev->size)
+    return -1;
+  return 0;
+}
+
+int migration_map_compute_layout(uint64_t dev_size, uint32_t entry_count,
+                                 uint64_t *map_offset, uint64_t *footer_offset,
+                                 uint64_t *backup_offset, uint64_t *map_size) {
+  tail_offsets(dev_size, backup_offset, footer_offset);
+  *map_size = (uint64_t)entry_count * sizeof(struct relocation_entry);
+  if (entry_count == 0) {
+    *map_offset = *footer_offset;
+    return 0;
+  }
+  if (*map_size > *footer_offset)
+    return -1;
+  uint64_t raw = *footer_offset - *map_size;
+  *map_offset = (raw + 4095ULL) & ~4095ULL;
+  if (*map_offset + *map_size > *footer_offset)
+    *map_offset = raw & ~4095ULL;
+  if (*map_offset + *map_size > *footer_offset ||
+      *map_offset + *map_size > dev_size)
+    return -1;
+  return 0;
+}
+
+int migration_map_footer_present(struct device *dev) {
+  struct migration_footer footer;
+  uint64_t bo, fo;
+  if (read_footer(dev, &footer, &bo, &fo) < 0)
+    return -1;
+  return memcmp(footer.magic, MIGRATION_MAGIC, 8) == 0 ? 1 : 0;
+}
+
+int migration_map_detect_existing(struct device *dev) {
+  return migration_map_footer_present(dev);
+}
+
+uint32_t migration_map_completed_count(const struct relocation_plan *plan) {
+  uint32_t n = 0;
+  if (!plan || !plan->entries)
+    return 0;
+  for (uint32_t i = 0; i < plan->count; i++) {
+    if (plan->entries[i].completed)
+      n++;
+  }
+  return n;
+}
+
+int migration_map_validate_plan(const struct relocation_entry *entries,
+                                uint32_t count, uint64_t dev_size) {
+  for (uint32_t i = 0; i < count; i++) {
+    const struct relocation_entry *re = &entries[i];
+    if (re->src_offset == re->dst_offset)
+      return -1;
+    if (re->length == 0 || re->src_offset + re->length > dev_size ||
+        re->dst_offset + re->length > dev_size)
+      return -1;
+  }
+  for (uint32_t i = 0; i < count; i++) {
+    uint64_t a0 = entries[i].dst_offset, a1 = a0 + entries[i].length;
+    for (uint32_t j = i + 1; j < count; j++) {
+      uint64_t b0 = entries[j].dst_offset, b1 = b0 + entries[j].length;
+      if (a0 < b1 && b0 < a1)
+        return -1;
+    }
+  }
+  return 0;
+}
+
+int migration_map_preflight_space(struct device *dev, uint32_t entry_count) {
+  uint64_t mo, ms, bo, fo;
+  if (entry_count > MIGRATION_MAX_ENTRIES)
+    return -1;
+  ms = (uint64_t)entry_count * sizeof(struct relocation_entry);
+  if (ms > 1024ULL * 1024 * 1024)
+    return -1;
+  return migration_map_compute_layout(dev->size, entry_count, &mo, &fo, &bo, &ms);
+}
+
+int migration_map_load(struct device *dev, struct relocation_plan *plan) {
+  struct migration_footer footer;
+  uint64_t backup_offset, footer_offset;
+  if (read_footer(dev, &footer, &backup_offset, &footer_offset) < 0)
+    return -1;
+  if (memcmp(footer.magic, MIGRATION_MAGIC, 8) != 0) {
+    fprintf(stderr, "btrfs2ext4: migration map magic invalid\n");
+    return -1;
+  }
+  if (footer.entry_count > MIGRATION_MAX_ENTRIES) {
+    fprintf(stderr, "btrfs2ext4: migration map entry_count out of range\n");
+    return -1;
+  }
+
+  uint64_t map_offset, map_size =
+      (uint64_t)footer.entry_count * sizeof(struct relocation_entry);
+  if (migration_map_compute_layout(dev->size, footer.entry_count, &map_offset,
+                                   &footer_offset, &backup_offset,
+                                   &map_size) < 0) {
+    fprintf(stderr, "btrfs2ext4: migration map layout invalid\n");
+    return -1;
+  }
+  if (footer.map_offset != map_offset) {
+    fprintf(stderr, "btrfs2ext4: migration map offset mismatch\n");
+    return -1;
+  }
+
+  if (footer.entry_count == 0) {
+    free(plan->entries);
+    plan->entries = NULL;
+    plan->count = 0;
+    plan->capacity = 0;
+    return 0;
+  }
+
+  struct relocation_entry *entries = malloc((size_t)map_size);
+  if (!entries)
+    return -1;
+  if (device_read(dev, footer.map_offset, entries, (size_t)map_size) < 0) {
+    free(entries);
+    return -1;
+  }
+  if (crc32c(0, entries, (size_t)map_size) != footer.crc32) {
+    fprintf(stderr, "btrfs2ext4: migration map checksum mismatch\n");
+    free(entries);
+    return -1;
+  }
+  for (uint32_t i = 0; i < footer.entry_count; i++) {
+    if (migration_map_validate_entry_bounds(dev, &entries[i]) < 0) {
+      free(entries);
+      return -1;
+    }
+  }
+  free(plan->entries);
+  plan->entries = entries;
+  plan->count = footer.entry_count;
+  plan->capacity = footer.entry_count;
+  return 0;
+}
+
+int migration_map_update_entry(struct device *dev, uint32_t index,
+                               const struct relocation_entry *entry) {
+  struct migration_footer footer;
+  uint64_t backup_offset, footer_offset;
+  if (read_footer(dev, &footer, &backup_offset, &footer_offset) < 0)
+    return -1;
+  if (memcmp(footer.magic, MIGRATION_MAGIC, 8) != 0 || index >= footer.entry_count)
+    return -1;
+
+  uint64_t map_size =
+      (uint64_t)footer.entry_count * sizeof(struct relocation_entry);
+  struct relocation_entry *entries = malloc((size_t)map_size);
+  if (!entries)
+    return -1;
+  if (device_read(dev, footer.map_offset, entries, (size_t)map_size) < 0) {
+    free(entries);
+    return -1;
+  }
+  entries[index] = *entry;
+  if (device_write(dev, footer.map_offset + (uint64_t)index * sizeof(*entry),
+                   entry, sizeof(*entry)) < 0) {
+    free(entries);
+    return -1;
+  }
+  if (write_footer(dev, footer_offset, footer.map_offset, footer.entry_count,
+                   crc32c(0, entries, (size_t)map_size)) < 0) {
+    free(entries);
+    return -1;
+  }
+  free(entries);
+  return device_sync(dev) < 0 ? -1 : 0;
+}
+
+int migration_map_save(struct device *dev, const struct relocation_plan *plan) {
+  struct btrfs_super_block sb_backup;
+  if (device_read(dev, BTRFS_SUPER_OFFSET, &sb_backup, sizeof(sb_backup)) < 0)
+    return -1;
+
+  uint64_t backup_offset, footer_offset, map_offset = 0, map_size = 0;
+  tail_offsets(dev->size, &backup_offset, &footer_offset);
+
+  if (device_write(dev, backup_offset, &sb_backup, sizeof(sb_backup)) < 0)
+    return -1;
+
+  if (plan->count > 0) {
+    if (plan->count > MIGRATION_MAX_ENTRIES)
+      return -1;
+    map_size = (uint64_t)plan->count * sizeof(struct relocation_entry);
+    if (map_size > 1024ULL * 1024 * 1024)
+      return -1;
+    if (migration_map_compute_layout(dev->size, plan->count, &map_offset,
+                                     &footer_offset, &backup_offset,
+                                     &map_size) < 0)
+      return -1;
+    if (device_write(dev, map_offset, plan->entries, map_size) < 0)
+      return -1;
+  }
+
+  uint32_t crc = plan->count > 0 ? crc32c(0, plan->entries, map_size) : 0;
+  if (write_footer(dev, footer_offset, map_offset, plan->count, crc) < 0)
+    return -1;
+
+  return device_sync(dev) < 0 ? -1 : 0;
+}
+
 int migration_map_rollback(struct device *dev) {
-  uint64_t backup_offset = (dev->size - SUPERBLOCK_BACKUP_OFFSET) & ~4095ULL;
-  uint64_t footer_offset = backup_offset - MIGRATION_FOOTER_OFFSET;
+  uint64_t backup_offset, footer_offset;
+  tail_offsets(dev->size, &backup_offset, &footer_offset);
 
   struct migration_footer footer;
   if (device_read(dev, footer_offset, &footer, sizeof(footer)) < 0)
     return -1;
 
   if (memcmp(footer.magic, MIGRATION_MAGIC, 8) != 0) {
-    fprintf(stderr, "btrfs2ext4: no valid migration map found for rollback "
-                    "(already rolled back or not converted)\n");
+    int cleared = 1;
+    for (int i = 0; i < 8; i++) {
+      if (footer.magic[i] != 0) {
+        cleared = 0;
+        break;
+      }
+    }
+    if (cleared && backup_is_btrfs(dev, backup_offset)) {
+      printf("Migration map already cleared — nothing to roll back.\n");
+      return 0;
+    }
+    fprintf(stderr, "btrfs2ext4: no valid migration map found for rollback\n");
     return -1;
   }
 
+  if (migration_map_validate_footer_bounds(dev, &footer) < 0)
+    return -1;
+
   printf("Found valid migration map with %u entries.\n", footer.entry_count);
 
-  /* Read the relocation entries */
   if (footer.entry_count > 0) {
     uint64_t map_size =
         (uint64_t)footer.entry_count * sizeof(struct relocation_entry);
-
-    /* Safely cap allocation limit to prevent extreme OOM attacks from bad
-     * footers */
-    if (map_size > 1024ULL * 1024 * 1024) { /* Max 1 GB map */
-      fprintf(stderr,
-              "btrfs2ext4: rollback migration map too large (corrupted?)\n");
-      return -1;
-    }
-
     struct relocation_entry *entries = malloc((size_t)map_size);
-    if (!entries) {
-      fprintf(stderr, "btrfs2ext4: rollback out of memory\n");
+    if (!entries)
       return -1;
-    }
 
     if (device_read(dev, footer.map_offset, entries, (size_t)map_size) < 0) {
       free(entries);
       return -1;
     }
 
-    /* Verify CRC */
-    uint32_t calc_crc = crc32c(0, entries, (size_t)map_size);
-    if (calc_crc != footer.crc32) {
+    if (crc32c(0, entries, (size_t)map_size) != footer.crc32) {
       fprintf(stderr, "btrfs2ext4: migration map CRC mismatch! Rollback "
                       "aborted to prevent corruption.\n");
       free(entries);
       return -1;
     }
 
-    printf("Reversing block relocations...\n");
+    for (uint32_t i = 0; i < footer.entry_count; i++) {
+      if (migration_map_validate_entry_bounds(dev, &entries[i]) < 0) {
+        free(entries);
+        return -1;
+      }
+    }
 
-    /* Buffer for copying data */
-    uint8_t *buf = malloc(1024 * 1024); /* 1MB copy buffer */
-    if (!buf) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < footer.entry_count; i++) {
+      if (entries[i].completed)
+        n++;
+    }
+
+    struct relocation_entry *todo =
+        malloc((size_t)n * sizeof(struct relocation_entry));
+    uint8_t *buf = malloc(1024 * 1024);
+    if (!todo || !buf) {
+      free(todo);
+      free(buf);
       free(entries);
       return -1;
     }
 
-    /* Iterate backwards. */
-    for (int32_t i = footer.entry_count - 1; i >= 0; i--) {
-      struct relocation_entry *re = &entries[i];
+    uint32_t w = 0;
+    for (uint32_t i = 0; i < footer.entry_count; i++) {
+      if (entries[i].completed)
+        todo[w++] = entries[i];
+    }
+    qsort(todo, n, sizeof(struct relocation_entry), cmp_seq_desc);
 
+    printf("Reversing %u completed relocations...\n", n);
+    for (uint32_t i = 0; i < n; i++) {
+      struct relocation_entry *re = &todo[i];
+      if (verify_dst_checksum(dev, re) < 0) {
+        free(todo);
+        free(buf);
+        free(entries);
+        return -1;
+      }
       uint64_t remaining = re->length;
-      uint64_t src = re->dst_offset; /* reading from where we copied TO */
-      uint64_t dst = re->src_offset; /* writing back to where we copied FROM */
-
+      uint64_t src = re->dst_offset;
+      uint64_t dst = re->src_offset;
       while (remaining > 0) {
         uint32_t chunk = remaining > 1024 * 1024 ? 1024 * 1024 : remaining;
-        if (device_read(dev, src, buf, chunk) < 0) {
-          fprintf(stderr,
-                  "btrfs2ext4: rollback failed to read block at 0x%lx\n",
-                  (unsigned long)src);
-          free(buf);
-          free(entries);
-          return -1;
-        }
-        if (device_write(dev, dst, buf, chunk) < 0) {
-          fprintf(stderr,
-                  "btrfs2ext4: rollback failed to restore block at 0x%lx\n",
-                  (unsigned long)dst);
+        if (device_read(dev, src, buf, chunk) < 0 ||
+            device_write(dev, dst, buf, chunk) < 0) {
+          free(todo);
           free(buf);
           free(entries);
           return -1;
@@ -163,29 +424,21 @@ int migration_map_rollback(struct device *dev) {
         remaining -= chunk;
       }
     }
-
+    free(todo);
     free(buf);
     free(entries);
     printf("Block relocations reversed.\n");
   }
 
-  /* Restore btrfs superblock */
   struct btrfs_super_block sb_backup;
   if (device_read(dev, backup_offset, &sb_backup, sizeof(sb_backup)) < 0)
     return -1;
-
-  if (device_write(dev, BTRFS_SUPER_OFFSET, &sb_backup, sizeof(sb_backup)) <
-      0) {
-    fprintf(stderr, "btrfs2ext4: rollback failed to write btrfs superblock "
-                    "back to 0x10000\n");
+  if (device_write(dev, BTRFS_SUPER_OFFSET, &sb_backup, sizeof(sb_backup)) < 0)
     return -1;
-  }
 
-  /* Wipe footer to prevent double-rollback */
   memset(&footer, 0, sizeof(footer));
   if (device_write(dev, footer_offset, &footer, sizeof(footer)) < 0)
     return -1;
 
-  device_sync(dev);
-  return 0;
+  return device_sync(dev) < 0 ? -1 : 0;
 }

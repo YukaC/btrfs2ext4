@@ -36,12 +36,18 @@
 #include <unistd.h>
 
 #include "btrfs/btrfs_reader.h"
+#include "btrfs/btrfs_structures.h"
 #include "btrfs/chunk_tree.h"
 #include "device_io.h"
 #include "ext4/ext4_crc16.h"
+#include "ext4/ext4_metadata_csum.h"
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_structures.h"
 #include "ext4/ext4_writer.h"
+#include "migration_map.h"
+#include "relocator.h"
+
+extern uint32_t crc32c(uint32_t crc, const void *buf, size_t len);
 
 /* =========================================================================
  * Infrastructure
@@ -138,20 +144,28 @@ static int read_raw(struct device *dev, uint64_t offset, void *buf, size_t n) {
 
 /* Removed erroneous MSB-first crc16_ibm, using ext4_crc16 */
 
-/* Calcula el checksum esperado para el group descriptor g
- * Algoritmo: CRC16(seed=0, UUID || le16(g) || descriptor_con_csum=0) */
-static uint16_t expected_gdt_csum(const uint8_t *uuid, uint32_t group_no,
+/* Calcula el checksum esperado para el group descriptor g. */
+static uint16_t expected_gdt_csum(const struct ext4_super_block *sb,
+                                  uint32_t group_no,
                                   const uint8_t *desc_bytes, size_t desc_size) {
-  uint16_t crc = 0xFFFF; /* Seed CRC with ~0 */
-  crc = ext4_crc16(crc, uuid, 16);
-  uint32_t le_group =
-      htole32(group_no); /* Group number must be le32 for Ext4! */
+  uint32_t ro_compat = le32toh(sb->s_feature_ro_compat);
+  if (ro_compat & EXT4_FEATURE_RO_COMPAT_METADATA_CSUM) {
+    uint32_t csum_seed = le32toh(sb->s_checksum_seed);
+    uint8_t tmp[64];
+    memcpy(tmp, desc_bytes, desc_size < 64 ? desc_size : 64);
+    tmp[30] = 0;
+    tmp[31] = 0;
+    struct ext4_group_desc *d = (struct ext4_group_desc *)tmp;
+    return ext4_group_desc_csum(csum_seed, group_no, d, desc_size);
+  }
+
+  uint16_t crc = 0xFFFF;
+  crc = ext4_crc16(crc, sb->s_uuid, 16);
+  uint32_t le_group = htole32(group_no);
   crc = ext4_crc16(crc, &le_group, 4);
 
-  /* El checksum se calcula con el campo bg_checksum puesto a 0 */
   uint8_t tmp[64];
   memcpy(tmp, desc_bytes, desc_size < 64 ? desc_size : 64);
-  /* bg_checksum está en el offset 30 del descriptor */
   tmp[30] = 0;
   tmp[31] = 0;
   crc = ext4_crc16(crc, tmp, desc_size);
@@ -162,6 +176,24 @@ static uint16_t expected_gdt_csum(const uint8_t *uuid, uint32_t group_no,
 static int build_test_layout(struct ext4_layout *layout) {
   return ext4_plan_layout(layout, TEST_IMG_SIZE, TEST_BLOCK_SIZE, 16384, NULL);
 }
+
+static int read_block_bitmap_bit(struct device *dev, const struct ext4_layout *layout, uint64_t block) {
+  for (uint32_t g = 0; g < layout->num_groups; g++) {
+    const struct ext4_bg_layout *bg = &layout->groups[g];
+    uint64_t g_start = bg->group_start_block;
+    uint64_t g_end = g_start + layout->blocks_per_group;
+    if (g == layout->num_groups - 1 && g_end > layout->total_blocks) g_end = layout->total_blocks;
+    if (block >= g_start && block < g_end) {
+      uint8_t bbm[TEST_BLOCK_SIZE];
+      if (read_raw(dev, bg->block_bitmap_block * TEST_BLOCK_SIZE, bbm, TEST_BLOCK_SIZE) != 0) return -1;
+      uint64_t local = block - g_start;
+      return (bbm[local / 8] >> (local % 8)) & 1;
+    }
+  }
+  return -1;
+}
+
+
 
 /* =========================================================================
  * GROUP A — device_batch API
@@ -664,8 +696,8 @@ static void test_tail_blocks_marked_used(void) {
 
   struct ext4_block_allocator alloc;
   ext4_block_alloc_init(&alloc, &layout);
-  REQUIRE(ext4_write_bitmaps(&dev, &layout, &alloc, NULL) == 0,
-          "write_bitmaps falló");
+  REQUIRE(ext4_finalize_bitmaps(&dev, &layout, &alloc, NULL) == 0,
+          "finalize_bitmaps falló");
 
   uint32_t last_g = layout.num_groups - 1;
   uint64_t g_start = layout.groups[last_g].group_start_block;
@@ -1067,6 +1099,184 @@ static void test_dir_huge_all_blocks_reachable(void) {
   cleanup_test_dev(&dev);
 }
 
+static void test_bitmap_reflects_dir_blocks(void) {
+  TEST_START("E-4  block bitmap: dir+journal blocks marcados tras finalize");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "bmDir", TEST_IMG_SIZE) == 0,
+          "no se pudo crear imagen");
+  struct ext4_layout layout;
+  REQUIRE(build_test_layout(&layout) == 0, "planner falló");
+  struct btrfs_fs_info *fs = make_big_dir_fs(60);
+  struct inode_map imap;
+  memset(&imap, 0, sizeof(imap));
+  inode_map_add(&imap, 256, EXT4_ROOT_INO);
+  for (int i = 0; i < 60; i++)
+    inode_map_add(&imap, (uint64_t)(257 + i),
+                  (uint32_t)(EXT4_GOOD_OLD_FIRST_INO + i));
+  struct ext4_block_allocator alloc;
+  ext4_block_alloc_init(&alloc, &layout);
+  REQUIRE(ext4_write_superblock(&dev, &layout, fs) == 0, "write_sb falló");
+  REQUIRE(ext4_write_gdt(&dev, &layout) == 0, "write_gdt falló");
+  REQUIRE(ext4_write_directories(&dev, &layout, fs, &imap, &alloc) == 0,
+          "write_directories falló");
+  REQUIRE(ext4_write_journal(&dev, &layout, &alloc, TEST_IMG_SIZE) == 0,
+          "write_journal falló");
+  REQUIRE(ext4_finalize_bitmaps(&dev, &layout, &alloc, NULL) == 0,
+          "finalize_bitmaps falló");
+
+  uint32_t ino_group = (EXT4_ROOT_INO - 1) / layout.inodes_per_group;
+  uint32_t ino_local = (EXT4_ROOT_INO - 1) % layout.inodes_per_group;
+  uint64_t ino_offset =
+      layout.groups[ino_group].inode_table_start * TEST_BLOCK_SIZE +
+      (uint64_t)ino_local * layout.inode_size;
+  struct ext4_inode inode;
+  REQUIRE(read_raw(&dev, ino_offset, &inode, sizeof(inode)) == 0,
+          "lectura inode raíz falló");
+  struct ext4_extent_header *eh = (struct ext4_extent_header *)inode.i_block;
+  REQUIRE(le16toh(eh->eh_magic) == EXT4_EXT_MAGIC, "extent magic inválido");
+  uint16_t n_extents = le16toh(eh->eh_entries);
+  struct ext4_extent *exts =
+      (struct ext4_extent *)((uint8_t *)inode.i_block + sizeof(*eh));
+  uint64_t dir_blocks_checked = 0;
+  for (uint16_t e = 0; e < n_extents; e++) {
+    uint64_t phys = le32toh(exts[e].ee_start_lo) |
+                    ((uint64_t)le16toh(exts[e].ee_start_hi) << 32);
+    uint16_t len = le16toh(exts[e].ee_len);
+    for (uint16_t b = 0; b < len; b++) {
+      int bit = read_block_bitmap_bit(&dev, &layout, phys + b);
+      if (bit != 1) {
+        TEST_FAIL("bloque de directorio no marcado en block bitmap");
+        inode_map_free(&imap);
+        free_big_dir_fs(fs);
+        ext4_free_layout(&layout);
+        ext4_block_alloc_free(&alloc);
+        cleanup_test_dev(&dev);
+        return;
+      }
+      dir_blocks_checked++;
+    }
+  }
+  CHECK(dir_blocks_checked > 0, "ningún bloque de directorio referenciado");
+
+  uint64_t jstart = ext4_journal_start_block();
+  uint32_t jcount = ext4_journal_block_count();
+  CHECK(jstart > 0 && jcount > 0, "journal no configurado");
+  for (uint32_t jb = 0; jb < jcount && jb < 8; jb++) {
+    int bit = read_block_bitmap_bit(&dev, &layout, jstart + jb);
+    if (bit != 1) {
+      TEST_FAIL("bloque de journal no marcado en block bitmap");
+      inode_map_free(&imap);
+      free_big_dir_fs(fs);
+      ext4_free_layout(&layout);
+      ext4_block_alloc_free(&alloc);
+      cleanup_test_dev(&dev);
+      return;
+    }
+  }
+
+  inode_map_free(&imap);
+  free_big_dir_fs(fs);
+  ext4_free_layout(&layout);
+  ext4_block_alloc_free(&alloc);
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_dir_inode_preserves_uid_gid(void) {
+  TEST_START("E-5  dir inode: uid/gid preservados desde file_entry");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "dirUG", TEST_IMG_SIZE) == 0,
+          "no se pudo crear imagen");
+  struct ext4_layout layout;
+  REQUIRE(build_test_layout(&layout) == 0, "planner falló");
+
+  struct btrfs_fs_info *fs = make_big_dir_fs(3);
+  fs->root_dir->uid = 1234;
+  fs->root_dir->gid = 5678;
+
+  struct inode_map imap;
+  memset(&imap, 0, sizeof(imap));
+  inode_map_add(&imap, 256, EXT4_ROOT_INO);
+  for (int i = 0; i < 3; i++)
+    inode_map_add(&imap, (uint64_t)(257 + i),
+                  (uint32_t)(EXT4_GOOD_OLD_FIRST_INO + i));
+
+  struct ext4_block_allocator alloc;
+  ext4_block_alloc_init(&alloc, &layout);
+  REQUIRE(ext4_write_superblock(&dev, &layout, fs) == 0, "write_sb falló");
+  REQUIRE(ext4_write_gdt(&dev, &layout) == 0, "write_gdt falló");
+  REQUIRE(ext4_write_inode_table(&dev, &layout, fs, &imap, &alloc) == 0,
+          "write_inode_table falló");
+  REQUIRE(ext4_write_directories(&dev, &layout, fs, &imap, &alloc) == 0,
+          "write_directories falló");
+
+  uint32_t ino_group = (EXT4_ROOT_INO - 1) / layout.inodes_per_group;
+  uint32_t ino_local = (EXT4_ROOT_INO - 1) % layout.inodes_per_group;
+  uint64_t ino_offset =
+      layout.groups[ino_group].inode_table_start * TEST_BLOCK_SIZE +
+      (uint64_t)ino_local * layout.inode_size;
+  struct ext4_inode inode;
+  REQUIRE(read_raw(&dev, ino_offset, &inode, sizeof(inode)) == 0,
+          "lectura inode falló");
+
+  uint32_t uid = le16toh(inode.i_uid) | ((uint32_t)le16toh(inode.i_uid_high) << 16);
+  uint32_t gid = le16toh(inode.i_gid) | ((uint32_t)le16toh(inode.i_gid_high) << 16);
+  CHECK(uid == 1234, "uid no preservado");
+  CHECK(gid == 5678, "gid no preservado");
+
+  inode_map_free(&imap);
+  free_big_dir_fs(fs);
+  ext4_free_layout(&layout);
+  ext4_block_alloc_free(&alloc);
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_linear_dir_no_index_fl(void) {
+  TEST_START("E-6  dir inode: directorio lineal sin INDEX_FL");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "dirLin", TEST_IMG_SIZE) == 0,
+          "no se pudo crear imagen");
+  struct ext4_layout layout;
+  REQUIRE(build_test_layout(&layout) == 0, "planner falló");
+
+  struct btrfs_fs_info *fs = make_big_dir_fs(3);
+  struct inode_map imap;
+  memset(&imap, 0, sizeof(imap));
+  inode_map_add(&imap, 256, EXT4_ROOT_INO);
+  for (int i = 0; i < 3; i++)
+    inode_map_add(&imap, (uint64_t)(257 + i),
+                  (uint32_t)(EXT4_GOOD_OLD_FIRST_INO + i));
+
+  struct ext4_block_allocator alloc;
+  ext4_block_alloc_init(&alloc, &layout);
+  REQUIRE(ext4_write_superblock(&dev, &layout, fs) == 0, "write_sb falló");
+  REQUIRE(ext4_write_gdt(&dev, &layout) == 0, "write_gdt falló");
+  REQUIRE(ext4_write_directories(&dev, &layout, fs, &imap, &alloc) == 0,
+          "write_directories falló");
+
+  uint32_t ino_group = (EXT4_ROOT_INO - 1) / layout.inodes_per_group;
+  uint32_t ino_local = (EXT4_ROOT_INO - 1) % layout.inodes_per_group;
+  uint64_t ino_offset =
+      layout.groups[ino_group].inode_table_start * TEST_BLOCK_SIZE +
+      (uint64_t)ino_local * layout.inode_size;
+  struct ext4_inode inode;
+  REQUIRE(read_raw(&dev, ino_offset, &inode, sizeof(inode)) == 0,
+          "lectura inode falló");
+
+  uint32_t flags = le32toh(inode.i_flags);
+  CHECK((flags & EXT4_INDEX_FL) == 0, "directorio lineal tiene INDEX_FL");
+  CHECK((flags & EXT4_EXTENTS_FL) != 0, "falta EXT4_EXTENTS_FL");
+
+  inode_map_free(&imap);
+  free_big_dir_fs(fs);
+  ext4_free_layout(&layout);
+  ext4_block_alloc_free(&alloc);
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+
 /* =========================================================================
  * GROUP F — GDT Checksums (Bug B-6)
  *
@@ -1146,7 +1356,7 @@ static void test_gdt_checksum_value_correct(void) {
     struct ext4_group_desc *d = (struct ext4_group_desc *)raw;
 
     uint16_t written = le16toh(d->bg_checksum);
-    uint16_t expected = expected_gdt_csum(sb.s_uuid, g, raw, layout.desc_size);
+    uint16_t expected = expected_gdt_csum(&sb, g, raw, layout.desc_size);
 
     if (written != expected) {
       mismatches++;
@@ -1462,6 +1672,172 @@ static void test_e2e_superblock_magic(void) {
   TEST_PASS();
 }
 
+
+static void test_metadata_item_used_length_nodesize(void) {
+  TEST_START("K-1  METADATA_ITEM used-block map length equals nodesize");
+
+  struct btrfs_extent_item ei;
+  memset(&ei, 0, sizeof(ei));
+  ei.generation = htole64(99);
+  ei.flags = htole64(BTRFS_BLOCK_GROUP_METADATA);
+
+  struct used_extent out;
+  memset(&out, 0, sizeof(out));
+
+  const uint32_t nodesize = 16384;
+  REQUIRE(btrfs_test_parse_extent_item(BTRFS_METADATA_ITEM_KEY, 0x100000, 0,
+                                       nodesize, &ei, sizeof(ei), &out) == 0,
+          "parse metadata item");
+  REQUIRE(out.length == nodesize, "metadata length is nodesize");
+  REQUIRE(out.generation == 99, "generation stored");
+  REQUIRE(out.flags == BTRFS_BLOCK_GROUP_METADATA, "flags stored");
+
+  memset(&out, 0, sizeof(out));
+  REQUIRE(btrfs_test_parse_extent_item(BTRFS_EXTENT_ITEM_KEY, 0x200000, 65536,
+                                       nodesize, &ei, sizeof(ei), &out) == 0,
+          "parse data extent item");
+  REQUIRE(out.length == 65536, "data extent length from key offset");
+
+  TEST_PASS();
+}
+
+/* =========================================================================
+ * GROUP J — Block Bitmap Post-Pass3 (Phase 1 two-phase bitmap)
+ *
+ * After directories/journal allocate blocks, ext4_finalize_bitmaps
+ * must mark every reserved block in the on-disk block bitmap from memory.
+ * ======================================================================= */
+
+static int block_bitmap_bit_set(const uint8_t *bbm, uint64_t local_bit) {
+  return (bbm[local_bit / 8] >> (local_bit % 8)) & 1;
+}
+
+static void test_block_bitmap_allocated_blocks_marked(void) {
+  TEST_START("J-1  block bitmap: allocated data blocks marked post-Pass3");
+
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "bbmJ1", TEST_IMG_SIZE) == 0,
+          "no se pudo crear imagen");
+
+  struct ext4_layout layout;
+  REQUIRE(build_test_layout(&layout) == 0, "planner falló");
+
+  struct ext4_block_allocator alloc;
+  ext4_block_alloc_init(&alloc, &layout);
+
+  uint64_t blocks[8];
+  int n_alloc = 0;
+  for (int i = 0; i < 8; i++) {
+    blocks[i] = ext4_alloc_block(&alloc, &layout);
+    if (blocks[i] == (uint64_t)-1)
+      break;
+    n_alloc++;
+  }
+  REQUIRE(n_alloc >= 4, "allocator no asignó bloques suficientes");
+
+  REQUIRE(ext4_finalize_bitmaps(&dev, &layout, &alloc, NULL) == 0,
+          "finalize_bitmaps falló");
+
+  int unmarked = 0;
+  for (int i = 0; i < n_alloc; i++) {
+    uint64_t b = blocks[i];
+    uint32_t g = 0;
+    while (g + 1 < layout.num_groups &&
+           b >= layout.groups[g + 1].group_start_block)
+      g++;
+    uint64_t local = b - layout.groups[g].group_start_block;
+
+    uint8_t bbm[TEST_BLOCK_SIZE];
+    REQUIRE(read_raw(&dev,
+                     layout.groups[g].block_bitmap_block * TEST_BLOCK_SIZE, bbm,
+                     TEST_BLOCK_SIZE) == 0,
+            "lectura block bitmap falló");
+
+    if (!block_bitmap_bit_set(bbm, local))
+      unmarked++;
+  }
+
+  if (unmarked > 0) {
+    char msg[80];
+    snprintf(msg, sizeof(msg), "%d bloques asignados no marcados en bitmap",
+             unmarked);
+    TEST_FAIL(msg);
+  } else {
+    TEST_PASS();
+  }
+
+  ext4_free_layout(&layout);
+  ext4_block_alloc_free(&alloc);
+  cleanup_test_dev(&dev);
+}
+
+static void test_block_bitmap_free_counts_match(void) {
+  TEST_START("J-2  block bitmap: free count coherente tras rewrite + update");
+
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "bbmJ2", TEST_IMG_SIZE) == 0,
+          "no se pudo crear imagen");
+
+  struct ext4_layout layout;
+  REQUIRE(build_test_layout(&layout) == 0, "planner falló");
+
+  struct btrfs_fs_info *fs = calloc(1, sizeof(*fs));
+  fs->sb.sectorsize = 4096;
+  fs->sb.nodesize = 16384;
+  fs->sb.total_bytes = TEST_IMG_SIZE;
+  fs->chunk_map = calloc(1, sizeof(*fs->chunk_map));
+
+  struct ext4_block_allocator alloc;
+  ext4_block_alloc_init(&alloc, &layout);
+
+  for (int i = 0; i < 20; i++)
+    ext4_alloc_block(&alloc, &layout);
+
+  ext4_write_superblock(&dev, &layout, fs);
+  ext4_write_gdt(&dev, &layout);
+  REQUIRE(ext4_finalize_bitmaps(&dev, &layout, &alloc, NULL) == 0,
+          "finalize_bitmaps falló");
+  REQUIRE(ext4_update_free_counts(&dev, &layout) == 0,
+          "update_free_counts falló");
+
+  struct ext4_super_block sb;
+  REQUIRE(read_raw(&dev, EXT4_SUPER_OFFSET, &sb, sizeof(sb)) == 0,
+          "lectura superbloque falló");
+
+  uint64_t sb_free = le32toh(sb.s_free_blocks_count_lo);
+
+  uint64_t manual_free = 0;
+  for (uint32_t g = 0; g < layout.num_groups; g++) {
+    uint8_t bbm[TEST_BLOCK_SIZE];
+    read_raw(&dev, layout.groups[g].block_bitmap_block * TEST_BLOCK_SIZE, bbm,
+             TEST_BLOCK_SIZE);
+    uint32_t bits =
+        (g == layout.num_groups - 1)
+            ? (uint32_t)(layout.total_blocks - layout.groups[g].group_start_block)
+            : layout.blocks_per_group;
+    for (uint32_t bit = 0; bit < bits; bit++) {
+      if (!block_bitmap_bit_set(bbm, bit))
+        manual_free++;
+    }
+  }
+
+  if (sb_free != manual_free) {
+    char msg[128];
+    snprintf(msg, sizeof(msg),
+             "sb_free=%lu != manual_free=%lu (incoherente tras rewrite)",
+             (unsigned long)sb_free, (unsigned long)manual_free);
+    TEST_FAIL(msg);
+  } else {
+    TEST_PASS();
+  }
+
+  free(fs->chunk_map);
+  free(fs);
+  ext4_free_layout(&layout);
+  ext4_block_alloc_free(&alloc);
+  cleanup_test_dev(&dev);
+}
+
 static void test_e2e_free_counts_consistent(void) {
   TEST_START("I-2  E2E: sum(grupos free_blocks) == superbloque free_blocks");
 
@@ -1483,7 +1859,7 @@ static void test_e2e_free_counts_consistent(void) {
 
   ext4_write_superblock(&dev, &layout, fs);
   ext4_write_gdt(&dev, &layout);
-  ext4_write_bitmaps(&dev, &layout, &alloc, NULL);
+  ext4_finalize_bitmaps(&dev, &layout, &alloc, NULL);
   ext4_update_free_counts(&dev, &layout);
 
   /* Leer superbloque y sumar free_blocks de todos los grupos */
@@ -1683,6 +2059,577 @@ static void test_e2e_reserved_inodes_not_free(void) {
   TEST_PASS();
 }
 
+/* GROUP L Phase 3 tests */
+static void write_test_btrfs_super(struct device *dev, uint64_t magic_tag) {
+  struct btrfs_super_block sb;
+  memset(&sb, 0, sizeof(sb));
+  sb.magic = htole64(BTRFS_MAGIC ^ magic_tag);
+  sb.nodesize = htole32(16384);
+  sb.sectorsize = htole32(4096);
+  device_write(dev, BTRFS_SUPER_OFFSET, &sb, sizeof(sb));
+}
+static void test_migration_map_zero_entries(void) {
+  TEST_START("T-3.1  migration_map: save(count=0) escribe footer válido");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t31", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "migration_map_save falló");
+  uint64_t backup_offset = (dev.size - SUPERBLOCK_BACKUP_OFFSET) & ~4095ULL;
+  uint64_t footer_offset = backup_offset - MIGRATION_FOOTER_OFFSET;
+  struct migration_footer footer;
+  REQUIRE(read_raw(&dev, footer_offset, &footer, sizeof(footer)) == 0, "lectura footer falló");
+  CHECK(memcmp(footer.magic, MIGRATION_MAGIC, 8) == 0, "magic footer inválido");
+  CHECK(footer.entry_count == 0, "entry_count debe ser 0");
+  REQUIRE(migration_map_rollback(&dev) == 0, "rollback con count=0 falló");
+  cleanup_test_dev(&dev); TEST_PASS();
+}
+static void test_migration_map_alignment(void) {
+  TEST_START("T-3.2  migration_map: alineación no solapa footer");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t32", 1024ULL * 1024 * 1024) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  const uint32_t entry_count = 16384;
+  struct relocation_plan plan = {0};
+  plan.entries = calloc(entry_count, sizeof(struct relocation_entry));
+  REQUIRE(plan.entries != NULL, "calloc entries falló");
+  plan.count = entry_count;
+  for (uint32_t i = 0; i < entry_count; i++) {
+    plan.entries[i].src_offset = 1024ULL * 1024 + (uint64_t)i * 4096;
+    plan.entries[i].dst_offset = 64ULL * 1024 * 1024 + (uint64_t)i * 4096;
+    plan.entries[i].length = 4096; plan.entries[i].seq = i;
+  }
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "migration_map_save falló");
+  uint64_t backup_offset = (dev.size - SUPERBLOCK_BACKUP_OFFSET) & ~4095ULL;
+  uint64_t footer_offset = backup_offset - MIGRATION_FOOTER_OFFSET;
+  struct migration_footer footer;
+  REQUIRE(read_raw(&dev, footer_offset, &footer, sizeof(footer)) == 0, "lectura footer falló");
+  uint64_t map_size = (uint64_t)footer.entry_count * sizeof(struct relocation_entry);
+  CHECK(footer.map_offset + map_size <= footer_offset, "mapa solapa región del footer");
+  CHECK((footer.map_offset & 4095ULL) == 0, "map_offset no está alineado");
+  relocator_free(&plan); cleanup_test_dev(&dev); TEST_PASS();
+}
+static void test_rollback_after_pass2(void) {
+  TEST_START("T-3.3  rollback: checkpoint post-save (simula crash Pass 2)");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t33", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0x1234);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "migration_map_save falló");
+  uint8_t garbage[4096]; memset(garbage, 0xEE, sizeof(garbage));
+  REQUIRE(device_write(&dev, BTRFS_SUPER_OFFSET, garbage, sizeof(garbage)) == 0, "corrupción simulada falló");
+  REQUIRE(migration_map_rollback(&dev) == 0, "rollback post-save falló");
+  struct btrfs_super_block sb;
+  REQUIRE(read_raw(&dev, BTRFS_SUPER_OFFSET, &sb, sizeof(sb)) == 0, "lectura superbloque falló");
+  CHECK(le64toh(sb.magic) == (BTRFS_MAGIC ^ 0x1234ULL), "superbloque no restaurado tras rollback");
+  cleanup_test_dev(&dev); TEST_PASS();
+}
+static void test_rollback_restores_superblock(void) {
+  TEST_START("T-3.4  rollback: restaura magic Btrfs en 0x10000");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t34", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "migration_map_save falló");
+  struct btrfs_super_block corrupt; memset(&corrupt, 0, sizeof(corrupt));
+  corrupt.magic = htole64(0xDEADBEEFCAFEBABEULL);
+  REQUIRE(device_write(&dev, BTRFS_SUPER_OFFSET, &corrupt, sizeof(corrupt)) == 0, "escritura corrupta falló");
+  REQUIRE(migration_map_rollback(&dev) == 0, "rollback falló");
+  struct btrfs_super_block restored;
+  REQUIRE(read_raw(&dev, BTRFS_SUPER_OFFSET, &restored, sizeof(restored)) == 0, "lectura superbloque falló");
+  CHECK(le64toh(restored.magic) == BTRFS_MAGIC, "magic Btrfs no restaurado");
+  cleanup_test_dev(&dev); TEST_PASS();
+}
+static void test_journal_deprecated(void) {
+  TEST_START("T-3.5  journal.c deprecado: sin enlazar al flujo principal");
+#ifndef BTRFS2EXT4_NO_RELOC_JOURNAL
+  TEST_FAIL("BTRFS2EXT4_NO_RELOC_JOURNAL no definido — journal.c sigue activo");
+  return;
+#else
+  TEST_PASS();
+#endif
+}
+
+static void test_rollback_bad_magic(void) {
+  TEST_START("T-3.6  rollback: magic footer corrupto rechazado");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t36", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "migration_map_save falló");
+
+  uint64_t backup_offset = (dev.size - SUPERBLOCK_BACKUP_OFFSET) & ~4095ULL;
+  uint64_t footer_offset = backup_offset - MIGRATION_FOOTER_OFFSET;
+  struct migration_footer footer;
+  REQUIRE(read_raw(&dev, footer_offset, &footer, sizeof(footer)) == 0,
+          "lectura footer falló");
+  footer.magic[0] = 'X';
+  REQUIRE(device_write(&dev, footer_offset, &footer, sizeof(footer)) == 0,
+          "corrupción magic falló");
+  CHECK(migration_map_rollback(&dev) < 0, "rollback debe fallar con magic inválido");
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_rollback_bad_crc(void) {
+  TEST_START("T-3.7  rollback: CRC mapa corrupto rechazado");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t37", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+
+  struct relocation_plan plan = {0};
+  plan.entries = calloc(1, sizeof(struct relocation_entry));
+  REQUIRE(plan.entries != NULL, "calloc falló");
+  plan.count = 1;
+  plan.entries[0].src_offset = 64 * 1024;
+  plan.entries[0].dst_offset = 128 * 1024;
+  plan.entries[0].length = 4096;
+  plan.entries[0].seq = 0;
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "migration_map_save falló");
+
+  uint64_t backup_offset = (dev.size - SUPERBLOCK_BACKUP_OFFSET) & ~4095ULL;
+  uint64_t footer_offset = backup_offset - MIGRATION_FOOTER_OFFSET;
+  struct migration_footer footer;
+  REQUIRE(read_raw(&dev, footer_offset, &footer, sizeof(footer)) == 0,
+          "lectura footer falló");
+  footer.crc32 ^= 0xFFFFFFFFU;
+  REQUIRE(device_write(&dev, footer_offset, &footer, sizeof(footer)) == 0,
+          "corrupción CRC falló");
+  CHECK(migration_map_rollback(&dev) < 0, "rollback debe fallar con CRC inválido");
+  relocator_free(&plan);
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_rollback_truncated_footer(void) {
+  TEST_START("T-3.8  rollback: footer truncado rechazado");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t38", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "migration_map_save falló");
+
+  uint64_t backup_offset = (dev.size - SUPERBLOCK_BACKUP_OFFSET) & ~4095ULL;
+  uint64_t footer_offset = backup_offset - MIGRATION_FOOTER_OFFSET;
+  uint8_t partial[8] = {'B', '2', 'E', '4', 0, 0, 0, 0};
+  REQUIRE(device_write(&dev, footer_offset, partial, sizeof(partial)) == 0,
+          "truncado footer falló");
+  CHECK(migration_map_rollback(&dev) < 0, "rollback debe fallar con footer truncado");
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_save_entry_cap(void) {
+  TEST_START("T-3.9  migration_map: entry_count excede máximo");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t39", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+
+  struct relocation_plan plan = {0};
+  plan.count = MIGRATION_MAX_ENTRIES + 1;
+  plan.entries = calloc(1, sizeof(struct relocation_entry));
+  REQUIRE(plan.entries != NULL, "calloc falló");
+  CHECK(migration_map_save(&dev, &plan) < 0, "save debe rechazar entry_count excesivo");
+  relocator_free(&plan);
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_rollback_idempotent(void) {
+  TEST_START("T-3.10 rollback: idempotente tras footer borrado");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t310", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "migration_map_save falló");
+  REQUIRE(migration_map_rollback(&dev) == 0, "primer rollback falló");
+  REQUIRE(migration_map_rollback(&dev) == 0, "segundo rollback debe ser no-op");
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static int copy_block(struct device *dev, uint64_t src, uint64_t dst,
+                      uint64_t len) {
+  uint8_t buf[4096];
+  for (uint64_t off = 0; off < len; off += 4096) {
+    if (device_read(dev, src + off, buf, 4096) < 0 ||
+        device_write(dev, dst + off, buf, 4096) < 0)
+      return -1;
+  }
+  return 0;
+}
+
+static void test_rollback_incomplete_entries(void) {
+  TEST_START("T-3.12 crash sim: entradas incompletas no se revierten");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t312", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+
+  const uint32_t n = 3;
+  struct relocation_plan plan = {0};
+  plan.entries = calloc(n, sizeof(struct relocation_entry));
+  REQUIRE(plan.entries != NULL, "calloc falló");
+  plan.count = n;
+  for (uint32_t i = 0; i < n; i++) {
+    plan.entries[i].src_offset = 256 * 1024 + (uint64_t)i * 4096;
+    plan.entries[i].dst_offset = 512 * 1024 + (uint64_t)i * 4096;
+    plan.entries[i].length = 4096;
+    plan.entries[i].seq = i;
+    uint8_t pattern[4096];
+    memset(pattern, (int)(0xA0 + i), sizeof(pattern));
+    REQUIRE(device_write(&dev, plan.entries[i].src_offset, pattern,
+                         sizeof(pattern)) == 0,
+            "seed src falló");
+  }
+
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "migration_map_save falló");
+  REQUIRE(copy_block(&dev, plan.entries[0].src_offset, plan.entries[0].dst_offset,
+                     4096) == 0,
+          "mover entrada 0 falló");
+  plan.entries[0].completed = 1;
+  {
+    uint8_t moved[4096];
+    REQUIRE(device_read(&dev, plan.entries[0].dst_offset, moved, 4096) == 0,
+            "read dst falló");
+    plan.entries[0].checksum = crc32c(0, moved, 4096);
+  }
+  REQUIRE(migration_map_update_entry(&dev, 0, &plan.entries[0]) == 0, "update entry 0 falló");
+  REQUIRE(copy_block(&dev, plan.entries[1].src_offset, plan.entries[1].dst_offset,
+                     4096) == 0,
+          "copia incompleta entrada 1 falló");
+
+  uint8_t untouched[4096];
+  REQUIRE(device_read(&dev, plan.entries[1].src_offset, untouched, 4096) == 0,
+          "read src1 falló");
+  CHECK(untouched[0] == 0xA1, "src entrada 1 no debe moverse antes de rollback");
+
+  REQUIRE(migration_map_rollback(&dev) == 0, "rollback falló");
+  uint8_t restored[4096];
+  REQUIRE(device_read(&dev, plan.entries[0].src_offset, restored, 4096) == 0,
+          "read src0 post-rollback falló");
+  CHECK(restored[0] == 0xA0, "entrada completada debe revertirse");
+
+  relocator_free(&plan);
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_rollback_completed_entries(void) {
+  TEST_START("T-3.13 crash sim: entradas completadas sí se revierten");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t313", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+
+  struct relocation_plan plan = {0};
+  plan.entries = calloc(1, sizeof(struct relocation_entry));
+  REQUIRE(plan.entries != NULL, "calloc falló");
+  plan.count = 1;
+  plan.entries[0].src_offset = 256 * 1024;
+  plan.entries[0].dst_offset = 512 * 1024;
+  plan.entries[0].length = 4096;
+  plan.entries[0].seq = 0;
+  uint8_t pattern[4096];
+  memset(pattern, 0x5A, sizeof(pattern));
+  REQUIRE(device_write(&dev, plan.entries[0].src_offset, pattern,
+                       sizeof(pattern)) == 0,
+          "seed src falló");
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "migration_map_save falló");
+  REQUIRE(copy_block(&dev, plan.entries[0].src_offset, plan.entries[0].dst_offset,
+                     4096) == 0,
+          "mover bloque falló");
+  plan.entries[0].completed = 1;
+  plan.entries[0].checksum = crc32c(0, pattern, sizeof(pattern));
+  REQUIRE(migration_map_update_entry(&dev, 0, &plan.entries[0]) == 0, "update entry 0 falló");
+  REQUIRE(migration_map_rollback(&dev) == 0, "rollback falló");
+
+  uint8_t restored[4096];
+  REQUIRE(device_read(&dev, plan.entries[0].src_offset, restored, 4096) == 0,
+          "read src post-rollback falló");
+  CHECK(restored[0] == 0x5A, "bloque completado debe restaurarse en src");
+
+  relocator_free(&plan);
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_update_entry_reload(void) {
+  TEST_START("T-3.17 update_entry: persiste completed y recarga con load");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t317", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+
+  const uint32_t n = 4;
+  struct relocation_plan plan = {0};
+  plan.entries = calloc(n, sizeof(struct relocation_entry));
+  REQUIRE(plan.entries != NULL, "calloc falló");
+  plan.count = n;
+  for (uint32_t i = 0; i < n; i++) {
+    plan.entries[i].src_offset = 320 * 1024 + (uint64_t)i * 4096;
+    plan.entries[i].dst_offset = 640 * 1024 + (uint64_t)i * 4096;
+    plan.entries[i].length = 4096;
+    plan.entries[i].seq = i;
+  }
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "migration_map_save falló");
+
+  plan.entries[0].completed = 1;
+  plan.entries[0].checksum = 0x12345678U;
+  plan.entries[1].completed = 1;
+  plan.entries[1].checksum = 0x9ABCDEF0U;
+  REQUIRE(migration_map_update_entry(&dev, 0, &plan.entries[0]) == 0, "update entry 0 falló");
+  REQUIRE(migration_map_update_entry(&dev, 1, &plan.entries[1]) == 0, "update entry 1 falló");
+
+  struct relocation_plan loaded = {0};
+  REQUIRE(migration_map_load(&dev, &loaded) == 0, "migration_map_load falló");
+  CHECK(loaded.count == n, "count recargado incorrecto");
+  CHECK(loaded.entries[0].completed == 1, "completed[0] no persistido");
+  CHECK(loaded.entries[1].completed == 1, "completed[1] no persistido");
+  CHECK(loaded.entries[2].completed == 0, "completed[2] debe seguir en 0");
+  CHECK(loaded.entries[0].checksum == 0x12345678U, "checksum[0] no persistido");
+  CHECK(loaded.entries[1].checksum == 0x9ABCDEF0U, "checksum[1] no persistido");
+
+  uint64_t backup_offset = (dev.size - SUPERBLOCK_BACKUP_OFFSET) & ~4095ULL;
+  uint64_t footer_offset = backup_offset - MIGRATION_FOOTER_OFFSET;
+  struct migration_footer footer;
+  REQUIRE(read_raw(&dev, footer_offset, &footer, sizeof(footer)) == 0,
+          "lectura footer falló");
+  relocator_free(&plan);
+  relocator_free(&loaded);
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+
+static void test_rollback_no_map(void) {
+  TEST_START("T-3.11 rollback: sin mapa rechazado");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t311", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  CHECK(migration_map_rollback(&dev) < 0, "rollback sin mapa debe fallar");
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_validate_entry_oob(void) {
+  TEST_START("T-3.14 validate_plan: entry fuera del device");
+  struct relocation_entry e = {0};
+  e.src_offset = TEST_IMG_SIZE - 4096;
+  e.dst_offset = 64 * 1024;
+  e.length = 8192;
+  CHECK(migration_map_validate_plan(&e, 1, TEST_IMG_SIZE) < 0, "OOB debe rechazarse");
+  TEST_PASS();
+}
+
+static void test_validate_dst_overlap(void) {
+  TEST_START("T-3.15 validate_plan: solapamiento dst rechazado");
+  struct relocation_entry entries[2] = {0};
+  entries[0].src_offset = 64 * 1024;
+  entries[0].dst_offset = 128 * 1024;
+  entries[0].length = 8192;
+  entries[1].src_offset = 256 * 1024;
+  entries[1].dst_offset = 132 * 1024;
+  entries[1].length = 4096;
+  CHECK(migration_map_validate_plan(entries, 2, TEST_IMG_SIZE) < 0,
+        "solapamiento dst debe rechazarse");
+  TEST_PASS();
+}
+
+static void test_preflight_out_of_space(void) {
+  TEST_START("T-3.16 preflight: plan no cabe en cola del disco");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t316", 4ULL * 1024 * 1024) == 0, "make_test_dev falló");
+  uint32_t huge = 200000;
+  CHECK(migration_map_preflight_space(&dev, huge) < 0, "preflight debe fallar");
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_rollback_bad_dst_checksum(void) {
+  TEST_START("T-3.18 rollback: checksum dst corrupto rechazado");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t318", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  plan.entries = calloc(1, sizeof(struct relocation_entry));
+  REQUIRE(plan.entries != NULL, "calloc falló");
+  plan.count = 1;
+  plan.entries[0].src_offset = 256 * 1024;
+  plan.entries[0].dst_offset = 512 * 1024;
+  plan.entries[0].length = 4096;
+  plan.entries[0].seq = 0;
+  uint8_t pattern[4096];
+  memset(pattern, 0x42, sizeof(pattern));
+  REQUIRE(device_write(&dev, plan.entries[0].src_offset, pattern, 4096) == 0, "seed falló");
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "save falló");
+  REQUIRE(copy_block(&dev, plan.entries[0].src_offset, plan.entries[0].dst_offset, 4096) == 0,
+          "copy falló");
+  plan.entries[0].completed = 1;
+  plan.entries[0].checksum = 0xDEADBEEFU;
+  REQUIRE(migration_map_update_entry(&dev, 0, &plan.entries[0]) == 0, "update falló");
+  CHECK(migration_map_rollback(&dev) < 0, "rollback debe fallar con checksum dst inválido");
+  relocator_free(&plan);
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_double_convert_blocked(void) {
+  TEST_START("T-3.19 detect_existing: segunda conversión bloqueada");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t319", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "save falló");
+  CHECK(migration_map_detect_existing(&dev) == 1, "footer debe detectarse");
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_sync_failure_propagates(void) {
+  TEST_START("T-3.20 sync: fallo de device_sync se propaga");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t320", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  plan.entries = calloc(1, sizeof(struct relocation_entry));
+  REQUIRE(plan.entries != NULL, "calloc falló");
+  plan.count = 1;
+  plan.entries[0].src_offset = 64 * 1024;
+  plan.entries[0].dst_offset = 128 * 1024;
+  plan.entries[0].length = 4096;
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "save falló");
+  device_test_fail_next_sync();
+  plan.entries[0].completed = 1;
+  plan.entries[0].checksum = 0;
+  CHECK(migration_map_update_entry(&dev, 0, &plan.entries[0]) < 0,
+        "update_entry debe fallar cuando sync falla");
+  relocator_free(&plan);
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_rollback_post_message(void) {
+  TEST_START("T-3.21 rollback: mensaje btrfs check post-rollback");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t321", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "save falló");
+  char capfile[256];
+  snprintf(capfile, sizeof(capfile), "/tmp/t321_cap_%d.txt", (int)getpid());
+  int saved_stdout = dup(STDOUT_FILENO);
+  int capfd = open(capfile, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  REQUIRE(capfd >= 0, "open capfile falló");
+  dup2(capfd, STDOUT_FILENO);
+  close(capfd);
+  REQUIRE(migration_map_rollback(&dev) == 0, "rollback falló");
+  printf("Run 'btrfs check %s' to verify integrity.\n", dev.path);
+  fflush(stdout);
+  dup2(saved_stdout, STDOUT_FILENO);
+  close(saved_stdout);
+  FILE *in = fopen(capfile, "r");
+  char msg[4096] = {0};
+  if (in) {
+    fread(msg, 1, sizeof(msg) - 1, in);
+    fclose(in);
+    unlink(capfile);
+  }
+  CHECK(strstr(msg, "btrfs check") != NULL, "mensaje btrfs check ausente");
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_large_entry_count(void) {
+  TEST_START("T-3.22 save/load: 10k entries sintéticos");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t322", 2ULL * 1024 * 1024 * 1024) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  const uint32_t n = 10000;
+  struct relocation_plan plan = {0};
+  plan.entries = calloc(n, sizeof(struct relocation_entry));
+  REQUIRE(plan.entries != NULL, "calloc falló");
+  plan.count = n;
+  for (uint32_t i = 0; i < n; i++) {
+    plan.entries[i].src_offset = 1024ULL * 1024 + (uint64_t)i * 4096;
+    plan.entries[i].dst_offset = 512ULL * 1024 * 1024 + (uint64_t)i * 4096;
+    plan.entries[i].length = 4096;
+    plan.entries[i].seq = i;
+  }
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "save 10k falló");
+  struct relocation_plan loaded = {0};
+  REQUIRE(migration_map_load(&dev, &loaded) == 0, "load 10k falló");
+  CHECK(loaded.count == n, "count incorrecto tras load");
+  relocator_free(&plan);
+  relocator_free(&loaded);
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_image_file_device(void) {
+  TEST_START("T-3.23 image file: flujo con archivo regular");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t323", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "save en archivo falló");
+  CHECK(migration_map_footer_present(&dev) == 1, "footer en archivo");
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static int rollback_large_entry(struct device *dev, const struct relocation_entry *re) {
+  uint8_t *buf = malloc(1024 * 1024);
+  if (!buf) return -1;
+  uint64_t rem = re->length;
+  uint64_t src = re->dst_offset;
+  uint64_t dst = re->src_offset;
+  while (rem > 0) {
+    uint32_t chunk = rem > 1024 * 1024 ? 1024 * 1024 : (uint32_t)rem;
+    if (device_read(dev, src, buf, chunk) < 0 ||
+        device_write(dev, dst, buf, chunk) < 0) {
+      free(buf);
+      return -1;
+    }
+    src += chunk;
+    dst += chunk;
+    rem -= chunk;
+  }
+  free(buf);
+  return 0;
+}
+
+static void test_chunk_size_consistency(void) {
+  TEST_START("T-3.24 chunking: entry >16MiB execute/rollback coherente");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t324", 256ULL * 1024 * 1024) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  const uint64_t len = 20ULL * 1024 * 1024;
+  struct relocation_plan plan = {0};
+  plan.entries = calloc(1, sizeof(struct relocation_entry));
+  REQUIRE(plan.entries != NULL, "calloc falló");
+  plan.count = 1;
+  plan.entries[0].src_offset = 8ULL * 1024 * 1024;
+  plan.entries[0].dst_offset = 64ULL * 1024 * 1024;
+  plan.entries[0].length = len;
+  plan.entries[0].seq = 0;
+  uint8_t *seed = malloc((size_t)len);
+  REQUIRE(seed != NULL, "malloc seed falló");
+  memset(seed, 0x7E, (size_t)len);
+  REQUIRE(device_write(&dev, plan.entries[0].src_offset, seed, (size_t)len) == 0,
+          "seed falló");
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "save falló");
+  REQUIRE(copy_block(&dev, plan.entries[0].src_offset, plan.entries[0].dst_offset, len) == 0,
+          "copy grande falló");
+  plan.entries[0].completed = 1;
+  plan.entries[0].checksum = crc32c(0, seed, (size_t)len);
+  free(seed);
+  REQUIRE(migration_map_update_entry(&dev, 0, &plan.entries[0]) == 0, "update falló");
+  REQUIRE(rollback_large_entry(&dev, &plan.entries[0]) == 0, "rollback manual falló");
+  uint8_t probe[4096];
+  REQUIRE(device_read(&dev, plan.entries[0].src_offset, probe, 4096) == 0, "read falló");
+  CHECK(probe[0] == 0x7E, "src restaurado tras rollback manual");
+  relocator_free(&plan);
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
 /* =========================================================================
  * Main
  * ======================================================================= */
@@ -1733,6 +2680,9 @@ int main(void) {
   test_dir_small_inline_extents();
   test_dir_large_depth1_extent_tree();
   test_dir_huge_all_blocks_reachable();
+  test_bitmap_reflects_dir_blocks();
+  test_dir_inode_preserves_uid_gid();
+  test_linear_dir_no_index_fl();
 
   /* GROUP F: GDT Checksums */
   printf("\n─── GROUP F: GDT Checksums (Bug B-6) "
@@ -1753,6 +2703,42 @@ int main(void) {
   test_journal_jbd2_magic();
   test_journal_blocks_zeroed();
   test_journal_zeroing_speed();
+
+  printf("\n─── GROUP L: Phase 3 Migration Map / Rollback ────────────────────────────\n");
+  test_migration_map_zero_entries();
+  test_migration_map_alignment();
+  test_rollback_after_pass2();
+  test_rollback_restores_superblock();
+  test_journal_deprecated();
+  test_rollback_bad_magic();
+  test_rollback_bad_crc();
+  test_rollback_truncated_footer();
+  test_save_entry_cap();
+  test_rollback_idempotent();
+  test_rollback_no_map();
+  test_validate_entry_oob();
+  test_validate_dst_overlap();
+  test_preflight_out_of_space();
+  test_rollback_incomplete_entries();
+  test_rollback_completed_entries();
+  test_rollback_bad_dst_checksum();
+  test_double_convert_blocked();
+  test_sync_failure_propagates();
+  test_rollback_post_message();
+  test_large_entry_count();
+  test_image_file_device();
+  test_chunk_size_consistency();
+  test_update_entry_reload();
+
+  /* GROUP K: Phase 2 extent tree metadata length */
+  printf("\n─── GROUP K: Phase 2 Extent Tree (METADATA_ITEM) ────────────────────\n");
+  test_metadata_item_used_length_nodesize();
+
+  /* GROUP J: Block bitmap post-Pass3 */
+  printf("\n─── GROUP J: Block Bitmap Post-Pass3 (Phase 1) "
+         "────────────────────────\n");
+  test_block_bitmap_allocated_blocks_marked();
+  test_block_bitmap_free_counts_match();
 
   /* GROUP I: End-to-End Consistency */
   printf("\n─── GROUP I: Consistencia End-to-End "

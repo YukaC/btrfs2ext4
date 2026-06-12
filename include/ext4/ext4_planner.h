@@ -20,6 +20,7 @@ struct ext4_bg_layout {
   uint32_t inode_table_blocks;  /* blocks occupied by inode table */
   uint64_t data_start_block;    /* first usable data block */
   uint32_t data_blocks;         /* number of data blocks */
+  uint32_t used_dirs_count;     /* directories in this group (Pass 3) */
   int has_super;                /* does this group have a superblock? */
 };
 

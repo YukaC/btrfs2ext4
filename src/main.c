@@ -21,7 +21,6 @@
 #include "device_io.h"
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_writer.h"
-#include "journal.h"
 #include "mem_tracker.h"
 #include "migration_map.h"
 #include "relocator.h"
@@ -41,6 +40,7 @@ static void print_usage(const char *prog) {
       "  -b, --block-size N      Set ext4 block size (default: 4096)\n"
       "  -i, --inode-ratio N     Set inode ratio (default: 16384)\n"
       "  -r, --rollback          Rollback a previous conversion\n"
+      "  -f, --force             Resume conversion with existing migration map\n"
       "  -w, --workdir <path>    Working directory for temp files (default: "
       "cwd)\n"
       "  -m, --memory-limit N    Max RAM in MB (0=auto 60%% of physical)\n"
@@ -202,19 +202,38 @@ static int compare_file_entry(const void *a, const void *b) {
   return 0;
 }
 
-int btrfs2ext4_convert(const struct convert_options *opts,
-                       progress_callback progress) {
+
+struct convert_state {
   struct device dev;
   struct btrfs_fs_info fs_info;
   struct ext4_layout layout;
   struct relocation_plan reloc_plan;
   struct inode_map ino_map;
-  int ret = -1;
+  struct ext4_block_allocator alloc;
+  int alloc_initialized;
+  struct adaptive_mem_config mem_cfg;
+  int ret;
+};
 
-  memset(&fs_info, 0, sizeof(fs_info));
-  memset(&layout, 0, sizeof(layout));
-  memset(&reloc_plan, 0, sizeof(reloc_plan));
-  memset(&ino_map, 0, sizeof(ino_map));
+static void convert_state_init(struct convert_state *st) {
+  memset(st, 0, sizeof(*st));
+  st->ret = -1;
+}
+
+static void convert_state_cleanup(struct convert_state *st) {
+  if (st->alloc_initialized)
+    ext4_block_alloc_free(&st->alloc);
+  inode_map_free(&st->ino_map);
+  relocator_free(&st->reloc_plan);
+  ext4_free_layout(&st->layout);
+  btrfs_free_fs(&st->fs_info);
+  device_close(&st->dev);
+}
+
+int btrfs2ext4_convert(const struct convert_options *opts,
+                       progress_callback progress) {
+  struct convert_state st;
+  convert_state_init(&st);
 
   printf("==============================================\n");
   printf("   btrfs2ext4 v" VERSION "\n");
@@ -228,55 +247,52 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   /* ================================================
    * Adaptive Memory Detection (production-grade)
    * ================================================ */
-  struct adaptive_mem_config mem_cfg;
-  memset(&mem_cfg, 0, sizeof(mem_cfg));
-
   long pages = sysconf(_SC_PHYS_PAGES);
   long page_size = sysconf(_SC_PAGE_SIZE);
   if (pages > 0 && page_size > 0) {
-    mem_cfg.total_ram = (uint64_t)pages * (uint64_t)page_size;
+    st.mem_cfg.total_ram = (uint64_t)pages * (uint64_t)page_size;
   } else {
-    mem_cfg.total_ram = 2ULL * 1024 * 1024 * 1024; /* fallback: 2GB */
+    st.mem_cfg.total_ram = 2ULL * 1024 * 1024 * 1024; /* fallback: 2GB */
   }
 
   long avail_pages = sysconf(_SC_AVPHYS_PAGES);
   if (avail_pages > 0 && page_size > 0) {
-    mem_cfg.available_ram = (uint64_t)avail_pages * (uint64_t)page_size;
+    st.mem_cfg.available_ram = (uint64_t)avail_pages * (uint64_t)page_size;
   } else {
-    mem_cfg.available_ram = mem_cfg.total_ram / 2;
+    st.mem_cfg.available_ram = st.mem_cfg.total_ram / 2;
   }
 
   if (opts->memory_limit_mb > 0) {
-    mem_cfg.mmap_threshold = (uint64_t)opts->memory_limit_mb * 1024 * 1024;
+    st.mem_cfg.mmap_threshold = (uint64_t)opts->memory_limit_mb * 1024 * 1024;
   } else {
     /* Auto: 60% of total physical RAM */
-    mem_cfg.mmap_threshold = mem_cfg.total_ram * 60 / 100;
+    st.mem_cfg.mmap_threshold = st.mem_cfg.total_ram * 60 / 100;
   }
 
-  mem_cfg.workdir = opts->workdir ? opts->workdir : ".";
+  st.mem_cfg.workdir = opts->workdir ? opts->workdir : ".";
 
   /* tmpfs safety check: prevent creating swap files on RAM-backed fs */
   struct statfs sfs;
-  if (statfs(mem_cfg.workdir, &sfs) == 0) {
+  if (statfs(st.mem_cfg.workdir, &sfs) == 0) {
     /* tmpfs magic = 0x01021994 */
     if (sfs.f_type == 0x01021994) {
-      mem_cfg.workdir_is_tmpfs = 1;
+      st.mem_cfg.workdir_is_tmpfs = 1;
       fprintf(stderr,
               "\n[WARNING] --workdir '%s' is mounted on tmpfs (RAM-backed).\n"
               "  Creating temp swap files here defeats the purpose of mmap!\n"
               "  Use a physical disk path instead.\n\n",
-              mem_cfg.workdir);
+              st.mem_cfg.workdir);
     }
   }
 
   printf("[INFO] RAM detected:     %.1f GiB total, %.1f GiB available\n",
-         (double)mem_cfg.total_ram / (1024.0 * 1024.0 * 1024.0),
-         (double)mem_cfg.available_ram / (1024.0 * 1024.0 * 1024.0));
+         (double)st.mem_cfg.total_ram / (1024.0 * 1024.0 * 1024.0),
+         (double)st.mem_cfg.available_ram / (1024.0 * 1024.0 * 1024.0));
   printf("[INFO] mmap threshold:   %.0f MiB%s\n",
-         (double)mem_cfg.mmap_threshold / (1024.0 * 1024.0),
+         (double)st.mem_cfg.mmap_threshold / (1024.0 * 1024.0),
          opts->memory_limit_mb > 0 ? " (user-configured)" : " (auto: 60%%)");
-  printf("[INFO] Temp file dir:    %s%s\n\n", mem_cfg.workdir,
-         mem_cfg.workdir_is_tmpfs ? " [tmpfs WARNING]" : "");
+  printf("[INFO] Temp file dir:    %s%s\n\n", st.mem_cfg.workdir,
+         st.mem_cfg.workdir_is_tmpfs ? " [tmpfs WARNING]" : "");
 
   /* Inicializar el tracker de memoria global antes de que otras
    * estructuras opcionales (hashes grandes, bloom filters, etc.)
@@ -284,11 +300,18 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   mem_track_init();
 
   /* Open device */
-  if (device_open(&dev, opts->device_path, opts->dry_run) < 0)
-    return -1;
+  if (device_open(&st.dev, opts->device_path, opts->dry_run) < 0)
+    goto cleanup;
 
   printf("Device: %s (%.1f GiB)\n\n", opts->device_path,
-         (double)dev.size / (1024.0 * 1024.0 * 1024.0));
+         (double)st.dev.size / (1024.0 * 1024.0 * 1024.0));
+
+  if (!opts->dry_run && migration_map_detect_existing(&st.dev) > 0 &&
+      !opts->force) {
+    fprintf(stderr,
+            "btrfs2ext4: existing migration map — use --rollback or --force\n");
+    goto cleanup;
+  }
 
   /* ================================================
    * PASS 1: Read Btrfs metadata
@@ -296,7 +319,7 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   if (progress)
     progress("Pass 1", 0, "Reading btrfs metadata...");
 
-  if (btrfs_read_fs(&dev, &fs_info) < 0) {
+  if (btrfs_read_fs(&st.dev, &st.fs_info) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to read btrfs metadata\n");
     goto cleanup;
   }
@@ -308,10 +331,10 @@ int btrfs2ext4_convert(const struct convert_options *opts,
    * PASS 2: Plan ext4 layout + relocate conflicts
    * ================================================ */
   if (progress)
-    progress("Pass 2", 0, "Planning ext4 layout...");
+    progress("Pass 2", 0, "Planning ext4 st.layout...");
 
-  if (ext4_plan_layout(&layout, dev.size, opts->block_size, opts->inode_ratio,
-                       &fs_info) < 0) {
+  if (ext4_plan_layout(&st.layout, st.dev.size, opts->block_size, opts->inode_ratio,
+                       &st.fs_info) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to plan ext4 layout\n");
     goto cleanup;
   }
@@ -319,36 +342,51 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   if (progress)
     progress("Pass 2", 30, "Detecting conflicts...");
 
-  uint32_t conflicts = ext4_find_conflicts(&layout, &fs_info);
+  uint32_t conflicts = ext4_find_conflicts(&st.layout, &st.fs_info);
 
   if (progress)
     progress("Pass 2", 50, "Planning relocation...");
 
-  if (relocator_plan(&reloc_plan, &layout, &fs_info) < 0) {
+  if (relocator_plan(&st.reloc_plan, &st.layout, &st.fs_info) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to plan block relocation\n");
     goto cleanup;
   }
 
   if (!opts->dry_run) {
-    if (progress)
-      progress("Pass 2", 60, "Saving migration map and btrfs backup...");
-
-    /* plan.v1 fix: Save migration map UNCONDITIONALLY (even when count=0).
-     * This ensures a rollback checkpoint exists before Pass 3 writes begin,
-     * even if no blocks needed relocation. Without this, a crash during
-     * Pass 3 would leave the filesystem in an unrecoverable state. */
-    if (migration_map_save(&dev, &reloc_plan) < 0) {
-      fprintf(stderr, "btrfs2ext4: failed to save migration map (aborting to "
-                      "prevent data loss)\n");
-      goto cleanup;
+    int resuming =
+        migration_map_detect_existing(&st.dev) > 0 && opts->force;
+    if (resuming) {
+      relocator_free(&st.reloc_plan);
+      if (migration_map_load(&st.dev, &st.reloc_plan) < 0) {
+        fprintf(stderr, "btrfs2ext4: failed to load migration map\n");
+        goto cleanup;
+      }
+    } else if (st.reloc_plan.count > 0) {
+      if (migration_map_validate_plan(st.reloc_plan.entries,
+                                      st.reloc_plan.count, st.dev.size) < 0 ||
+          migration_map_preflight_space(&st.dev, st.reloc_plan.count) < 0) {
+        fprintf(stderr, "btrfs2ext4: migration plan validation failed\n");
+        goto cleanup;
+      }
     }
-
-    if (reloc_plan.count > 0) {
+    if (!resuming) {
+      if (progress)
+        progress("Pass 2", 60, "Saving migration map and btrfs backup...");
+      if (migration_map_save(&st.dev, &st.reloc_plan) < 0) {
+        fprintf(stderr, "btrfs2ext4: failed to save migration map\n");
+        goto cleanup;
+      }
+    }
+    if (st.reloc_plan.count > 0) {
+      if (!check_battery_safe()) {
+        fprintf(stderr,
+                "btrfs2ext4: aborting block relocation — unsafe power state\n");
+        goto cleanup;
+      }
       if (progress)
         progress("Pass 2", 70, "Relocating conflicting blocks...");
-
-      if (relocator_execute(&reloc_plan, &dev, &fs_info, layout.block_size) <
-          0) {
+      if (relocator_execute(&st.reloc_plan, &st.dev, &st.fs_info,
+                            st.layout.block_size) < 0) {
         fprintf(stderr, "btrfs2ext4: block relocation failed!\n");
         goto cleanup;
       }
@@ -360,39 +398,40 @@ int btrfs2ext4_convert(const struct convert_options *opts,
 
   printf("\n=== Hardware Viability Audit (Pre-flight Check) ===\n");
   printf("  RAM total detected:     %.1f GiB\n",
-         (double)mem_cfg.total_ram / (1024.0 * 1024.0 * 1024.0));
+         (double)st.mem_cfg.total_ram / (1024.0 * 1024.0 * 1024.0));
 
   double ext4_ino_ram =
-      (double)(fs_info.inode_count * sizeof(struct inode_map_entry) * 3) /
+      (double)(st.fs_info.inode_count * sizeof(struct inode_map_entry) * 3) /
       (1024.0 * 1024.0);
   printf("  Conversion RAM needed:  %.1f MiB%s\n", ext4_ino_ram,
-         (ext4_ino_ram * 1024 * 1024 > mem_cfg.mmap_threshold)
+         (ext4_ino_ram * 1024 * 1024 > st.mem_cfg.mmap_threshold)
              ? " (mmap WILL BE USED)"
              : " (in-memory)");
 
   uint64_t expansion =
-      fs_info.compressed_extent_count > 0
-          ? (fs_info.total_decompressed_bytes - fs_info.total_compressed_bytes)
+      st.fs_info.compressed_extent_count > 0
+          ? (st.fs_info.total_decompressed_bytes - st.fs_info.total_compressed_bytes)
           : 0;
   uint64_t expansion_blocks =
-      (expansion + layout.block_size - 1) / layout.block_size;
+      (expansion + st.layout.block_size - 1) / st.layout.block_size;
 
   /* Count available data blocks */
   uint64_t free_data_blocks = 0;
-  for (uint32_t g = 0; g < layout.num_groups; g++) {
-    free_data_blocks += layout.groups[g].data_blocks;
+  for (uint32_t g = 0; g < st.layout.num_groups; g++) {
+    free_data_blocks += st.layout.groups[g].data_blocks;
   }
 
   /* Subtract blocks already used by existing data */
   uint64_t used_data_blocks = 0;
-  for (uint32_t i = 0; i < fs_info.inode_count; i++) {
-    const struct file_entry *fe = fs_info.inode_table[i];
+  for (uint32_t i = 0; i < st.fs_info.inode_count; i++) {
+    const struct file_entry *fe = st.fs_info.inode_table[i];
     for (uint32_t j = 0; j < fe->extent_count; j++) {
       if (fe->extents[j].type != BTRFS_FILE_EXTENT_INLINE &&
+          fe->extents[j].type != BTRFS_FILE_EXTENT_PREALLOC &&
           fe->extents[j].disk_bytenr != 0) {
         used_data_blocks +=
-            (fe->extents[j].disk_num_bytes + layout.block_size - 1) /
-            layout.block_size;
+            (fe->extents[j].disk_num_bytes + st.layout.block_size - 1) /
+            st.layout.block_size;
       }
     }
   }
@@ -401,18 +440,18 @@ int btrfs2ext4_convert(const struct convert_options *opts,
                            ? free_data_blocks - used_data_blocks
                            : 0;
 
-  uint64_t dedup_bytes = fs_info.dedup_blocks_needed * layout.block_size;
-  uint64_t total_needed = expansion_blocks + fs_info.dedup_blocks_needed;
+  uint64_t dedup_bytes = st.fs_info.dedup_blocks_needed * st.layout.block_size;
+  uint64_t total_needed = expansion_blocks + st.fs_info.dedup_blocks_needed;
 
   printf("  Decompression Expansion:%lu blocks (%.1f MiB)\n",
          (unsigned long)expansion_blocks,
          (double)expansion / (1024.0 * 1024.0));
   printf("  CoW Physical Cloning:   %lu extra blocks (%.1f MiB)\n",
-         (unsigned long)fs_info.dedup_blocks_needed,
+         (unsigned long)st.fs_info.dedup_blocks_needed,
          (double)dedup_bytes / (1024.0 * 1024.0));
   printf("  Available Data Blocks:  %lu blocks (%.1f MiB)\n",
          (unsigned long)available,
-         (double)available * layout.block_size / (1024.0 * 1024.0));
+         (double)available * st.layout.block_size / (1024.0 * 1024.0));
 
   if (total_needed > available) {
     fprintf(stderr,
@@ -420,7 +459,7 @@ int btrfs2ext4_convert(const struct convert_options *opts,
             "  Need %lu additional blocks but only %lu are free.\n"
             "  Please free up at least %.1f MiB before retrying.\n\n",
             (unsigned long)total_needed, (unsigned long)available,
-            (double)(total_needed - available) * layout.block_size /
+            (double)(total_needed - available) * st.layout.block_size /
                 (1024.0 * 1024.0));
     goto cleanup;
   }
@@ -439,8 +478,8 @@ int btrfs2ext4_convert(const struct convert_options *opts,
 
     /* Benchmark 128 MB or total device size, whichever is smaller */
     uint64_t bench_size = 128ULL * 1024 * 1024;
-    if (bench_size > dev.size)
-      bench_size = dev.size;
+    if (bench_size > st.dev.size)
+      bench_size = st.dev.size;
 
     uint32_t chunk = 1048576; /* 1 MB */
     uint8_t *bench_buf = malloc(chunk);
@@ -454,7 +493,7 @@ int btrfs2ext4_convert(const struct convert_options *opts,
       uint64_t offset = 0;
 
       while (read_bytes < bench_size) {
-        if (device_read(&dev, offset, bench_buf, chunk) < 0)
+        if (device_read(&st.dev, offset, bench_buf, chunk) < 0)
           break;
         read_bytes += chunk;
         offset += chunk;
@@ -473,10 +512,10 @@ int btrfs2ext4_convert(const struct convert_options *opts,
 
         /* Calculate approximate write footprint to be deployed in Phase 3 */
         uint64_t inode_tbl_bytes =
-            (uint64_t)layout.total_inodes * layout.inode_size;
-        uint64_t gdt_bytes = (uint64_t)layout.num_groups * layout.desc_size;
+            (uint64_t)st.layout.total_inodes * st.layout.inode_size;
+        uint64_t gdt_bytes = (uint64_t)st.layout.num_groups * st.layout.desc_size;
         uint64_t bitmap_bytes =
-            (uint64_t)layout.num_groups * layout.block_size * 2;
+            (uint64_t)st.layout.num_groups * st.layout.block_size * 2;
         uint64_t total_meta_write_bytes =
             inode_tbl_bytes + gdt_bytes + bitmap_bytes;
 
@@ -509,30 +548,30 @@ int btrfs2ext4_convert(const struct convert_options *opts,
    * ================================================ */
   if (opts->dry_run) {
     printf("=== DRY RUN: Would write ext4 structures here ===\n");
-    printf("  - %u block groups\n", layout.num_groups);
-    printf("  - %u inodes\n", layout.total_inodes);
+    printf("  - %u block groups\n", st.layout.num_groups);
+    printf("  - %u inodes\n", st.layout.total_inodes);
     printf("  - %u data/metadata conflicts detected\n", conflicts);
-    printf("  - %u blocks would be relocated\n", reloc_plan.count);
-    printf("  - %lu total blocks\n", (unsigned long)layout.total_blocks);
+    printf("  - %u blocks would be relocated\n", st.reloc_plan.count);
+    printf("  - %lu total blocks\n", (unsigned long)st.layout.total_blocks);
 
     /* Dry-run integrity check: physically read all conflicting blocks
      * and compute CRC32C to detect I/O errors / bad sectors */
-    if (reloc_plan.count > 0) {
+    if (st.reloc_plan.count > 0) {
       printf("\n=== Dry-Run Integrity Check ===\n");
-      printf("  Reading %u conflicting blocks...\n", reloc_plan.count);
+      printf("  Reading %u conflicting blocks...\n", st.reloc_plan.count);
 
       uint32_t read_errors = 0;
       uint32_t blocks_checked = 0;
-      uint8_t *check_buf = malloc(layout.block_size);
+      uint8_t *check_buf = malloc(st.layout.block_size);
 
       if (check_buf) {
-        for (uint32_t r = 0; r < reloc_plan.count; r++) {
-          uint64_t offset = reloc_plan.entries[r].src_offset;
-          uint32_t length = reloc_plan.entries[r].length;
+        for (uint32_t r = 0; r < st.reloc_plan.count; r++) {
+          uint64_t offset = st.reloc_plan.entries[r].src_offset;
+          uint32_t length = st.reloc_plan.entries[r].length;
 
-          if (device_read(&dev, offset, check_buf,
-                          length < layout.block_size ? length
-                                                     : layout.block_size) < 0) {
+          if (device_read(&st.dev, offset, check_buf,
+                          length < st.layout.block_size ? length
+                                                     : st.layout.block_size) < 0) {
             fprintf(stderr, "  ERROR: cannot read block at offset %lu\n",
                     (unsigned long)offset);
             read_errors++;
@@ -541,8 +580,8 @@ int btrfs2ext4_convert(const struct convert_options *opts,
           }
 
           /* Progress every 1000 blocks */
-          if ((r + 1) % 1000 == 0 || r + 1 == reloc_plan.count) {
-            printf("  [%u/%u] blocks verified\r", r + 1, reloc_plan.count);
+          if ((r + 1) % 1000 == 0 || r + 1 == st.reloc_plan.count) {
+            printf("  [%u/%u] blocks verified\r", r + 1, st.reloc_plan.count);
             fflush(stdout);
           }
         }
@@ -567,12 +606,12 @@ int btrfs2ext4_convert(const struct convert_options *opts,
       printf("===============================\n");
     }
 
-    ret = 0;
+    st.ret = 0;
     goto cleanup;
   }
 
   if (!opts->dry_run && !check_battery_safe()) {
-    ret = -1;
+    st.ret = -1;
     goto cleanup;
   }
 
@@ -595,20 +634,20 @@ int btrfs2ext4_convert(const struct convert_options *opts,
     progress("Pass 3", 0, "Linearizing I/O (sorting inodes)...");
 
   printf("Sorting %u inodes for optimal Ext4 sequential I/O layout...\n",
-         fs_info.inode_count);
-  qsort(fs_info.inode_table, fs_info.inode_count, sizeof(struct file_entry *),
+         st.fs_info.inode_count);
+  qsort(st.fs_info.inode_table, st.fs_info.inode_count, sizeof(struct file_entry *),
         compare_file_entry);
 
   /* Inicializar el allocator global de bloques Ext4 y marcar bloques de datos
    * ya usados por Btrfs (tras la relocación) para que no se reutilicen. */
-  struct ext4_block_allocator alloc;
-  ext4_block_alloc_init(&alloc, &layout);
-  ext4_block_alloc_mark_fs_data(&alloc, &layout, &fs_info);
+  ext4_block_alloc_init(&st.alloc, &st.layout);
+  st.alloc_initialized = 1;
+  ext4_block_alloc_mark_fs_data(&st.alloc, &st.layout, &st.fs_info);
 
   /* Link adaptive memory management to the Ext4 inode map */
-  ino_map.mem_cfg = &mem_cfg;
+  st.ino_map.mem_cfg = &st.mem_cfg;
 
-  if (ext4_write_superblock(&dev, &layout, &fs_info) < 0) {
+  if (ext4_write_superblock(&st.dev, &st.layout, &st.fs_info) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to write superblock\n");
     goto cleanup;
   }
@@ -616,7 +655,7 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   if (progress)
     progress("Pass 3", 20, "Writing group descriptor table...");
 
-  if (ext4_write_gdt(&dev, &layout) < 0) {
+  if (ext4_write_gdt(&st.dev, &st.layout) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to write GDT\n");
     goto cleanup;
   }
@@ -624,51 +663,49 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   if (progress)
     progress("Pass 3", 40, "Writing inode tables...");
 
-  if (ext4_write_inode_table(&dev, &layout, &fs_info, &ino_map, &alloc) < 0) {
+  if (ext4_write_inode_table(&st.dev, &st.layout, &st.fs_info, &st.ino_map, &st.alloc) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to write inode tables\n");
     goto cleanup;
   }
 
   if (progress)
-    progress("Pass 3", 55, "Writing bitmaps...");
+    progress("Pass 3", 55, "Writing directory entries...");
 
-  /* Bug A fix: bitmaps are written AFTER inode tables so the inode_map
-   * is fully populated and ext4_write_bitmaps can mark active inodes. */
-  if (ext4_write_bitmaps(&dev, &layout, &alloc, &ino_map) < 0) {
-    fprintf(stderr, "btrfs2ext4: failed to write bitmaps\n");
-    goto cleanup;
-  }
-
-  if (progress)
-    progress("Pass 3", 60, "Writing directory entries...");
-
-  if (ext4_write_directories(&dev, &layout, &fs_info, &ino_map, &alloc) < 0) {
+  if (ext4_write_directories(&st.dev, &st.layout, &st.fs_info, &st.ino_map, &st.alloc) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to write directories\n");
     goto cleanup;
   }
 
   if (progress)
-    progress("Pass 3", 85, "Writing journal...");
+    progress("Pass 3", 70, "Writing journal...");
 
-  if (ext4_write_journal(&dev, &layout, &alloc, dev.size) < 0) {
+  if (ext4_write_journal(&st.dev, &st.layout, &st.alloc, st.dev.size) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to write journal\n");
     goto cleanup;
   }
 
-  if (ext4_finalize_journal_inode(&dev, &layout) < 0) {
+  if (ext4_finalize_journal_inode(&st.dev, &st.layout) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to finalize journal inode\n");
+    goto cleanup;
+  }
+
+  if (progress)
+    progress("Pass 3", 88, "Finalizing block and inode bitmaps...");
+
+  if (ext4_finalize_bitmaps(&st.dev, &st.layout, &st.alloc, &st.ino_map) < 0) {
+    fprintf(stderr, "btrfs2ext4: failed to finalize bitmaps\n");
     goto cleanup;
   }
 
   if (progress)
     progress("Pass 3", 90, "Updating free block counts (GDT/Superblock)...");
 
-  if (ext4_update_free_counts(&dev, &layout) < 0) {
+  if (ext4_update_free_counts(&st.dev, &st.layout) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to update free counts\n");
     goto cleanup;
   }
 
-  device_sync(&dev);
+  device_sync(&st.dev);
 
   if (progress)
     progress("Pass 3", 100, "Ext4 filesystem written!");
@@ -687,17 +724,11 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   printf("     consolidate file extents for improved sequential read speed.\n");
   printf("\n");
 
-  ret = 0;
+  st.ret = 0;
 
 cleanup:
-  ext4_block_alloc_free(&alloc);
-  inode_map_free(&ino_map);
-  relocator_free(&reloc_plan);
-  ext4_free_layout(&layout);
-  btrfs_free_fs(&fs_info);
-  device_close(&dev);
-
-  return ret;
+  convert_state_cleanup(&st);
+  return st.ret;
 }
 
 int btrfs2ext4_rollback(const char *device_path) {
@@ -735,6 +766,7 @@ int main(int argc, char **argv) {
       {"block-size", required_argument, NULL, 'b'},
       {"inode-ratio", required_argument, NULL, 'i'},
       {"rollback", no_argument, NULL, 'r'},
+      {"force", no_argument, NULL, 'f'},
       {"workdir", required_argument, NULL, 'w'},
       {"memory-limit", required_argument, NULL, 'm'},
       {"help", no_argument, NULL, 'h'},
@@ -742,7 +774,7 @@ int main(int argc, char **argv) {
       {NULL, 0, NULL, 0}};
 
   int opt;
-  while ((opt = getopt_long(argc, argv, "nvb:i:rw:m:hV", long_options, NULL)) !=
+  while ((opt = getopt_long(argc, argv, "nvb:i:rfw:m:hV", long_options, NULL)) !=
          -1) {
     switch (opt) {
     case 'n':
@@ -765,6 +797,9 @@ int main(int argc, char **argv) {
       break;
     case 'r':
       opts.rollback = 1;
+      break;
+    case 'f':
+      opts.force = 1;
       break;
     case 'w':
       opts.workdir = optarg;
@@ -812,8 +847,8 @@ int main(int argc, char **argv) {
   }
 
   if (opts.rollback) {
-    return btrfs2ext4_rollback(opts.device_path);
+    return btrfs2ext4_rollback(opts.device_path) == 0 ? 0 : 1;
   }
 
-  return btrfs2ext4_convert(&opts, progress_print);
+  return btrfs2ext4_convert(&opts, progress_print) == 0 ? 0 : 1;
 }

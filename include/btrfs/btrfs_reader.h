@@ -26,12 +26,14 @@
 
 struct file_extent {
   uint64_t file_offset;    /* offset within the file */
+  uint64_t offset;         /* fi->offset: offset within extent on disk */
   uint64_t disk_bytenr;    /* physical byte address on disk (0=hole) */
   uint64_t disk_num_bytes; /* size on disk */
   uint64_t num_bytes;      /* logical bytes in file */
   uint64_t ram_bytes;      /* decompressed size */
   uint8_t compression;     /* BTRFS_COMPRESS_* */
   uint8_t type;            /* BTRFS_FILE_EXTENT_INLINE/REG/PREALLOC */
+  uint8_t is_physical;   /* 1 = disk_bytenr is already a physical byte offset */
   /* For inline extents, data is stored separately */
   uint8_t *inline_data;
   uint32_t inline_data_len;
@@ -108,9 +110,10 @@ struct file_entry {
  * ======================================================================== */
 
 struct used_extent {
-  uint64_t start;  /* physical byte offset */
-  uint64_t length; /* length in bytes */
-  uint64_t flags;  /* BTRFS_BLOCK_GROUP_DATA/METADATA/SYSTEM */
+  uint64_t start;       /* physical byte offset */
+  uint64_t length;      /* length in bytes */
+  uint64_t flags;       /* BTRFS_BLOCK_GROUP_DATA/METADATA/SYSTEM */
+  uint64_t generation;  /* btrfs_extent_item.generation */
 };
 
 struct used_block_map {
@@ -218,5 +221,17 @@ void btrfs_free_fs(struct btrfs_fs_info *fs_info);
  */
 struct file_entry *btrfs_find_inode(struct btrfs_fs_info *fs_info,
                                     uint64_t ino);
+
+#ifdef BTRFS_TESTING
+void btrfs_test_set_malloc_fail_at(size_t size);
+void btrfs_test_cow_hash_reset(void);
+int btrfs_test_cow_hash_check_and_add(uint64_t bytenr, uint64_t num_bytes);
+void btrfs_test_apply_prealloc_rules(struct file_extent *ext);
+int btrfs_test_alloc_inline_data(size_t len, uint8_t **out);
+int btrfs_test_parse_extent_item(uint8_t key_type, uint64_t key_objectid,
+                                 uint64_t key_offset, uint32_t nodesize,
+                                 const void *data, uint32_t data_size,
+                                 struct used_extent *out);
+#endif
 
 #endif /* BTRFS_READER_H */
