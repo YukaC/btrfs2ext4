@@ -21,7 +21,6 @@
 #include "device_io.h"
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_writer.h"
-#include "journal.h"
 #include "mem_tracker.h"
 #include "migration_map.h"
 #include "relocator.h"
@@ -360,6 +359,12 @@ int btrfs2ext4_convert(const struct convert_options *opts,
     }
 
     if (st.reloc_plan.count > 0) {
+      if (!check_battery_safe()) {
+        fprintf(stderr,
+                "btrfs2ext4: aborting block relocation — unsafe power state\n");
+        goto cleanup;
+      }
+
       if (progress)
         progress("Pass 2", 70, "Relocating conflicting blocks...");
 
