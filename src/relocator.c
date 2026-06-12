@@ -19,7 +19,6 @@
 #include "btrfs/chunk_tree.h"
 #include "device_io.h"
 #include "ext4/ext4_planner.h"
-#include "journal.h"
 #include "mem_tracker.h"
 #include "relocator.h"
 
@@ -526,10 +525,7 @@ int relocator_execute(struct relocation_plan *plan, struct device *dev,
           extent_hash_free(&ehash);
 
         fprintf(stderr,
-                "btrfs2ext4: relocation write failed at seq %u, initiating "
-                "partial rollback...\n",
-                re->seq);
-        journal_replay_partial(dev, journal_current_offset(), re->seq);
+                "btrfs2ext4: relocation write failed at seq %u\n", re->seq);
         return -1;
       }
 

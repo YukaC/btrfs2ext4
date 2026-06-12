@@ -121,7 +121,6 @@ set(BTRFS2EXT4_SOURCES
     src/ext4/ext4_crc16.c
     src/relocator.c
     src/bloom.c
-    src/journal.c
     src/mem_tracker.c
     src/migration_map.c
     src/thread_pool.c
@@ -129,6 +128,7 @@ set(BTRFS2EXT4_SOURCES
 
 # Main executable
 add_executable(btrfs2ext4 ${BTRFS2EXT4_SOURCES})
+target_compile_definitions(btrfs2ext4 PRIVATE BTRFS2EXT4_NO_RELOC_JOURNAL=1)
 
 target_link_libraries(btrfs2ext4
     ${UUID_LIBRARIES}
@@ -187,7 +187,6 @@ set(BTRFS2EXT4_LIB_SOURCES
     src/ext4/ext4_crc16.c
     src/relocator.c
     src/bloom.c
-    src/journal.c
     src/mem_tracker.c
     src/migration_map.c
     src/thread_pool.c
@@ -256,7 +255,8 @@ endif()
 
 # --- Integration Test ---
 add_executable(test_integration tests/test_integration.c ${BTRFS2EXT4_LIB_SOURCES})
-target_compile_definitions(test_integration PRIVATE BTRFS_TESTING=1)
+target_compile_definitions(test_integration PRIVATE
+    BTRFS_TESTING=1 BTRFS2EXT4_NO_RELOC_JOURNAL=1)
 target_link_libraries(test_integration
     ${UUID_LIBRARIES}
     ${ZLIB_LIBRARIES}
