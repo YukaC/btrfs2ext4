@@ -3062,13 +3062,11 @@ int main(void) {
   test_planner_dedup_budget();
   test_planner_safety_margin();
 
-  printf("\n─── GROUP N2: Phase 4b ETA + Exact Accounting (Approach C) ────────────────\n");
+  printf("\n─── GROUP N2: Phase 4b ETA + Exact Accounting (Approach A) ────────────────\n");
   test_planner_htree_total_matches_budget();
   test_journal_uses_planner_tail();
   test_planner_dedup_decompression_split();
-  test_conversion_eta_tier1_no_calibration_io();
-  test_conversion_eta_tier2_calibration_io_cap();
-  test_conversion_eta_calibrated_narrower_range();
+  test_conversion_eta_pass3_sanity();
 
   /* GROUP K: Phase 2 extent tree metadata length */
   printf("\n─── GROUP K: Phase 2 Extent Tree (METADATA_ITEM) ────────────────────\n");

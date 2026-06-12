@@ -142,6 +142,8 @@ btrfs2ext4 [options] <device>
 sudo umount /dev/sdX1
 
 # 2. Dry-run first — checks space, estimates time, detects problems
+#    Prints planner budget (data/journal/HTree/dedup/decompression) and an
+#    analytical conversion ETA (HDD/SSD via sysfs; optional 128 MiB read benchmark)
 sudo btrfs2ext4 -n /dev/sdX1
 
 # 3. Convert

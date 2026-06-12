@@ -188,12 +188,21 @@ Every non-data block is appended to the `reserved_blocks[]` array (a flat list o
 |-------|--------|
 | `data_blocks` | File extents, symlink blocks, extent-tree index nodes, directory base blocks |
 | `journal_blocks` | `ext4_journal_default_blocks()` (mke2fs heuristic); reserved contiguously at device tail |
-| `htree_blocks` | Per-directory HTree overhead (`dir_size/block_size + 10` when `dir_size > block_size`) |
-| `dedup_blocks` | `dedup_blocks_needed` plus decompression expansion |
+| `htree_blocks` | Sum of `ext4_htree_blocks_total()` per directory (`dir_size/block_size + 10`, min 4 when `dir_size > block_size`; matches `dir_writer`) |
+| `dedup_blocks` | `dedup_blocks_needed` (CoW clone expansion only) |
+| `decompression_blocks` | Compression expansion: `⌈(total_decompressed − total_compressed) / block_size⌉` |
 | `metadata_blocks` | `reserved_block_count` after journal tail reservation |
 | `safety_margin_blocks` | `total_blocks × safety_margin_percent / 100` (CLI `--safety-margin`, default 5%, range 1–25) |
 
-Viability requires `data + journal + htree + dedup < physically_usable` and remaining headroom ≥ safety margin. `main.c` prints the planner budget instead of duplicating the arithmetic.
+Viability requires `data + journal + htree + dedup + decompression < physically_usable` and remaining headroom ≥ safety margin. `main.c` prints the planner budget instead of duplicating the arithmetic.
+
+**Conversion ETA (`conversion_eta.c`)** — analytical O(1) estimate after planning; no extra I/O on the real conversion path:
+
+- Storage class from `/sys/block/*/queue/rotational` (cached): HDD 120/80 MB/s read/write, SSD 400/300 MB/s; journal zeroing at 200 MB/s.
+- Pass 1: `inode_count × 4096` read bytes.
+- Pass 2: relocation entries × 2 (read+write) / read_bw + `reloc->count × seek_ms` (HDD 8 ms, SSD 0.1 ms).
+- Pass 3: `budget.total_required × block_size` plus inode/GDT/bitmap metadata bytes, plus journal zeroing time.
+- Uncertainty: ±20% (HDD) or ±10% (SSD). Dry-run (`--dry-run`) optionally runs a 128 MiB sequential read benchmark to scale throughput (`measured / expected`); real conversion skips the benchmark.
 
 The `sparse_super` feature is applied: superblock + GDT copies exist only in groups 0, 1, and powers of 3, 5, and 7 (function `ext4_bg_has_super()`).
 
