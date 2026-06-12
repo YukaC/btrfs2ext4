@@ -44,6 +44,8 @@
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_structures.h"
 #include "ext4/ext4_writer.h"
+#include "migration_map.h"
+#include "relocator.h"
 
 /* =========================================================================
  * Infrastructure
@@ -2055,6 +2057,95 @@ static void test_e2e_reserved_inodes_not_free(void) {
   TEST_PASS();
 }
 
+static void write_test_btrfs_super(struct device *dev, uint64_t magic_tag) {
+  struct btrfs_super_block sb;
+  memset(&sb, 0, sizeof(sb));
+  sb.magic = htole64(BTRFS_MAGIC ^ magic_tag);
+  sb.nodesize = htole32(16384);
+  sb.sectorsize = htole32(4096);
+  device_write(dev, BTRFS_SUPER_OFFSET, &sb, sizeof(sb));
+}
+static void test_migration_map_zero_entries(void) {
+  TEST_START("T-3.1  migration_map: save(count=0) escribe footer válido");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t31", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "migration_map_save falló");
+  uint64_t backup_offset = (dev.size - SUPERBLOCK_BACKUP_OFFSET) & ~4095ULL;
+  uint64_t footer_offset = backup_offset - MIGRATION_FOOTER_OFFSET;
+  struct migration_footer footer;
+  REQUIRE(read_raw(&dev, footer_offset, &footer, sizeof(footer)) == 0, "lectura footer falló");
+  CHECK(memcmp(footer.magic, MIGRATION_MAGIC, 8) == 0, "magic footer inválido");
+  CHECK(footer.entry_count == 0, "entry_count debe ser 0");
+  REQUIRE(migration_map_rollback(&dev) == 0, "rollback con count=0 falló");
+  cleanup_test_dev(&dev); TEST_PASS();
+}
+static void test_migration_map_alignment(void) {
+  TEST_START("T-3.2  migration_map: alineación no solapa footer");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t32", 1024ULL * 1024 * 1024) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  const uint32_t entry_count = 51200;
+  struct relocation_plan plan = {0};
+  plan.entries = calloc(entry_count, sizeof(struct relocation_entry));
+  REQUIRE(plan.entries != NULL, "calloc entries falló");
+  plan.count = entry_count;
+  for (uint32_t i = 0; i < entry_count; i++) {
+    plan.entries[i].src_offset = 1024ULL * 1024 + (uint64_t)i * 4096;
+    plan.entries[i].dst_offset = 64ULL * 1024 * 1024 + (uint64_t)i * 4096;
+    plan.entries[i].length = 4096; plan.entries[i].seq = i;
+  }
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "migration_map_save falló");
+  uint64_t backup_offset = (dev.size - SUPERBLOCK_BACKUP_OFFSET) & ~4095ULL;
+  uint64_t footer_offset = backup_offset - MIGRATION_FOOTER_OFFSET;
+  struct migration_footer footer;
+  REQUIRE(read_raw(&dev, footer_offset, &footer, sizeof(footer)) == 0, "lectura footer falló");
+  uint64_t map_size = (uint64_t)footer.entry_count * sizeof(struct relocation_entry);
+  CHECK(footer.map_offset + map_size <= footer_offset, "mapa solapa región del footer");
+  CHECK((footer.map_offset & 4095ULL) == 0, "map_offset no está alineado");
+  relocator_free(&plan); cleanup_test_dev(&dev); TEST_PASS();
+}
+static void test_rollback_after_pass2(void) {
+  TEST_START("T-3.3  rollback: checkpoint post-save (simula crash Pass 2)");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t33", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0x1234);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "migration_map_save falló");
+  uint8_t garbage[4096]; memset(garbage, 0xEE, sizeof(garbage));
+  REQUIRE(device_write(&dev, BTRFS_SUPER_OFFSET, garbage, sizeof(garbage)) == 0, "corrupción simulada falló");
+  REQUIRE(migration_map_rollback(&dev) == 0, "rollback post-save falló");
+  struct btrfs_super_block sb;
+  REQUIRE(read_raw(&dev, BTRFS_SUPER_OFFSET, &sb, sizeof(sb)) == 0, "lectura superbloque falló");
+  CHECK(le64toh(sb.magic) == (BTRFS_MAGIC ^ 0x1234ULL), "superbloque no restaurado tras rollback");
+  cleanup_test_dev(&dev); TEST_PASS();
+}
+static void test_rollback_restores_superblock(void) {
+  TEST_START("T-3.4  rollback: restaura magic Btrfs en 0x10000");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t34", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "migration_map_save falló");
+  struct btrfs_super_block corrupt; memset(&corrupt, 0, sizeof(corrupt));
+  corrupt.magic = htole64(0xDEADBEEFCAFEBABEULL);
+  REQUIRE(device_write(&dev, BTRFS_SUPER_OFFSET, &corrupt, sizeof(corrupt)) == 0, "escritura corrupta falló");
+  REQUIRE(migration_map_rollback(&dev) == 0, "rollback falló");
+  struct btrfs_super_block restored;
+  REQUIRE(read_raw(&dev, BTRFS_SUPER_OFFSET, &restored, sizeof(restored)) == 0, "lectura superbloque falló");
+  CHECK(le64toh(restored.magic) == BTRFS_MAGIC, "magic Btrfs no restaurado");
+  cleanup_test_dev(&dev); TEST_PASS();
+}
+static void test_journal_deprecated(void) {
+  TEST_START("T-3.5  journal.c deprecado: sin enlazar al flujo principal");
+#ifndef BTRFS2EXT4_NO_RELOC_JOURNAL
+  TEST_FAIL("BTRFS2EXT4_NO_RELOC_JOURNAL no definido — journal.c sigue activo"); return;
+#else
+  TEST_PASS();
+#endif
+}
+
 /* =========================================================================
  * Main
  * ======================================================================= */
@@ -2148,6 +2239,13 @@ int main(void) {
   test_e2e_inode_table_within_bounds();
   test_e2e_superblock_feature_bits();
   test_e2e_reserved_inodes_not_free();
+
+  printf("\n─── GROUP L: Phase 3 Migration Map / Rollback ────────────────────────────\n");
+  test_migration_map_zero_entries();
+  test_migration_map_alignment();
+  test_rollback_after_pass2();
+  test_rollback_restores_superblock();
+  test_journal_deprecated();
 
   /* Summary */
   printf("\n═══════════════════════════════════════════════════════════════════"
