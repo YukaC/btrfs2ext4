@@ -40,6 +40,7 @@ static void print_usage(const char *prog) {
       "  -b, --block-size N      Set ext4 block size (default: 4096)\n"
       "  -i, --inode-ratio N     Set inode ratio (default: 16384)\n"
       "  -r, --rollback          Rollback a previous conversion\n"
+      "      --emergency-recover Diagnose interrupted Pass 3 (read-only)\n"
       "  -f, --force             Resume conversion with existing migration map\n"
       "  -w, --workdir <path>    Working directory for temp files (default: "
       "cwd)\n"
@@ -766,6 +767,7 @@ int main(int argc, char **argv) {
       {"block-size", required_argument, NULL, 'b'},
       {"inode-ratio", required_argument, NULL, 'i'},
       {"rollback", no_argument, NULL, 'r'},
+      {"emergency-recover", no_argument, NULL, 1001},
       {"force", no_argument, NULL, 'f'},
       {"workdir", required_argument, NULL, 'w'},
       {"memory-limit", required_argument, NULL, 'm'},
@@ -797,6 +799,9 @@ int main(int argc, char **argv) {
       break;
     case 'r':
       opts.rollback = 1;
+      break;
+    case 1001:
+      opts.emergency_recover = 1;
       break;
     case 'f':
       opts.force = 1;
@@ -848,6 +853,10 @@ int main(int argc, char **argv) {
 
   if (opts.rollback) {
     return btrfs2ext4_rollback(opts.device_path) == 0 ? 0 : 1;
+  }
+
+  if (opts.emergency_recover) {
+    return btrfs2ext4_emergency_recover(opts.device_path) == 0 ? 0 : 1;
   }
 
   return btrfs2ext4_convert(&opts, progress_print) == 0 ? 0 : 1;

@@ -131,6 +131,7 @@ btrfs2ext4 [options] <device>
 | `-w PATH`, `--workdir PATH`  | Directory for mmap() swap files (default: ./)      |
 | `-m LIMIT`, `--memory-limit` | Memory threshold for mmap, in bytes or `%`         |
 | `-r`, `--rollback`           | Restore original Btrfs superblock from backup      |
+| `--emergency-recover`        | Diagnose interrupted Pass 3 (read-only)            |
 | `-V`, `--version`            | Print version                                      |
 | `-h`, `--help`               | Print help                                         |
 
@@ -164,6 +165,10 @@ sudo btrfs check /dev/sdX1
 
 > [!NOTE]
 > Rollback restores the Btrfs superblock from the automatic backup written at the start of conversion. Relocated blocks stay at their new positions — run `btrfs check` to verify integrity.
+
+### Emergency recovery (Pass 3 interrupted)
+
+`--emergency-recover` inspects the device read-only and prints recommended recovery steps.
 
 ---
 

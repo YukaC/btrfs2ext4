@@ -37,6 +37,9 @@ Define the strict threshold where the engine drops into \fBmmap()\fR paging to p
 .BR \-r ", " \-\-rollback
 Roll back a previously interrupted or completed conversion by restoring the automatic Btrfs superblock backup. Run \fIbtrfs check\fR after using this function.
 .TP
+.B \-\-emergency\-recover
+Read-only Pass 3 interruption diagnostic.
+.TP
 .BR \-V ", " \-\-version
 Print the software version.
 .TP
@@ -71,6 +74,10 @@ Mount the newly converted Ext4 partition:
 Rollback an aborted conversion:
 .RS
 .B btrfs2ext4 --rollback /dev/sda1
+.RE
+.PP
+.RS
+.B btrfs2ext4 --emergency-recover /dev/sda1
 .RE
 .SH SEE ALSO
 \fBfsck.ext4\fR(8), \fBmkfs.ext4\fR(8), \fBtune2fs\fR(8), \fBbtrfs-check\fR(8)

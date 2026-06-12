@@ -14,6 +14,7 @@ struct convert_options {
   int dry_run;              /* 1 = simulate only, don't write */
   int verbose;              /* 1 = detailed output */
   int rollback;             /* 1 = rollback a previous conversion */
+  int emergency_recover;    /* 1 = diagnose interrupted Pass 3 (read-only) */
   int force;                /* 1 = resume conversion with existing map */
   int no_journal;           /* 1 = skip crash-recovery journal */
   uint32_t block_size;      /* ext4 block size (default 4096) */
@@ -42,6 +43,8 @@ int btrfs2ext4_convert(const struct convert_options *opts,
  * The CLI maps this to process exit codes: 0 success, 1 failure.
  */
 int btrfs2ext4_rollback(const char *device_path);
+
+int btrfs2ext4_emergency_recover(const char *device_path);
 
 /*
  * Print version information.
