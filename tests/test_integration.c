@@ -38,10 +38,12 @@
 #include "btrfs/btrfs_reader.h"
 #include "btrfs/btrfs_structures.h"
 #include "btrfs/chunk_tree.h"
+#include "conversion_eta.h"
 #include "device_io.h"
 #include "ext4/ext4_crc16.h"
 #include "ext4/ext4_metadata_csum.h"
 #include "ext4/ext4_planner.h"
+#include "ext4/ext4_space.h"
 #include "ext4/ext4_structures.h"
 #include "ext4/ext4_writer.h"
 #include "migration_map.h"
@@ -2861,6 +2863,88 @@ static void test_planner_safety_margin(void) {
   TEST_PASS();
 }
 
+static void test_planner_htree_total_matches_budget(void) {
+  TEST_START("T-4b.1  planner HTree budget == ext4_htree_blocks_total()");
+  const uint64_t dev_size = 64ULL * 1024 * 1024;
+  struct btrfs_fs_info *fs = make_big_dir_fs(800);
+  struct ext4_layout layout;
+  struct ext4_space_budget budget;
+  uint32_t expected = ext4_htree_blocks_total(fs->root_dir, TEST_BLOCK_SIZE);
+  REQUIRE(ext4_plan_layout(fs, dev_size, TEST_BLOCK_SIZE, 16384,
+                           EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout,
+                           &budget) == 0, "plan");
+  CHECK(expected > 0, "synthetic dir needs HTree");
+  CHECK(budget.htree_blocks == expected, "htree budget matches dir_writer");
+  ext4_free_layout(&layout);
+  free_big_dir_fs(fs);
+  TEST_PASS();
+}
+
+static void test_journal_uses_planner_tail(void) {
+  TEST_START("T-4b.2  journal: usa bloques reservados del planner");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "jrn4b2", TEST_IMG_SIZE) == 0, "image");
+  struct ext4_layout layout;
+  REQUIRE(build_test_layout(&layout) == 0, "planner");
+  REQUIRE(layout.journal_start_block > 0, "journal tail reserved");
+  struct ext4_block_allocator alloc;
+  ext4_block_alloc_init(&alloc, &layout);
+  REQUIRE(ext4_write_journal(&dev, &layout, &alloc, TEST_IMG_SIZE) == 0, "write_journal");
+  CHECK(ext4_journal_start_block() == layout.journal_start_block, "journal at planner tail");
+  ext4_block_alloc_free(&alloc);
+  ext4_free_layout(&layout);
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_planner_dedup_decompression_split(void) {
+  TEST_START("T-4b.3  budget splits dedup vs decompression");
+  const uint64_t dev_size = 64ULL * 1024 * 1024;
+  struct btrfs_fs_info *fs = calloc(1, sizeof(*fs));
+  fs->dedup_blocks_needed = 42;
+  fs->compressed_extent_count = 1;
+  fs->total_compressed_bytes = 4096;
+  fs->total_decompressed_bytes = 4096 + 3 * TEST_BLOCK_SIZE;
+  struct ext4_layout layout;
+  struct ext4_space_budget budget;
+  REQUIRE(ext4_plan_layout(fs, dev_size, TEST_BLOCK_SIZE, 16384,
+                           EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout,
+                           &budget) == 0, "plan");
+  CHECK(budget.dedup_blocks == 42, "dedup only CoW clones");
+  CHECK(budget.decompression_blocks == 3, "decompression separate");
+  ext4_free_layout(&layout);
+  free(fs);
+  TEST_PASS();
+}
+
+static void test_conversion_eta_pass3_sanity(void) {
+  TEST_START("T-4b.4  ETA pass3 bytes includes budget+metadata");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "eta4b4", TEST_IMG_SIZE) == 0, "image");
+  struct ext4_layout layout;
+  REQUIRE(build_test_layout(&layout) == 0, "planner");
+  struct ext4_space_budget budget = {0};
+  budget.total_required = 500;
+  budget.journal_blocks = layout.journal_blocks;
+  budget.htree_blocks = 12;
+  struct relocation_plan reloc = {0};
+  struct conversion_eta eta;
+  REQUIRE(conversion_eta_estimate(&dev, &layout, &budget, &reloc, NULL, 1.0,
+                                  &eta) == 0, "eta");
+  uint64_t meta_bytes = (uint64_t)layout.total_inodes * layout.inode_size;
+  meta_bytes += (uint64_t)layout.num_groups * layout.desc_size;
+  meta_bytes += (uint64_t)layout.num_groups * layout.block_size * 2;
+  uint64_t expected_pass3 =
+      (uint64_t)budget.total_required * layout.block_size + meta_bytes;
+  CHECK(eta.pass3_write_bytes == expected_pass3, "pass3 bytes formula");
+  CHECK(eta.pass3_write_sec > 0.0, "pass3 time positive");
+  CHECK(eta.total_min_sec <= eta.total_max_sec, "min/max range");
+  ext4_free_layout(&layout);
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+
 /* =========================================================================
  * Main
  * ======================================================================= */
@@ -2977,6 +3061,14 @@ int main(void) {
   test_planner_htree_budget();
   test_planner_dedup_budget();
   test_planner_safety_margin();
+
+  printf("\n─── GROUP N2: Phase 4b ETA + Exact Accounting (Approach C) ────────────────\n");
+  test_planner_htree_total_matches_budget();
+  test_journal_uses_planner_tail();
+  test_planner_dedup_decompression_split();
+  test_conversion_eta_tier1_no_calibration_io();
+  test_conversion_eta_tier2_calibration_io_cap();
+  test_conversion_eta_calibrated_narrower_range();
 
   /* GROUP K: Phase 2 extent tree metadata length */
   printf("\n─── GROUP K: Phase 2 Extent Tree (METADATA_ITEM) ────────────────────\n");

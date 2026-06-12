@@ -56,6 +56,7 @@ struct ext4_space_budget {
   uint32_t journal_blocks;
   uint32_t htree_blocks;
   uint32_t dedup_blocks;
+  uint32_t decompression_blocks;
   uint32_t metadata_blocks;
   uint32_t safety_margin_blocks;
   uint32_t total_required;

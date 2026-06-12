@@ -18,6 +18,7 @@
 #include "btrfs/btrfs_reader.h"
 #include "btrfs/chunk_tree.h"
 #include "btrfs2ext4.h"
+#include "conversion_eta.h"
 #include "device_io.h"
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_writer.h"
@@ -428,6 +429,10 @@ int btrfs2ext4_convert(const struct convert_options *opts,
          space_budget.dedup_blocks,
          (double)space_budget.dedup_blocks * st.layout.block_size /
              (1024.0 * 1024.0));
+  printf("  Decompression reserve:  %u blocks (%.1f MiB)\n",
+         space_budget.decompression_blocks,
+         (double)space_budget.decompression_blocks * st.layout.block_size /
+             (1024.0 * 1024.0));
   printf("  Metadata reserved:      %u blocks\n",
          space_budget.metadata_blocks);
   printf("  Safety margin (%u%%):    %u blocks (%.1f MiB)\n",
@@ -451,78 +456,68 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   printf("===================================================\n\n");
 
   /* ================================================
-   * DRY-RUN Benchmark and ETA Estimation
+   * Conversion time estimate (analytical; benchmark only on dry-run)
    * ================================================ */
-  if (opts->dry_run) {
-    printf("=== DRY RUN: ETA Benchmark ===\n");
-    printf("  Benchmarking device read speed to estimate real conversion "
-           "time...\n");
+  {
+    struct conversion_eta eta;
+    double throughput_scale = 1.0;
 
-    /* Benchmark 128 MB or total device size, whichever is smaller */
-    uint64_t bench_size = 128ULL * 1024 * 1024;
-    if (bench_size > st.dev.size)
-      bench_size = st.dev.size;
-
-    uint32_t chunk = 1048576; /* 1 MB */
-    uint8_t *bench_buf = malloc(chunk);
-    if (!bench_buf) {
-      printf("  WARNING: Could not allocate benchmark buffer.\n");
+    printf("=== Conversion Time Estimate ===\n");
+    if (conversion_eta_estimate(&st.dev, &st.layout, &space_budget,
+                                &st.reloc_plan, &st.fs_info, 1.0, &eta) != 0) {
+      printf("  WARNING: ETA model failed.\n");
     } else {
-      struct timespec tb_start, tb_end;
-      clock_gettime(CLOCK_MONOTONIC, &tb_start);
-
-      uint64_t read_bytes = 0;
-      uint64_t offset = 0;
-
-      while (read_bytes < bench_size) {
-        if (device_read(&st.dev, offset, bench_buf, chunk) < 0)
-          break;
-        read_bytes += chunk;
-        offset += chunk;
+      if (opts->dry_run) {
+        uint64_t bench_size = 128ULL * 1024 * 1024;
+        if (bench_size > st.dev.size)
+          bench_size = st.dev.size;
+        uint32_t chunk = 1048576;
+        uint8_t *bench_buf = malloc(chunk);
+        if (bench_buf) {
+          struct timespec tb_start, tb_end;
+          clock_gettime(CLOCK_MONOTONIC, &tb_start);
+          uint64_t read_bytes = 0, offset = 0;
+          while (read_bytes < bench_size) {
+            if (device_read(&st.dev, offset, bench_buf, chunk) < 0)
+              break;
+            read_bytes += chunk;
+            offset += chunk;
+          }
+          clock_gettime(CLOCK_MONOTONIC, &tb_end);
+          free(bench_buf);
+          double elapsed_sec =
+              (tb_end.tv_sec - tb_start.tv_sec) +
+              (tb_end.tv_nsec - tb_start.tv_nsec) / 1e9;
+          if (elapsed_sec > 0.0 && read_bytes > 0) {
+            double speed_mb_s =
+                ((double)read_bytes / (1024.0 * 1024.0)) / elapsed_sec;
+            double expected = (eta.device_rotational == 1) ? 120.0 : 400.0;
+            throughput_scale = speed_mb_s / expected;
+            printf("  Read benchmark:         %.1f MB/s (scale %.2fx)\n",
+                   speed_mb_s, throughput_scale);
+            conversion_eta_estimate(&st.dev, &st.layout, &space_budget,
+                                    &st.reloc_plan, &st.fs_info,
+                                    throughput_scale, &eta);
+          }
+        }
       }
-
-      clock_gettime(CLOCK_MONOTONIC, &tb_end);
-      free(bench_buf);
-
-      double elapsed_sec = (tb_end.tv_sec - tb_start.tv_sec) +
-                           (tb_end.tv_nsec - tb_start.tv_nsec) / 1e9;
-
-      if (elapsed_sec > 0.0 && read_bytes > 0) {
-        double speed_mb_s =
-            ((double)read_bytes / (1024.0 * 1024.0)) / elapsed_sec;
-        printf("  Read speed measured:    %.1f MB/s\n", speed_mb_s);
-
-        /* Calculate approximate write footprint to be deployed in Phase 3 */
-        uint64_t inode_tbl_bytes =
-            (uint64_t)st.layout.total_inodes * st.layout.inode_size;
-        uint64_t gdt_bytes = (uint64_t)st.layout.num_groups * st.layout.desc_size;
-        uint64_t bitmap_bytes =
-            (uint64_t)st.layout.num_groups * st.layout.block_size * 2;
-        uint64_t total_meta_write_bytes =
-            inode_tbl_bytes + gdt_bytes + bitmap_bytes;
-
-        /* Penalize speed: 40% efficiency for sequential-ish, 10% efficiency for
-         * scattered */
-        double write_speed_optimistic = speed_mb_s * 0.40;
-        double write_speed_pessimistic = speed_mb_s * 0.10;
-
-        double eta_min_sec =
-            ((double)total_meta_write_bytes / (1024.0 * 1024.0)) /
-            write_speed_optimistic;
-        double eta_max_sec =
-            ((double)total_meta_write_bytes / (1024.0 * 1024.0)) /
-            write_speed_pessimistic;
-
-        printf("  Phase 3 Write footprint:%.1f MB\n",
-               (double)total_meta_write_bytes / (1024.0 * 1024.0));
-        printf(
-            "\n  >> Estimated Real Conversion Time: %.0f to %.0f seconds <<\n",
-            eta_min_sec, eta_max_sec);
-      } else {
-        printf("  Benchmark failed to complete.\n");
-      }
+      const char *media = eta.device_rotational == 1
+                              ? "HDD"
+                              : (eta.device_rotational == 0 ? "SSD/NVMe"
+                                                            : "unknown");
+      printf("  Storage class:          %s\n", media);
+      printf("  Pass 1 (metadata read): %.1f s\n", eta.pass1_sec);
+      printf("  Pass 2 (relocation):    %.1f s (%lu MiB moved)\n",
+             eta.pass2_reloc_sec,
+             (unsigned long)((eta.pass2_read_bytes + eta.pass2_write_bytes) /
+                             (1024 * 1024)));
+      printf("  Pass 3 (ext4 write):    %.1f s (%lu MiB footprint)\n",
+             eta.pass3_write_sec,
+             (unsigned long)(eta.pass3_write_bytes / (1024 * 1024)));
+      printf("\n  >> Estimated conversion time: %.0f–%.0f seconds <<\n",
+             eta.total_min_sec, eta.total_max_sec);
     }
-    printf("==============================\n\n");
+    printf("================================\n\n");
   }
 
   /* ================================================

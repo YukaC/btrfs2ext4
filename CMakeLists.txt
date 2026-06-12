@@ -100,6 +100,7 @@ endif()
 # Source files
 set(BTRFS2EXT4_SOURCES
     src/main.c
+    src/conversion_eta.c
     src/device_io.c
     src/btrfs/checksum.c
     src/btrfs/superblock.c
@@ -167,6 +168,7 @@ enable_testing()
 
 # Shared source files (everything except main.c)
 set(BTRFS2EXT4_LIB_SOURCES
+    src/conversion_eta.c
     src/device_io.c
     src/btrfs/checksum.c
     src/btrfs/superblock.c

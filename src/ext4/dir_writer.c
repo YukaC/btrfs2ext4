@@ -15,6 +15,7 @@
 #include "device_io.h"
 #include "ext4/ext4_metadata_csum.h"
 #include "ext4/ext4_planner.h"
+#include "ext4/ext4_space.h"
 #include "ext4/ext4_structures.h"
 #include "ext4/ext4_writer.h"
 
@@ -438,12 +439,7 @@ int ext4_write_directories(struct device *dev, struct ext4_layout *layout,
      * Build directory blocks.
      * Support for multi-block directories via Ext4 HTree index (EXT4_INDEX_FL).
      */
-    uint32_t dir_size = 24;
-    for (uint32_t c = 0; c < dir->child_count; c++) {
-      uint8_t nl = (uint8_t)dir->children[c].name_len;
-      if (nl > 0)
-        dir_size += dir_entry_len(nl);
-    }
+    uint32_t dir_size = ext4_dir_logical_size(dir);
 
     int use_htree = (dir_size > block_size);
     if (use_htree) {
@@ -453,9 +449,8 @@ int ext4_write_directories(struct device *dev, struct ext4_layout *layout,
 
     /* Max ~260,000 blocks per directory (v1 2-Level HTree)
      * Start with a reasonable allocation and grow if needed. */
-    uint32_t max_dir_blocks = use_htree ? (dir_size / block_size + 10) : 1;
-    if (max_dir_blocks < 4)
-      max_dir_blocks = 4;
+    uint32_t max_dir_blocks =
+        use_htree ? ext4_htree_blocks_total(dir, block_size) : 1;
 
     uint64_t *dir_block_nums = calloc(max_dir_blocks, sizeof(uint64_t));
     uint8_t **dir_blocks = calloc(max_dir_blocks, sizeof(uint8_t *));
