@@ -13,7 +13,8 @@ struct convert_options {
   const char *workdir;      /* --workdir: path for temp files (default: pwd) */
   int dry_run;              /* 1 = simulate only, don't write */
   int verbose;              /* 1 = detailed output */
-  int rollback;             /* 1 = rollback a previous conversion */
+  int rollback;
+  int force;             /* 1 = rollback a previous conversion */
   int no_journal;           /* 1 = skip crash-recovery journal */
   uint32_t block_size;      /* ext4 block size (default 4096) */
   uint32_t inode_ratio;     /* bytes per inode (default 16384) */

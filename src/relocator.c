@@ -20,6 +20,7 @@
 #include "device_io.h"
 #include "ext4/ext4_planner.h"
 #include "mem_tracker.h"
+#include "migration_map.h"
 #include "relocator.h"
 
 /* CRC32C from superblock.c */
@@ -462,18 +463,40 @@ int relocator_plan(struct relocation_plan *plan,
   return 0;
 }
 
-/* ========================================================================
- * Relocation executor — with batched I/O and hash-based extent update
- * ======================================================================== */
-
+/* Relocation executor — batch checkpoints (Approach C) */
+static uint32_t read_checkpoint_interval(struct device *dev) {
+  struct migration_footer footer;
+  uint64_t bo = (dev->size - SUPERBLOCK_BACKUP_OFFSET) & ~4095ULL;
+  uint64_t fo = bo - MIGRATION_FOOTER_OFFSET;
+  if (device_read(dev, fo, &footer, sizeof(footer)) < 0)
+    return MIGRATION_DEFAULT_CHECKPOINT_INTERVAL;
+  if (memcmp(footer.magic, MIGRATION_MAGIC, 8) != 0)
+    return MIGRATION_DEFAULT_CHECKPOINT_INTERVAL;
+  return footer.checkpoint_interval ? footer.checkpoint_interval
+                                    : MIGRATION_DEFAULT_CHECKPOINT_INTERVAL;
+}
+static int maybe_flush_checkpoint(struct device *dev, struct relocation_plan *plan,
+    uint32_t *nent, uint64_t *nbytes, uint32_t interval) {
+  if (*nent < interval && *nbytes < MIGRATION_CHECKPOINT_BYTES)
+    return 0;
+  if (migration_map_flush_progress(dev, plan) < 0)
+    return -1;
+  *nent = 0;
+  *nbytes = 0;
+  return 0;
+}
 int relocator_execute(struct relocation_plan *plan, struct device *dev,
                       struct btrfs_fs_info *fs_info, uint32_t block_size) {
   if (plan->count == 0) {
     printf("No blocks need relocation.\n\n");
     return 0;
   }
-
-  printf("Executing %u block relocations...\n", plan->count);
+  uint32_t done0 = migration_map_completed_count(plan);
+  printf("Executing %u block relocations (%u already completed)...\n",
+         plan->count, done0);
+  uint32_t interval = read_checkpoint_interval(dev);
+  uint32_t since = 0;
+  uint64_t bytes_since = 0;
 
   /* Build extent hash for O(1) updates (#7) */
   struct extent_hash ehash;
@@ -498,6 +521,8 @@ int relocator_execute(struct relocation_plan *plan, struct device *dev,
 
   for (uint32_t i = 0; i < plan->count; i++) {
     struct relocation_entry *re = &plan->entries[i];
+    if (re->completed)
+      continue;
 
     uint64_t remaining = re->length;
     uint64_t current_src = re->src_offset;
@@ -539,8 +564,6 @@ int relocator_execute(struct relocation_plan *plan, struct device *dev,
       current_dst += chunk;
       remaining -= chunk;
     }
-
-    re->completed = 1;
 
     /* Update in-memory extent maps using hash (O(1) per block - supports CoW
      * dupes) */
@@ -604,18 +627,31 @@ int relocator_execute(struct relocation_plan *plan, struct device *dev,
       }
     }
 
-    /* Progress */
+    re->completed = 1;
+    since++;
+    bytes_since += re->length;
+    if (maybe_flush_checkpoint(dev, plan, &since, &bytes_since, interval) < 0) {
+      free(buf);
+      if (have_hash)
+        extent_hash_free(&ehash);
+      return -1;
+    }
     if ((i + 1) % 100 == 0 || i + 1 == plan->count) {
       printf("  Relocated %u/%u entries (%.1f%%)\n", i + 1, plan->count,
              100.0 * (i + 1) / plan->count);
     }
   }
-
+  if (since > 0 || bytes_since > 0) {
+    if (migration_map_flush_progress(dev, plan) < 0) {
+      free(buf);
+      if (have_hash)
+        extent_hash_free(&ehash);
+      return -1;
+    }
+  }
   free(buf);
   if (have_hash)
     extent_hash_free(&ehash);
-  device_sync(dev);
-
   printf("  Block relocation complete\n\n");
   return 0;
 }
