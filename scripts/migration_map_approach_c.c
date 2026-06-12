@@ -110,7 +110,9 @@ int migration_map_compute_layout(uint64_t dev_size, uint32_t entry_count,
     *map_offset = *footer_offset;
     return 0;
   }
-  *map_offset = ((*footer_offset - *map_size) + 4095ULL) & ~4095ULL;
+  if (*footer_offset < *map_size)
+    return -1;
+  *map_offset = (*footer_offset - *map_size) & ~4095ULL;
   if (*map_offset + *map_size > *footer_offset ||
       *map_offset + *map_size > dev_size)
     return -1;
