@@ -17,6 +17,7 @@
 #include "btrfs/btrfs_reader.h"
 #include "device_io.h"
 #include "ext4/ext4_planner.h"
+#include "ext4/ext4_space.h"
 #include "ext4/ext4_structures.h"
 #include "ext4/ext4_writer.h"
 
@@ -42,33 +43,6 @@ struct jbd2_superblock {
 _Static_assert(sizeof(struct jbd2_superblock) == 1024,
                "jbd2_superblock must be exactly 1024 bytes");
 
-/*
- * Default journal size heuristic (same as mke2fs):
- *   device < 512 MiB  →  4 MiB
- *   device < 1 GiB    → 16 MiB
- *   device < 2 GiB    → 32 MiB
- *   device < 4 GiB    → 64 MiB
- *   device >= 4 GiB   → 128 MiB
- */
-static uint32_t journal_default_blocks(uint64_t device_size,
-                                       uint32_t block_size) {
-  uint64_t mib = device_size / (1024 * 1024);
-  uint32_t journal_mib;
-
-  if (mib < 512)
-    journal_mib = 4;
-  else if (mib < 1024)
-    journal_mib = 16;
-  else if (mib < 2048)
-    journal_mib = 32;
-  else if (mib < 4096)
-    journal_mib = 64;
-  else
-    journal_mib = 128;
-
-  return (journal_mib * 1024 * 1024) / block_size;
-}
-
 /* Bug M fix: Replaced global state with per-invocation struct.
  * Previously g_journal_start_block / g_journal_block_count were static
  * globals that would keep stale values if the conversion was retried. */
@@ -79,7 +53,7 @@ int ext4_write_journal(struct device *dev, const struct ext4_layout *layout,
                        struct ext4_block_allocator *alloc,
                        uint64_t device_size) {
   uint32_t block_size = layout->block_size;
-  uint32_t journal_blocks = journal_default_blocks(device_size, block_size);
+  uint32_t journal_blocks = ext4_journal_default_blocks(device_size, block_size);
 
   /* Bug M fix: Reset globals before each invocation to avoid stale state */
   g_journal_start_block = 0;

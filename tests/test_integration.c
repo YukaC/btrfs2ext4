@@ -174,7 +174,8 @@ static uint16_t expected_gdt_csum(const struct ext4_super_block *sb,
 
 /* Construye un ext4_layout de prueba para TEST_IMG_SIZE */
 static int build_test_layout(struct ext4_layout *layout) {
-  return ext4_plan_layout(layout, TEST_IMG_SIZE, TEST_BLOCK_SIZE, 16384, NULL);
+  return ext4_plan_layout(NULL, TEST_IMG_SIZE, TEST_BLOCK_SIZE, 16384,
+                          EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, layout, NULL);
 }
 
 static int read_block_bitmap_bit(struct device *dev, const struct ext4_layout *layout, uint64_t block) {
@@ -690,8 +691,9 @@ static void test_tail_blocks_marked_used(void) {
           "no se pudo crear imagen");
 
   struct ext4_layout layout;
-  REQUIRE(ext4_plan_layout(&layout, odd_size, TEST_BLOCK_SIZE, 16384, NULL) ==
-              0,
+  REQUIRE(ext4_plan_layout(NULL, odd_size, TEST_BLOCK_SIZE, 16384,
+                           EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout,
+                           NULL) == 0,
           "planner falló");
 
   struct ext4_block_allocator alloc;
@@ -749,8 +751,9 @@ static void test_tail_boundary_exact_multiple(void) {
   struct ext4_layout layout;
   /* blocks_per_group estándar = 32768, usar justo 3 grupos */
   uint64_t exact_size = (uint64_t)32768 * 3 * TEST_BLOCK_SIZE;
-  REQUIRE(ext4_plan_layout(&layout, exact_size, TEST_BLOCK_SIZE, 16384, NULL) ==
-              0,
+  REQUIRE(ext4_plan_layout(NULL, exact_size, TEST_BLOCK_SIZE, 16384,
+                           EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout,
+                           NULL) == 0,
           "planner falló");
 
   uint32_t last_g = layout.num_groups - 1;
@@ -846,6 +849,27 @@ static void free_big_dir_fs(struct btrfs_fs_info *fs) {
     free(fs->chunk_map->entries);
     free(fs->chunk_map);
   }
+  free(fs);
+}
+
+static struct btrfs_fs_info *make_single_file_fs(uint64_t data_blocks) {
+  struct btrfs_fs_info *fs = calloc(1, sizeof(*fs));
+  fs->inode_count = 1;
+  fs->inode_table = calloc(1, sizeof(*fs->inode_table));
+  struct file_entry *fe = calloc(1, sizeof(*fe));
+  fe->ino = 256;
+  fe->mode = S_IFDIR | 0755;
+  fe->size = data_blocks * TEST_BLOCK_SIZE;
+  fs->inode_table[0] = fe;
+  return fs;
+}
+
+static void free_single_file_fs(struct btrfs_fs_info *fs) {
+  if (!fs)
+    return;
+  if (fs->inode_table && fs->inode_table[0])
+    free(fs->inode_table[0]);
+  free(fs->inode_table);
   free(fs);
 }
 
@@ -1008,8 +1032,9 @@ static void test_dir_huge_all_blocks_reachable(void) {
           "no se pudo crear imagen");
 
   struct ext4_layout layout;
-  REQUIRE(ext4_plan_layout(&layout, 256ULL * 1024 * 1024, TEST_BLOCK_SIZE,
-                           16384, NULL) == 0,
+  REQUIRE(ext4_plan_layout(NULL, 256ULL * 1024 * 1024, TEST_BLOCK_SIZE, 16384,
+                           EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout,
+                           NULL) == 0,
           "planner falló");
 
   struct btrfs_fs_info *fs = make_big_dir_fs(1000);
@@ -1605,8 +1630,9 @@ static void test_journal_zeroing_speed(void) {
           "no se pudo crear imagen");
 
   struct ext4_layout layout;
-  REQUIRE(ext4_plan_layout(&layout, 256ULL * 1024 * 1024, TEST_BLOCK_SIZE,
-                           16384, NULL) == 0,
+  REQUIRE(ext4_plan_layout(NULL, 256ULL * 1024 * 1024, TEST_BLOCK_SIZE, 16384,
+                           EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout,
+                           NULL) == 0,
           "planner falló");
 
   struct ext4_block_allocator alloc;
@@ -2766,6 +2792,76 @@ static void test_pass3_crash_each_step(void) {
 }
 
 /* =========================================================================
+ * GROUP N — Phase 4 Space Budget (Approach A)
+ * ======================================================================= */
+
+static void test_planner_journal_space_reject(void) {
+  TEST_START("T-4.1  planner: journal+data excede espacio libre");
+  const uint64_t dev_size = 32ULL * 1024 * 1024;
+  struct btrfs_fs_info *fs = make_single_file_fs(7000);
+  struct ext4_layout layout;
+  int ret = ext4_plan_layout(fs, dev_size, TEST_BLOCK_SIZE, 16384,
+                             EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout, NULL);
+  CHECK(ret < 0, "planner debió rechazar por journal+data sin margen");
+  free_single_file_fs(fs);
+  TEST_PASS();
+}
+
+static void test_planner_htree_budget(void) {
+  TEST_START("T-4.2  planner: directorio grande reserva HTree");
+  const uint64_t dev_size = 64ULL * 1024 * 1024;
+  struct btrfs_fs_info *fs = make_big_dir_fs(800);
+  struct ext4_layout layout;
+  struct ext4_space_budget budget;
+  REQUIRE(ext4_plan_layout(fs, dev_size, TEST_BLOCK_SIZE, 16384,
+                           EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout,
+                           &budget) == 0,
+          "plan");
+  CHECK(budget.htree_blocks > 0, "htree budget");
+  CHECK(layout.journal_start_block + layout.journal_blocks == layout.total_blocks,
+        "journal at tail");
+  ext4_free_layout(&layout);
+  free_big_dir_fs(fs);
+  TEST_PASS();
+}
+
+static void test_planner_dedup_budget(void) {
+  TEST_START("T-4.3  planner: dedup_blocks_needed en presupuesto");
+  const uint64_t dev_size = 32ULL * 1024 * 1024;
+  struct btrfs_fs_info *fs = calloc(1, sizeof(*fs));
+  fs->dedup_blocks_needed = 7000;
+  struct ext4_layout layout;
+  int ret = ext4_plan_layout(fs, dev_size, TEST_BLOCK_SIZE, 16384,
+                             EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout, NULL);
+  CHECK(ret < 0, "7000 dedup blocks debe rechazar");
+  fs->dedup_blocks_needed = 100;
+  memset(&layout, 0, sizeof(layout));
+  ret = ext4_plan_layout(fs, dev_size, TEST_BLOCK_SIZE, 16384,
+                         EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout, NULL);
+  CHECK(ret == 0, "100 dedup blocks debe pasar");
+  ext4_free_layout(&layout);
+  free(fs);
+  TEST_PASS();
+}
+
+static void test_planner_safety_margin(void) {
+  TEST_START("T-4.4  planner: margen 10%% rechaza conversion que pasa al 5%%");
+  const uint64_t dev_size = 64ULL * 1024 * 1024;
+  struct btrfs_fs_info *fs = make_single_file_fs(13000);
+  struct ext4_layout layout;
+  int ret5 = ext4_plan_layout(fs, dev_size, TEST_BLOCK_SIZE, 16384, 5, &layout,
+                              NULL);
+  CHECK(ret5 == 0, "debe pasar con margen 5%%");
+  ext4_free_layout(&layout);
+  int ret10 = ext4_plan_layout(fs, dev_size, TEST_BLOCK_SIZE, 16384, 10,
+                               &layout, NULL);
+  CHECK(ret10 < 0, "debe fallar con margen 10%%");
+  ext4_free_layout(&layout);
+  free_single_file_fs(fs);
+  TEST_PASS();
+}
+
+/* =========================================================================
  * Main
  * ======================================================================= */
 
@@ -2874,6 +2970,13 @@ int main(void) {
   test_emergency_no_markers();
   test_pass3_finalize_wipes_footer();
   test_pass3_crash_each_step();
+
+  printf("\n─── GROUP N: Phase 4 Space Budget (Approach A) "
+         "────────────────────────────\n");
+  test_planner_journal_space_reject();
+  test_planner_htree_budget();
+  test_planner_dedup_budget();
+  test_planner_safety_margin();
 
   /* GROUP K: Phase 2 extent tree metadata length */
   printf("\n─── GROUP K: Phase 2 Extent Tree (METADATA_ITEM) ────────────────────\n");

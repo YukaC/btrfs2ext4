@@ -571,7 +571,7 @@ static void test_planner_minimum_device(void) {
   TEST_START("Planner: minimum viable device (1 MiB)");
 
   struct ext4_layout layout;
-  int ret = ext4_plan_layout(&layout, 1 * 1024 * 1024, 4096, 16384, NULL);
+  int ret = ext4_plan_layout(NULL, 1 * 1024 * 1024, 4096, 16384, EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout, NULL);
   /* Should either succeed with 1 group or fail gracefully */
   if (ret == 0) {
     ASSERT_TRUE(layout.num_groups >= 1, "at least 1 group");
@@ -585,7 +585,7 @@ static void test_planner_tiny_device(void) {
   TEST_START("Planner: tiny device (4 KiB — too small)");
 
   struct ext4_layout layout;
-  int ret = ext4_plan_layout(&layout, 4096, 4096, 16384, NULL);
+  int ret = ext4_plan_layout(NULL, 4096, 4096, 16384, EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout, NULL);
   /* 4 KiB is too small for any valid ext4 — should fail */
   if (ret == 0) {
     ext4_free_layout(&layout);
@@ -599,7 +599,7 @@ static void test_planner_large_device(void) {
 
   struct ext4_layout layout;
   uint64_t size_16tb = 16ULL * 1024 * 1024 * 1024 * 1024;
-  int ret = ext4_plan_layout(&layout, size_16tb, 4096, 16384, NULL);
+  int ret = ext4_plan_layout(NULL, size_16tb, 4096, 16384, EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout, NULL);
 
   if (ret == 0) {
     /* Check for integer overflow in calculations */
@@ -617,7 +617,7 @@ static void test_planner_zero_size(void) {
   TEST_START("Planner: zero-size device");
 
   struct ext4_layout layout;
-  int ret = ext4_plan_layout(&layout, 0, 4096, 16384, NULL);
+  int ret = ext4_plan_layout(NULL, 0, 4096, 16384, EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout, NULL);
   ASSERT_TRUE(ret < 0, "zero size should fail");
   TEST_PASS();
 }
@@ -630,7 +630,7 @@ static void test_planner_block_sizes(void) {
 
   for (int i = 0; i < 3; i++) {
     struct ext4_layout layout;
-    int ret = ext4_plan_layout(&layout, dev_size, sizes[i], 16384, NULL);
+    int ret = ext4_plan_layout(NULL, dev_size, sizes[i], 16384, EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout, NULL);
     ASSERT_TRUE(ret == 0, "plan should succeed");
     ASSERT_TRUE(layout.block_size == sizes[i], "block size mismatch");
     ext4_free_layout(&layout);
@@ -1155,7 +1155,7 @@ static void bench_planner_large(void) {
   double t0 = now_seconds();
   struct ext4_layout layout;
   uint64_t size_1tb = 1ULL * 1024 * 1024 * 1024 * 1024;
-  int ret = ext4_plan_layout(&layout, size_1tb, 4096, 16384, NULL);
+  int ret = ext4_plan_layout(NULL, size_1tb, 4096, 16384, EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout, NULL);
   double t1 = now_seconds();
 
   if (ret == 0) {
@@ -1219,7 +1219,7 @@ static void test_overflow_block_count(void) {
   struct ext4_layout layout;
   /* Device just under 16 TiB (max for ext4 with 4K blocks) */
   uint64_t size = (uint64_t)UINT32_MAX * 4096ULL;
-  int ret = ext4_plan_layout(&layout, size, 4096, 16384, NULL);
+  int ret = ext4_plan_layout(NULL, size, 4096, 16384, EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout, NULL);
   /* Must not crash, regardless of success/failure */
   if (ret == 0) {
     printf("(%u groups) ", layout.num_groups);
@@ -1232,7 +1232,7 @@ static void test_overflow_huge_inode_ratio(void) {
   TEST_START("Overflow: inode ratio = 1 (inode per byte)");
 
   struct ext4_layout layout;
-  int ret = ext4_plan_layout(&layout, 256 * 1024 * 1024, 4096, 1, NULL);
+  int ret = ext4_plan_layout(NULL, 256 * 1024 * 1024, 4096, 1, EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout, NULL);
   /* Ratio of 1 means 1 inode per byte = 256M inodes.
    * Should either succeed with massive inode table or fail gracefully */
   if (ret == 0) {
@@ -1246,8 +1246,8 @@ static void test_overflow_max_inode_ratio(void) {
   TEST_START("Overflow: inode ratio = UINT32_MAX");
 
   struct ext4_layout layout;
-  int ret = ext4_plan_layout(&layout, 1ULL * 1024 * 1024 * 1024, 4096,
-                             UINT32_MAX, NULL);
+  int ret = ext4_plan_layout(NULL, 1ULL * 1024 * 1024 * 1024, 4096, UINT32_MAX,
+                             EXT4_DEFAULT_SAFETY_MARGIN_PERCENT, &layout, NULL);
   /* Huge ratio = very few inodes. Should succeed. */
   if (ret == 0) {
     printf("(%u inodes) ", layout.total_inodes);

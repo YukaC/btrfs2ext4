@@ -45,6 +45,7 @@ static void print_usage(const char *prog) {
       "  -w, --workdir <path>    Working directory for temp files (default: "
       "cwd)\n"
       "  -m, --memory-limit N    Max RAM in MB (0=auto 60%% of physical)\n"
+      "      --safety-margin N   Free-space headroom %% for planner (1-25, default 5)\n"
       "  -h, --help              Show this help\n"
       "  -V, --version           Show version\n"
       "\n"
@@ -334,8 +335,10 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   if (progress)
     progress("Pass 2", 0, "Planning ext4 st.layout...");
 
-  if (ext4_plan_layout(&st.layout, st.dev.size, opts->block_size, opts->inode_ratio,
-                       &st.fs_info) < 0) {
+  struct ext4_space_budget space_budget;
+  if (ext4_plan_layout(&st.fs_info, st.dev.size, opts->block_size,
+                       opts->inode_ratio, opts->safety_margin_percent, &st.layout,
+                       &space_budget) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to plan ext4 layout\n");
     goto cleanup;
   }
@@ -409,64 +412,42 @@ int btrfs2ext4_convert(const struct convert_options *opts,
              ? " (mmap WILL BE USED)"
              : " (in-memory)");
 
-  uint64_t expansion =
-      st.fs_info.compressed_extent_count > 0
-          ? (st.fs_info.total_decompressed_bytes - st.fs_info.total_compressed_bytes)
-          : 0;
-  uint64_t expansion_blocks =
-      (expansion + st.layout.block_size - 1) / st.layout.block_size;
-
-  /* Count available data blocks */
-  uint64_t free_data_blocks = 0;
-  for (uint32_t g = 0; g < st.layout.num_groups; g++) {
-    free_data_blocks += st.layout.groups[g].data_blocks;
+  printf("  Data blocks required:   %u blocks (%.1f MiB)\n",
+         space_budget.data_blocks,
+         (double)space_budget.data_blocks * st.layout.block_size /
+             (1024.0 * 1024.0));
+  printf("  Journal reservation:    %u blocks (%.1f MiB)\n",
+         space_budget.journal_blocks,
+         (double)space_budget.journal_blocks * st.layout.block_size /
+             (1024.0 * 1024.0));
+  printf("  HTree reservation:      %u blocks (%.1f MiB)\n",
+         space_budget.htree_blocks,
+         (double)space_budget.htree_blocks * st.layout.block_size /
+             (1024.0 * 1024.0));
+  printf("  Dedup/CoW expansion:    %u blocks (%.1f MiB)\n",
+         space_budget.dedup_blocks,
+         (double)space_budget.dedup_blocks * st.layout.block_size /
+             (1024.0 * 1024.0));
+  printf("  Metadata reserved:      %u blocks\n",
+         space_budget.metadata_blocks);
+  printf("  Safety margin (%u%%):    %u blocks (%.1f MiB)\n",
+         st.layout.safety_margin_percent, space_budget.safety_margin_blocks,
+         (double)space_budget.safety_margin_blocks * st.layout.block_size /
+             (1024.0 * 1024.0));
+  {
+    uint64_t physically_usable =
+        st.layout.total_blocks > space_budget.metadata_blocks
+            ? st.layout.total_blocks - space_budget.metadata_blocks
+            : 0;
+    uint64_t slack = physically_usable > space_budget.total_required
+                         ? physically_usable - space_budget.total_required -
+                               space_budget.safety_margin_blocks
+                         : 0;
+    printf("  Space viability check:  OK (%.1f%% headroom after margin)\n",
+           physically_usable > 0
+               ? (double)slack * 100.0 / (double)physically_usable
+               : 0.0);
   }
-
-  /* Subtract blocks already used by existing data */
-  uint64_t used_data_blocks = 0;
-  for (uint32_t i = 0; i < st.fs_info.inode_count; i++) {
-    const struct file_entry *fe = st.fs_info.inode_table[i];
-    for (uint32_t j = 0; j < fe->extent_count; j++) {
-      if (fe->extents[j].type != BTRFS_FILE_EXTENT_INLINE &&
-          fe->extents[j].type != BTRFS_FILE_EXTENT_PREALLOC &&
-          fe->extents[j].disk_bytenr != 0) {
-        used_data_blocks +=
-            (fe->extents[j].disk_num_bytes + st.layout.block_size - 1) /
-            st.layout.block_size;
-      }
-    }
-  }
-
-  uint64_t available = free_data_blocks > used_data_blocks
-                           ? free_data_blocks - used_data_blocks
-                           : 0;
-
-  uint64_t dedup_bytes = st.fs_info.dedup_blocks_needed * st.layout.block_size;
-  uint64_t total_needed = expansion_blocks + st.fs_info.dedup_blocks_needed;
-
-  printf("  Decompression Expansion:%lu blocks (%.1f MiB)\n",
-         (unsigned long)expansion_blocks,
-         (double)expansion / (1024.0 * 1024.0));
-  printf("  CoW Physical Cloning:   %lu extra blocks (%.1f MiB)\n",
-         (unsigned long)st.fs_info.dedup_blocks_needed,
-         (double)dedup_bytes / (1024.0 * 1024.0));
-  printf("  Available Data Blocks:  %lu blocks (%.1f MiB)\n",
-         (unsigned long)available,
-         (double)available * st.layout.block_size / (1024.0 * 1024.0));
-
-  if (total_needed > available) {
-    fprintf(stderr,
-            "\nbtrfs2ext4: FATAL — Insufficient free space for conversion!\n"
-            "  Need %lu additional blocks but only %lu are free.\n"
-            "  Please free up at least %.1f MiB before retrying.\n\n",
-            (unsigned long)total_needed, (unsigned long)available,
-            (double)(total_needed - available) * st.layout.block_size /
-                (1024.0 * 1024.0));
-    goto cleanup;
-  }
-  printf("  Space viability check:  OK (%.1f%% headroom)\n",
-         available > 0 ? (double)(available - total_needed) * 100.0 / available
-                       : 0.0);
   printf("===================================================\n\n");
 
   /* ================================================
@@ -807,6 +788,7 @@ int main(int argc, char **argv) {
   memset(&opts, 0, sizeof(opts));
   opts.block_size = 4096;
   opts.inode_ratio = 16384;
+  opts.safety_margin_percent = EXT4_DEFAULT_SAFETY_MARGIN_PERCENT;
 
   static struct option long_options[] = {
       {"dry-run", no_argument, NULL, 'n'},
@@ -818,6 +800,7 @@ int main(int argc, char **argv) {
       {"force", no_argument, NULL, 'f'},
       {"workdir", required_argument, NULL, 'w'},
       {"memory-limit", required_argument, NULL, 'm'},
+      {"safety-margin", required_argument, NULL, 1002},
       {"help", no_argument, NULL, 'h'},
       {"version", no_argument, NULL, 'V'},
       {NULL, 0, NULL, 0}};
@@ -859,6 +842,18 @@ int main(int argc, char **argv) {
     case 'm':
       opts.memory_limit_mb = (uint32_t)atoi(optarg);
       break;
+    case 1002: {
+      int margin = atoi(optarg);
+      if (margin < EXT4_MIN_SAFETY_MARGIN_PERCENT ||
+          margin > EXT4_MAX_SAFETY_MARGIN_PERCENT) {
+        fprintf(stderr,
+                "Invalid safety margin %d (must be %d-%d)\n", margin,
+                EXT4_MIN_SAFETY_MARGIN_PERCENT, EXT4_MAX_SAFETY_MARGIN_PERCENT);
+        return 1;
+      }
+      opts.safety_margin_percent = (uint8_t)margin;
+      break;
+    }
     case 'h':
       print_usage(argv[0]);
       return 0;

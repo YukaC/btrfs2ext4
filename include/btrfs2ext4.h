@@ -20,6 +20,7 @@ struct convert_options {
   uint32_t block_size;      /* ext4 block size (default 4096) */
   uint32_t inode_ratio;     /* bytes per inode (default 16384) */
   uint32_t memory_limit_mb; /* --memory-limit: max RAM MB (0=auto) */
+  uint8_t safety_margin_percent; /* --safety-margin: free-space headroom (1-25) */
 };
 
 /* Conversion progress callback */

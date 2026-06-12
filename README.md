@@ -130,6 +130,7 @@ btrfs2ext4 [options] <device>
 | `-i N`, `--inode-ratio N`    | Bytes-per-inode ratio (default: 16384)             |
 | `-w PATH`, `--workdir PATH`  | Directory for mmap() swap files (default: ./)      |
 | `-m LIMIT`, `--memory-limit` | Memory threshold for mmap, in bytes or `%`         |
+| `--safety-margin N`          | Planner free-space headroom % (1–25, default 5)    |
 | `-r`, `--rollback`           | Restore original Btrfs superblock from backup      |
 | `-V`, `--version`            | Print version                                      |
 | `-h`, `--help`               | Print help                                         |
