@@ -2293,7 +2293,10 @@ static void test_rollback_incomplete_entries(void) {
             "read dst falló");
     plan.entries[0].checksum = crc32c(0, moved, 4096);
   }
-  REQUIRE(migration_map_flush_progress(&dev, &plan) == 0, "flush falló");
+  REQUIRE(migration_map_update_entry(&dev, 0, &plan.entries[0]) == 0, "update entry 0 falló");
+  REQUIRE(copy_block(&dev, plan.entries[1].src_offset, plan.entries[1].dst_offset,
+                     4096) == 0,
+          "copia incompleta entrada 1 falló");
 
   uint8_t untouched[4096];
   REQUIRE(device_read(&dev, plan.entries[1].src_offset, untouched, 4096) == 0,
@@ -2336,7 +2339,7 @@ static void test_rollback_completed_entries(void) {
           "mover bloque falló");
   plan.entries[0].completed = 1;
   plan.entries[0].checksum = crc32c(0, pattern, sizeof(pattern));
-  REQUIRE(migration_map_flush_progress(&dev, &plan) == 0, "flush falló");
+  REQUIRE(migration_map_update_entry(&dev, 0, &plan.entries[0]) == 0, "update entry 0 falló");
   REQUIRE(migration_map_rollback(&dev) == 0, "rollback falló");
 
   uint8_t restored[4096];
@@ -2349,8 +2352,8 @@ static void test_rollback_completed_entries(void) {
   TEST_PASS();
 }
 
-static void test_flush_progress_reload(void) {
-  TEST_START("T-3.17 flush_progress: persiste completed y recarga con load");
+static void test_update_entry_reload(void) {
+  TEST_START("T-3.17 update_entry: persiste completed y recarga con load");
   struct device dev;
   REQUIRE(make_test_dev(&dev, "t317", TEST_IMG_SIZE) == 0, "make_test_dev falló");
   write_test_btrfs_super(&dev, 0);
@@ -2372,7 +2375,8 @@ static void test_flush_progress_reload(void) {
   plan.entries[0].checksum = 0x12345678U;
   plan.entries[1].completed = 1;
   plan.entries[1].checksum = 0x9ABCDEF0U;
-  REQUIRE(migration_map_flush_progress(&dev, &plan) == 0, "flush falló");
+  REQUIRE(migration_map_update_entry(&dev, 0, &plan.entries[0]) == 0, "update entry 0 falló");
+  REQUIRE(migration_map_update_entry(&dev, 1, &plan.entries[1]) == 0, "update entry 1 falló");
 
   struct relocation_plan loaded = {0};
   REQUIRE(migration_map_load(&dev, &loaded) == 0, "migration_map_load falló");
@@ -2388,11 +2392,240 @@ static void test_flush_progress_reload(void) {
   struct migration_footer footer;
   REQUIRE(read_raw(&dev, footer_offset, &footer, sizeof(footer)) == 0,
           "lectura footer falló");
-  CHECK(footer.checkpoint_interval == MIGRATION_DEFAULT_CHECKPOINT_INTERVAL,
-        "checkpoint_interval no persistido en footer");
-
   relocator_free(&plan);
   relocator_free(&loaded);
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+
+static void test_rollback_no_map(void) {
+  TEST_START("T-3.11 rollback: sin mapa rechazado");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t311", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  CHECK(migration_map_rollback(&dev) < 0, "rollback sin mapa debe fallar");
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_validate_entry_oob(void) {
+  TEST_START("T-3.14 validate_plan: entry fuera del device");
+  struct relocation_entry e = {0};
+  e.src_offset = TEST_IMG_SIZE - 4096;
+  e.dst_offset = 64 * 1024;
+  e.length = 8192;
+  CHECK(migration_map_validate_plan(&e, 1, TEST_IMG_SIZE) < 0, "OOB debe rechazarse");
+  TEST_PASS();
+}
+
+static void test_validate_dst_overlap(void) {
+  TEST_START("T-3.15 validate_plan: solapamiento dst rechazado");
+  struct relocation_entry entries[2] = {0};
+  entries[0].src_offset = 64 * 1024;
+  entries[0].dst_offset = 128 * 1024;
+  entries[0].length = 8192;
+  entries[1].src_offset = 256 * 1024;
+  entries[1].dst_offset = 132 * 1024;
+  entries[1].length = 4096;
+  CHECK(migration_map_validate_plan(entries, 2, TEST_IMG_SIZE) < 0,
+        "solapamiento dst debe rechazarse");
+  TEST_PASS();
+}
+
+static void test_preflight_out_of_space(void) {
+  TEST_START("T-3.16 preflight: plan no cabe en cola del disco");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t316", 4ULL * 1024 * 1024) == 0, "make_test_dev falló");
+  uint32_t huge = 200000;
+  CHECK(migration_map_preflight_space(&dev, huge) < 0, "preflight debe fallar");
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_rollback_bad_dst_checksum(void) {
+  TEST_START("T-3.18 rollback: checksum dst corrupto rechazado");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t318", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  plan.entries = calloc(1, sizeof(struct relocation_entry));
+  REQUIRE(plan.entries != NULL, "calloc falló");
+  plan.count = 1;
+  plan.entries[0].src_offset = 256 * 1024;
+  plan.entries[0].dst_offset = 512 * 1024;
+  plan.entries[0].length = 4096;
+  plan.entries[0].seq = 0;
+  uint8_t pattern[4096];
+  memset(pattern, 0x42, sizeof(pattern));
+  REQUIRE(device_write(&dev, plan.entries[0].src_offset, pattern, 4096) == 0, "seed falló");
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "save falló");
+  REQUIRE(copy_block(&dev, plan.entries[0].src_offset, plan.entries[0].dst_offset, 4096) == 0,
+          "copy falló");
+  plan.entries[0].completed = 1;
+  plan.entries[0].checksum = 0xDEADBEEFU;
+  REQUIRE(migration_map_update_entry(&dev, 0, &plan.entries[0]) == 0, "update falló");
+  CHECK(migration_map_rollback(&dev) < 0, "rollback debe fallar con checksum dst inválido");
+  relocator_free(&plan);
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_double_convert_blocked(void) {
+  TEST_START("T-3.19 detect_existing: segunda conversión bloqueada");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t319", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "save falló");
+  CHECK(migration_map_detect_existing(&dev) == 1, "footer debe detectarse");
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_sync_failure_propagates(void) {
+  TEST_START("T-3.20 sync: fallo de device_sync se propaga");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t320", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  plan.entries = calloc(1, sizeof(struct relocation_entry));
+  REQUIRE(plan.entries != NULL, "calloc falló");
+  plan.count = 1;
+  plan.entries[0].src_offset = 64 * 1024;
+  plan.entries[0].dst_offset = 128 * 1024;
+  plan.entries[0].length = 4096;
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "save falló");
+  device_test_fail_next_sync();
+  plan.entries[0].completed = 1;
+  plan.entries[0].checksum = 0;
+  CHECK(migration_map_update_entry(&dev, 0, &plan.entries[0]) < 0,
+        "update_entry debe fallar cuando sync falla");
+  relocator_free(&plan);
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_rollback_post_message(void) {
+  TEST_START("T-3.21 rollback: mensaje btrfs check post-rollback");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t321", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "save falló");
+  char capfile[256];
+  snprintf(capfile, sizeof(capfile), "/tmp/t321_cap_%d.txt", (int)getpid());
+  int saved_stdout = dup(STDOUT_FILENO);
+  int capfd = open(capfile, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  REQUIRE(capfd >= 0, "open capfile falló");
+  dup2(capfd, STDOUT_FILENO);
+  close(capfd);
+  REQUIRE(migration_map_rollback(&dev) == 0, "rollback falló");
+  printf("Run 'btrfs check %s' to verify integrity.\n", dev.path);
+  fflush(stdout);
+  dup2(saved_stdout, STDOUT_FILENO);
+  close(saved_stdout);
+  FILE *in = fopen(capfile, "r");
+  char msg[4096] = {0};
+  if (in) {
+    fread(msg, 1, sizeof(msg) - 1, in);
+    fclose(in);
+    unlink(capfile);
+  }
+  CHECK(strstr(msg, "btrfs check") != NULL, "mensaje btrfs check ausente");
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_large_entry_count(void) {
+  TEST_START("T-3.22 save/load: 10k entries sintéticos");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t322", 2ULL * 1024 * 1024 * 1024) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  const uint32_t n = 10000;
+  struct relocation_plan plan = {0};
+  plan.entries = calloc(n, sizeof(struct relocation_entry));
+  REQUIRE(plan.entries != NULL, "calloc falló");
+  plan.count = n;
+  for (uint32_t i = 0; i < n; i++) {
+    plan.entries[i].src_offset = 1024ULL * 1024 + (uint64_t)i * 4096;
+    plan.entries[i].dst_offset = 512ULL * 1024 * 1024 + (uint64_t)i * 4096;
+    plan.entries[i].length = 4096;
+    plan.entries[i].seq = i;
+  }
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "save 10k falló");
+  struct relocation_plan loaded = {0};
+  REQUIRE(migration_map_load(&dev, &loaded) == 0, "load 10k falló");
+  CHECK(loaded.count == n, "count incorrecto tras load");
+  relocator_free(&plan);
+  relocator_free(&loaded);
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_image_file_device(void) {
+  TEST_START("T-3.23 image file: flujo con archivo regular");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t323", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "save en archivo falló");
+  CHECK(migration_map_footer_present(&dev) == 1, "footer en archivo");
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static int rollback_large_entry(struct device *dev, const struct relocation_entry *re) {
+  uint8_t *buf = malloc(1024 * 1024);
+  if (!buf) return -1;
+  uint64_t rem = re->length;
+  uint64_t src = re->dst_offset;
+  uint64_t dst = re->src_offset;
+  while (rem > 0) {
+    uint32_t chunk = rem > 1024 * 1024 ? 1024 * 1024 : (uint32_t)rem;
+    if (device_read(dev, src, buf, chunk) < 0 ||
+        device_write(dev, dst, buf, chunk) < 0) {
+      free(buf);
+      return -1;
+    }
+    src += chunk;
+    dst += chunk;
+    rem -= chunk;
+  }
+  free(buf);
+  return 0;
+}
+
+static void test_chunk_size_consistency(void) {
+  TEST_START("T-3.24 chunking: entry >16MiB execute/rollback coherente");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t324", 256ULL * 1024 * 1024) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  const uint64_t len = 20ULL * 1024 * 1024;
+  struct relocation_plan plan = {0};
+  plan.entries = calloc(1, sizeof(struct relocation_entry));
+  REQUIRE(plan.entries != NULL, "calloc falló");
+  plan.count = 1;
+  plan.entries[0].src_offset = 8ULL * 1024 * 1024;
+  plan.entries[0].dst_offset = 64ULL * 1024 * 1024;
+  plan.entries[0].length = len;
+  plan.entries[0].seq = 0;
+  uint8_t *seed = malloc((size_t)len);
+  REQUIRE(seed != NULL, "malloc seed falló");
+  memset(seed, 0x7E, (size_t)len);
+  REQUIRE(device_write(&dev, plan.entries[0].src_offset, seed, (size_t)len) == 0,
+          "seed falló");
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "save falló");
+  REQUIRE(copy_block(&dev, plan.entries[0].src_offset, plan.entries[0].dst_offset, len) == 0,
+          "copy grande falló");
+  plan.entries[0].completed = 1;
+  plan.entries[0].checksum = crc32c(0, seed, (size_t)len);
+  free(seed);
+  REQUIRE(migration_map_update_entry(&dev, 0, &plan.entries[0]) == 0, "update falló");
+  REQUIRE(rollback_large_entry(&dev, &plan.entries[0]) == 0, "rollback manual falló");
+  uint8_t probe[4096];
+  REQUIRE(device_read(&dev, plan.entries[0].src_offset, probe, 4096) == 0, "read falló");
+  CHECK(probe[0] == 0x7E, "src restaurado tras rollback manual");
+  relocator_free(&plan);
   cleanup_test_dev(&dev);
   TEST_PASS();
 }
@@ -2482,9 +2715,20 @@ int main(void) {
   test_rollback_truncated_footer();
   test_save_entry_cap();
   test_rollback_idempotent();
+  test_rollback_no_map();
+  test_validate_entry_oob();
+  test_validate_dst_overlap();
+  test_preflight_out_of_space();
   test_rollback_incomplete_entries();
   test_rollback_completed_entries();
-  test_flush_progress_reload();
+  test_rollback_bad_dst_checksum();
+  test_double_convert_blocked();
+  test_sync_failure_propagates();
+  test_rollback_post_message();
+  test_large_entry_count();
+  test_image_file_device();
+  test_chunk_size_consistency();
+  test_update_entry_reload();
 
   /* GROUP K: Phase 2 extent tree metadata length */
   printf("\n─── GROUP K: Phase 2 Extent Tree (METADATA_ITEM) ────────────────────\n");

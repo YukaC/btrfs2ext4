@@ -40,6 +40,7 @@ static void print_usage(const char *prog) {
       "  -b, --block-size N      Set ext4 block size (default: 4096)\n"
       "  -i, --inode-ratio N     Set inode ratio (default: 16384)\n"
       "  -r, --rollback          Rollback a previous conversion\n"
+      "  -f, --force             Resume conversion with existing migration map\n"
       "  -w, --workdir <path>    Working directory for temp files (default: "
       "cwd)\n"
       "  -m, --memory-limit N    Max RAM in MB (0=auto 60%% of physical)\n"
@@ -305,6 +306,13 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   printf("Device: %s (%.1f GiB)\n\n", opts->device_path,
          (double)st.dev.size / (1024.0 * 1024.0 * 1024.0));
 
+  if (!opts->dry_run && migration_map_detect_existing(&st.dev) > 0 &&
+      !opts->force) {
+    fprintf(stderr,
+            "btrfs2ext4: existing migration map — use --rollback or --force\n");
+    goto cleanup;
+  }
+
   /* ================================================
    * PASS 1: Read Btrfs metadata
    * ================================================ */
@@ -345,31 +353,40 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   }
 
   if (!opts->dry_run) {
-    if (progress)
-      progress("Pass 2", 60, "Saving migration map and btrfs backup...");
-
-    /* plan.v1 fix: Save migration map UNCONDITIONALLY (even when count=0).
-     * This ensures a rollback checkpoint exists before Pass 3 writes begin,
-     * even if no blocks needed relocation. Without this, a crash during
-     * Pass 3 would leave the filesystem in an unrecoverable state. */
-    if (migration_map_save(&st.dev, &st.reloc_plan) < 0) {
-      fprintf(stderr, "btrfs2ext4: failed to save migration map (aborting to "
-                      "prevent data loss)\n");
-      goto cleanup;
+    int resuming =
+        migration_map_detect_existing(&st.dev) > 0 && opts->force;
+    if (resuming) {
+      relocator_free(&st.reloc_plan);
+      if (migration_map_load(&st.dev, &st.reloc_plan) < 0) {
+        fprintf(stderr, "btrfs2ext4: failed to load migration map\n");
+        goto cleanup;
+      }
+    } else if (st.reloc_plan.count > 0) {
+      if (migration_map_validate_plan(st.reloc_plan.entries,
+                                      st.reloc_plan.count, st.dev.size) < 0 ||
+          migration_map_preflight_space(&st.dev, st.reloc_plan.count) < 0) {
+        fprintf(stderr, "btrfs2ext4: migration plan validation failed\n");
+        goto cleanup;
+      }
     }
-
+    if (!resuming) {
+      if (progress)
+        progress("Pass 2", 60, "Saving migration map and btrfs backup...");
+      if (migration_map_save(&st.dev, &st.reloc_plan) < 0) {
+        fprintf(stderr, "btrfs2ext4: failed to save migration map\n");
+        goto cleanup;
+      }
+    }
     if (st.reloc_plan.count > 0) {
       if (!check_battery_safe()) {
         fprintf(stderr,
                 "btrfs2ext4: aborting block relocation — unsafe power state\n");
         goto cleanup;
       }
-
       if (progress)
         progress("Pass 2", 70, "Relocating conflicting blocks...");
-
-      if (relocator_execute(&st.reloc_plan, &st.dev, &st.fs_info, st.layout.block_size) <
-          0) {
+      if (relocator_execute(&st.reloc_plan, &st.dev, &st.fs_info,
+                            st.layout.block_size) < 0) {
         fprintf(stderr, "btrfs2ext4: block relocation failed!\n");
         goto cleanup;
       }
@@ -749,6 +766,7 @@ int main(int argc, char **argv) {
       {"block-size", required_argument, NULL, 'b'},
       {"inode-ratio", required_argument, NULL, 'i'},
       {"rollback", no_argument, NULL, 'r'},
+      {"force", no_argument, NULL, 'f'},
       {"workdir", required_argument, NULL, 'w'},
       {"memory-limit", required_argument, NULL, 'm'},
       {"help", no_argument, NULL, 'h'},
@@ -756,7 +774,7 @@ int main(int argc, char **argv) {
       {NULL, 0, NULL, 0}};
 
   int opt;
-  while ((opt = getopt_long(argc, argv, "nvb:i:rw:m:hV", long_options, NULL)) !=
+  while ((opt = getopt_long(argc, argv, "nvb:i:rfw:m:hV", long_options, NULL)) !=
          -1) {
     switch (opt) {
     case 'n':
@@ -779,6 +797,9 @@ int main(int argc, char **argv) {
       break;
     case 'r':
       opts.rollback = 1;
+      break;
+    case 'f':
+      opts.force = 1;
       break;
     case 'w':
       opts.workdir = optarg;

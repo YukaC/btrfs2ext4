@@ -14,6 +14,7 @@ struct convert_options {
   int dry_run;              /* 1 = simulate only, don't write */
   int verbose;              /* 1 = detailed output */
   int rollback;             /* 1 = rollback a previous conversion */
+  int force;                /* 1 = resume conversion with existing map */
   int no_journal;           /* 1 = skip crash-recovery journal */
   uint32_t block_size;      /* ext4 block size (default 4096) */
   uint32_t inode_ratio;     /* bytes per inode (default 16384) */

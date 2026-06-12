@@ -20,6 +20,7 @@
 #include "device_io.h"
 #include "ext4/ext4_planner.h"
 #include "mem_tracker.h"
+#include "migration_map.h"
 #include "relocator.h"
 
 /* CRC32C from superblock.c */
@@ -473,7 +474,9 @@ int relocator_execute(struct relocation_plan *plan, struct device *dev,
     return 0;
   }
 
-  printf("Executing %u block relocations...\n", plan->count);
+  uint32_t done0 = migration_map_completed_count(plan);
+  printf("Executing %u block relocations (%u already completed)...\n",
+         plan->count, done0);
 
   /* Build extent hash for O(1) updates (#7) */
   struct extent_hash ehash;
@@ -498,6 +501,8 @@ int relocator_execute(struct relocation_plan *plan, struct device *dev,
 
   for (uint32_t i = 0; i < plan->count; i++) {
     struct relocation_entry *re = &plan->entries[i];
+    if (re->completed)
+      continue;
 
     uint64_t remaining = re->length;
     uint64_t current_src = re->src_offset;
@@ -539,8 +544,6 @@ int relocator_execute(struct relocation_plan *plan, struct device *dev,
       current_dst += chunk;
       remaining -= chunk;
     }
-
-    re->completed = 1;
 
     /* Update in-memory extent maps using hash (O(1) per block - supports CoW
      * dupes) */
@@ -604,17 +607,22 @@ int relocator_execute(struct relocation_plan *plan, struct device *dev,
       }
     }
 
-    /* Progress */
-    if ((i + 1) % 100 == 0 || i + 1 == plan->count) {
-      printf("  Relocated %u/%u entries (%.1f%%)\n", i + 1, plan->count,
-             100.0 * (i + 1) / plan->count);
+    re->completed = 1;
+    if (migration_map_update_entry(dev, i, re) < 0) {
+      free(buf);
+      if (have_hash)
+        extent_hash_free(&ehash);
+      return -1;
     }
+
+    uint32_t completed = migration_map_completed_count(plan);
+    printf("Pass 2: entry=%u/%u completed=%u\n", i + 1, plan->count,
+           completed);
   }
 
   free(buf);
   if (have_hash)
     extent_hash_free(&ehash);
-  device_sync(dev);
 
   printf("  Block relocation complete\n\n");
   return 0;
