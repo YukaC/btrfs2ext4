@@ -214,7 +214,7 @@ struct convert_state {
   struct inode_map ino_map;
   struct ext4_block_allocator alloc;
   int alloc_initialized;
-  struct adaptive_mem_config mem_cfg;
+  struct mem_config mem_cfg;
   int ret;
 };
 
@@ -247,60 +247,9 @@ int btrfs2ext4_convert(const struct convert_options *opts,
     printf("*** DRY RUN MODE — no changes will be written ***\n\n");
   }
 
-  /* ================================================
-   * Adaptive Memory Detection (production-grade)
-   * ================================================ */
-  long pages = sysconf(_SC_PHYS_PAGES);
-  long page_size = sysconf(_SC_PAGE_SIZE);
-  if (pages > 0 && page_size > 0) {
-    st.mem_cfg.total_ram = (uint64_t)pages * (uint64_t)page_size;
-  } else {
-    st.mem_cfg.total_ram = 2ULL * 1024 * 1024 * 1024; /* fallback: 2GB */
-  }
-
-  long avail_pages = sysconf(_SC_AVPHYS_PAGES);
-  if (avail_pages > 0 && page_size > 0) {
-    st.mem_cfg.available_ram = (uint64_t)avail_pages * (uint64_t)page_size;
-  } else {
-    st.mem_cfg.available_ram = st.mem_cfg.total_ram / 2;
-  }
-
-  if (opts->memory_limit_mb > 0) {
-    st.mem_cfg.mmap_threshold = (uint64_t)opts->memory_limit_mb * 1024 * 1024;
-  } else {
-    /* Auto: 60% of total physical RAM */
-    st.mem_cfg.mmap_threshold = st.mem_cfg.total_ram * 60 / 100;
-  }
-
-  st.mem_cfg.workdir = opts->workdir ? opts->workdir : ".";
-
-  /* tmpfs safety check: prevent creating swap files on RAM-backed fs */
-  struct statfs sfs;
-  if (statfs(st.mem_cfg.workdir, &sfs) == 0) {
-    /* tmpfs magic = 0x01021994 */
-    if (sfs.f_type == 0x01021994) {
-      st.mem_cfg.workdir_is_tmpfs = 1;
-      fprintf(stderr,
-              "\n[WARNING] --workdir '%s' is mounted on tmpfs (RAM-backed).\n"
-              "  Creating temp swap files here defeats the purpose of mmap!\n"
-              "  Use a physical disk path instead.\n\n",
-              st.mem_cfg.workdir);
-    }
-  }
-
-  printf("[INFO] RAM detected:     %.1f GiB total, %.1f GiB available\n",
-         (double)st.mem_cfg.total_ram / (1024.0 * 1024.0 * 1024.0),
-         (double)st.mem_cfg.available_ram / (1024.0 * 1024.0 * 1024.0));
-  printf("[INFO] mmap threshold:   %.0f MiB%s\n",
-         (double)st.mem_cfg.mmap_threshold / (1024.0 * 1024.0),
-         opts->memory_limit_mb > 0 ? " (user-configured)" : " (auto: 60%%)");
-  printf("[INFO] Temp file dir:    %s%s\n\n", st.mem_cfg.workdir,
-         st.mem_cfg.workdir_is_tmpfs ? " [tmpfs WARNING]" : "");
-
-  /* Inicializar el tracker de memoria global antes de que otras
-   * estructuras opcionales (hashes grandes, bloom filters, etc.)
-   * empiecen a llamar a mem_track_exceeded(). */
-  mem_track_init();
+  /* Unified memory policy (mem_tracker) */
+  mem_config_init(&st.mem_cfg, opts->memory_limit_mb,
+                  opts->workdir ? opts->workdir : ".");
 
   /* Open device */
   if (device_open(&st.dev, opts->device_path, opts->dry_run) < 0)
@@ -624,7 +573,7 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   ext4_block_alloc_mark_fs_data(&st.alloc, &st.layout, &st.fs_info);
 
   /* Link adaptive memory management to the Ext4 inode map */
-  st.ino_map.mem_cfg = &st.mem_cfg;
+  st.ino_map.mem_cfg = mem_config_get();
 
   if (ext4_write_superblock(&st.dev, &st.layout, &st.fs_info) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to write superblock\n");

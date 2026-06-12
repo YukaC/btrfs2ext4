@@ -10,6 +10,7 @@
 
 #include <endian.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,8 +40,9 @@ static int dir_needs_htree(const struct file_entry *dir, uint32_t block_size) {
   return dir_size > block_size;
 }
 
-/* Global decomp pool */
+/* Global decomp pool — Phase 5 Approach C producer-consumer pipeline */
 static struct thread_pool *g_decomp_pool = NULL;
+#define DECOMP_PIPELINE_DEPTH 4
 
 struct decomp_job {
   struct device *dev;
@@ -51,22 +53,199 @@ struct decomp_job {
   uint8_t *decomp_buf;
   uint64_t decomp_len;
   int status;
+  int ready; /* 0=in flight, 1=done ok, -1=failed */
+  pthread_mutex_t lock;
+  pthread_cond_t done;
 };
+
+static void decomp_job_init(struct decomp_job *job) {
+  memset(job, 0, sizeof(*job));
+  job->ready = 0;
+  job->status = -1;
+  pthread_mutex_init(&job->lock, NULL);
+  pthread_cond_init(&job->done, NULL);
+}
+
+static void decomp_job_destroy(struct decomp_job *job) {
+  pthread_mutex_destroy(&job->lock);
+  pthread_cond_destroy(&job->done);
+}
 
 static void decomp_worker(void *arg) {
   struct decomp_job *job = arg;
   uint8_t *thread_buf = NULL;
-  job->status =
-      btrfs_decompress_extent(job->dev, job->chunk_map, job->ext,
-                              job->block_size, &thread_buf, &job->decomp_len);
-  if (job->status == 0 && thread_buf && job->decomp_len > 0) {
+  int st = btrfs_decompress_extent(job->dev, job->chunk_map, job->ext,
+                                   job->block_size, &thread_buf,
+                                   &job->decomp_len);
+  if (st == 0 && thread_buf && job->decomp_len > 0) {
     job->decomp_buf = malloc(job->decomp_len);
-    if (job->decomp_buf) {
+    if (job->decomp_buf)
       memcpy(job->decomp_buf, thread_buf, job->decomp_len);
+    else
+      st = -1;
+  }
+  pthread_mutex_lock(&job->lock);
+  job->status = st;
+  job->ready = (st == 0) ? 1 : -1;
+  pthread_cond_signal(&job->done);
+  pthread_mutex_unlock(&job->lock);
+}
+
+static int decomp_job_wait(struct decomp_job *job) {
+  pthread_mutex_lock(&job->lock);
+  while (job->ready == 0)
+    pthread_cond_wait(&job->done, &job->lock);
+  int ok = job->ready == 1;
+  pthread_mutex_unlock(&job->lock);
+  return ok ? 0 : -1;
+}
+
+static void decomp_job_submit_async(struct decomp_job *job) {
+  if (thread_pool_submit(g_decomp_pool, decomp_worker, job, NULL) < 0)
+    decomp_worker(job);
+}
+
+/*
+ * Write decompressed data for one job via io_uring batch API.
+ * Called on the main/I/O thread as each decomp job completes.
+ */
+static int decomp_job_write_io(struct device *dev, struct decomp_job *job,
+                               struct file_extent *ext,
+                               struct file_entry *fe_mut, uint32_t e,
+                               struct ext4_block_allocator *alloc,
+                               const struct ext4_layout *layout,
+                               uint32_t block_size) {
+  if (decomp_job_wait(job) < 0) {
+    fprintf(stderr,
+            "btrfs2ext4: failed to decompress_extent for inode %lu\n",
+            (unsigned long)fe_mut->ino);
+    free(job->decomp_buf);
+    return -1;
+  }
+
+  uint8_t *decomp_buf = job->decomp_buf;
+  uint64_t decomp_len = job->decomp_len;
+
+  uint32_t needed_blocks =
+      (uint32_t)((decomp_len + block_size - 1) / block_size);
+
+  struct run {
+    uint64_t phys_block;
+    uint32_t count;
+  };
+  struct run *runs = calloc(needed_blocks, sizeof(struct run));
+  if (!runs) {
+    free(decomp_buf);
+    return -1;
+  }
+  uint32_t num_runs = 0;
+  int alloc_failed = 0;
+
+  for (uint32_t b = 0; b < needed_blocks; b++) {
+    uint64_t blk = ext4_alloc_block(alloc, layout);
+    if (blk == (uint64_t)-1) {
+      fprintf(stderr,
+              "btrfs2ext4: no space for decompressed block %u (inode %lu)\n",
+              b, (unsigned long)fe_mut->ino);
+      alloc_failed = 1;
+      break;
+    }
+    if (num_runs > 0 &&
+        runs[num_runs - 1].phys_block + runs[num_runs - 1].count == blk) {
+      runs[num_runs - 1].count++;
     } else {
-      job->status = -1;
+      runs[num_runs].phys_block = blk;
+      runs[num_runs].count = 1;
+      num_runs++;
     }
   }
+
+  device_write_batch_begin(dev);
+  uint8_t **run_bufs = calloc(num_runs, sizeof(uint8_t *));
+  uint32_t blocks_written = 0;
+  for (uint32_t r = 0; r < num_runs && !alloc_failed; r++) {
+    uint64_t run_byte_offset = runs[r].phys_block * block_size;
+    size_t run_bytes = (size_t)runs[r].count * block_size;
+    uint64_t src_offset = (uint64_t)blocks_written * block_size;
+    size_t write_len = run_bytes;
+    if (src_offset + write_len > decomp_len)
+      write_len = (size_t)(decomp_len - src_offset);
+
+    uint8_t *run_buf = calloc(1, run_bytes);
+    if (run_buf) {
+      if (write_len > 0)
+        memcpy(run_buf, decomp_buf + src_offset, write_len);
+      device_write_batch_add(dev, run_byte_offset, run_buf, run_bytes);
+      if (run_bufs)
+        run_bufs[r] = run_buf;
+    }
+    blocks_written += runs[r].count;
+  }
+  device_write_batch_submit(dev);
+  if (run_bufs) {
+    for (uint32_t r = 0; r < num_runs; r++)
+      free(run_bufs[r]);
+    free(run_bufs);
+  }
+
+  if (alloc_failed || num_runs == 0) {
+    free(runs);
+    free(decomp_buf);
+    return -1;
+  }
+
+  if (num_runs == 1) {
+    ext->disk_bytenr = runs[0].phys_block * block_size;
+    ext->disk_num_bytes = (uint64_t)runs[0].count * block_size;
+    ext->num_bytes = decomp_len;
+    ext->ram_bytes = decomp_len;
+    ext->compression = BTRFS_COMPRESS_NONE;
+  } else {
+    if (fe_mut->extent_count + num_runs - 1 > fe_mut->extent_capacity) {
+      fe_mut->extent_capacity = fe_mut->extent_count + num_runs - 1;
+      struct file_extent *new_exts =
+          realloc(fe_mut->extents,
+                  fe_mut->extent_capacity * sizeof(struct file_extent));
+      if (!new_exts) {
+        free(runs);
+        free(decomp_buf);
+        return -1;
+      }
+      fe_mut->extents = new_exts;
+      ext = &fe_mut->extents[e];
+    }
+    if (e + 1 < fe_mut->extent_count) {
+      memmove(&fe_mut->extents[e + num_runs], &fe_mut->extents[e + 1],
+              (fe_mut->extent_count - e - 1) * sizeof(struct file_extent));
+    }
+    uint64_t current_file_offset = ext->file_offset;
+    uint64_t remaining_decomp_len = decomp_len;
+    uint8_t base_type = ext->type;
+    for (uint32_t r = 0; r < num_runs; r++) {
+      struct file_extent *r_ext = &fe_mut->extents[e + r];
+      memset(r_ext, 0, sizeof(struct file_extent));
+      r_ext->type = base_type;
+      r_ext->compression = BTRFS_COMPRESS_NONE;
+      r_ext->disk_bytenr = runs[r].phys_block * block_size;
+      r_ext->disk_num_bytes = (uint64_t)runs[r].count * block_size;
+      uint64_t run_bytes = (uint64_t)runs[r].count * block_size;
+      if (r == num_runs - 1) {
+        r_ext->num_bytes = remaining_decomp_len;
+        r_ext->ram_bytes = remaining_decomp_len;
+      } else {
+        r_ext->num_bytes = run_bytes;
+        r_ext->ram_bytes = run_bytes;
+        remaining_decomp_len -= run_bytes;
+      }
+      r_ext->file_offset = current_file_offset;
+      current_file_offset += r_ext->num_bytes;
+    }
+    fe_mut->extent_count += (num_runs - 1);
+  }
+
+  free(decomp_buf);
+  free(runs);
+  return (int)(num_runs > 1 ? num_runs - 1 : 0);
 }
 /* ========================================================================
  * Inode number mapping
@@ -445,208 +624,63 @@ int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
         }
 
         if (has_compressed) {
-          struct thread_pool_wait_group *wg = thread_pool_wg_create();
+          /* Phase 5 Approach C: producer-consumer pipeline — pool workers
+           * decompress while main thread batches io_uring writes as jobs
+           * complete (rolling window depth = DECOMP_PIPELINE_DEPTH). */
           struct decomp_job *jobs =
               calloc(fe_mut->extent_count, sizeof(struct decomp_job));
+          uint32_t *cidx = calloc(fe_mut->extent_count, sizeof(uint32_t));
+          if (!jobs || !cidx) {
+            free(jobs);
+            free(cidx);
+            continue;
+          }
 
-          /* Pass 1: Dispatch to pool */
+          uint32_t n_comp = 0;
           for (uint32_t e = 0; e < fe_mut->extent_count; e++) {
             struct file_extent *ext = &fe_mut->extents[e];
             if (ext->compression == BTRFS_COMPRESS_NONE ||
                 ext->type == BTRFS_FILE_EXTENT_INLINE ||
-                ext->type == BTRFS_FILE_EXTENT_PREALLOC || ext->disk_bytenr == 0)
+                ext->type == BTRFS_FILE_EXTENT_PREALLOC ||
+                ext->disk_bytenr == 0)
               continue;
-
-            jobs[e].dev = dev;
-            jobs[e].chunk_map = fs_info->chunk_map;
-            jobs[e].ext = ext;
-            jobs[e].block_size = block_size;
-            jobs[e].status = -1;
-
-            thread_pool_wg_add(wg, 1);
-            if (thread_pool_submit(g_decomp_pool, decomp_worker, &jobs[e], wg) <
-                0) {
-              /* Fallback if pool is full or fails */
-              thread_pool_wg_done(wg);
-              decomp_worker(&jobs[e]);
-            }
+            decomp_job_init(&jobs[e]);
+            cidx[n_comp++] = e;
           }
 
-          thread_pool_wg_wait(wg);
-          thread_pool_wg_destroy(wg);
-
-          /* Pass 2: Allocate blocks and queue I/O sequentially */
-          for (uint32_t e = 0; e < fe_mut->extent_count; e++) {
-            struct file_extent *ext = &fe_mut->extents[e];
-            if (ext->compression == BTRFS_COMPRESS_NONE ||
-                ext->type == BTRFS_FILE_EXTENT_INLINE ||
-                ext->type == BTRFS_FILE_EXTENT_PREALLOC || ext->disk_bytenr == 0)
-              continue;
-
-            if (jobs[e].status < 0) {
-              fprintf(stderr,
-                      "btrfs2ext4: failed to decompress extent for inode %lu\n",
-                      (unsigned long)fe->ino);
-              free(jobs[e].decomp_buf);
-              continue;
+          uint32_t next_submit = 0;
+          uint32_t next_write = 0;
+          while (next_write < n_comp) {
+            while (next_submit < n_comp &&
+                   next_submit < next_write + DECOMP_PIPELINE_DEPTH) {
+              uint32_t ei = cidx[next_submit];
+              jobs[ei].dev = dev;
+              jobs[ei].chunk_map = fs_info->chunk_map;
+              jobs[ei].ext = &fe_mut->extents[ei];
+              jobs[ei].block_size = block_size;
+              decomp_job_submit_async(&jobs[ei]);
+              next_submit++;
             }
 
-            uint8_t *decomp_buf = jobs[e].decomp_buf;
-            uint64_t decomp_len = jobs[e].decomp_len;
-
-            /* Allocate new blocks and write decompressed data */
-            uint32_t needed_blocks =
-                (uint32_t)((decomp_len + block_size - 1) / block_size);
-
-            struct run {
-              uint64_t phys_block;
-              uint32_t count;
-            };
-            struct run *runs = calloc(needed_blocks, sizeof(struct run));
-            if (!runs) {
-              continue;
-            }
-            uint32_t num_runs = 0;
-            int alloc_failed = 0;
-
-            /* First: allocate blocks and build runs array */
-            for (uint32_t b = 0; b < needed_blocks; b++) {
-              uint64_t blk = ext4_alloc_block(alloc, layout);
-              if (blk == (uint64_t)-1) {
-                fprintf(stderr,
-                        "btrfs2ext4: no space for decompressed block %u "
-                        "(inode %lu)\n",
-                        b, (unsigned long)fe->ino);
-                alloc_failed = 1;
-                break;
-              }
-
-              if (num_runs > 0 &&
-                  runs[num_runs - 1].phys_block + runs[num_runs - 1].count ==
-                      blk) {
-                runs[num_runs - 1].count++;
-              } else {
-                runs[num_runs].phys_block = blk;
-                runs[num_runs].count = 1;
-                num_runs++;
+            uint32_t wi = cidx[next_write];
+            int added = decomp_job_write_io(
+                dev, &jobs[wi], &fe_mut->extents[wi], fe_mut, wi, alloc,
+                layout, block_size);
+            decomp_job_destroy(&jobs[wi]);
+            if (added > 0) {
+              for (uint32_t j = next_write + 1; j < n_comp; j++) {
+                if (cidx[j] > wi)
+                  cidx[j] += (uint32_t)added;
               }
             }
-
-            /* Bug D fix + io_uring: Write decompressed data per contiguous
-             * run using batch API. Buffers are deferred-freed after submit
-             * so they remain valid for async I/O. */
-            device_write_batch_begin(dev);
-
-            /* Collect run buffers for deferred free after submit */
-            uint8_t **run_bufs = calloc(num_runs, sizeof(uint8_t *));
-            uint32_t blocks_written = 0;
-            for (uint32_t r = 0; r < num_runs && !alloc_failed; r++) {
-              uint64_t run_byte_offset = runs[r].phys_block * block_size;
-              size_t run_bytes = (size_t)runs[r].count * block_size;
-
-              uint64_t src_offset = (uint64_t)blocks_written * block_size;
-              size_t write_len = run_bytes;
-              if (src_offset + write_len > decomp_len)
-                write_len = (size_t)(decomp_len - src_offset);
-
-              uint8_t *run_buf = calloc(1, run_bytes);
-              if (run_buf) {
-                if (write_len > 0)
-                  memcpy(run_buf, decomp_buf + src_offset, write_len);
-                device_write_batch_add(dev, run_byte_offset, run_buf,
-                                       run_bytes);
-                if (run_bufs)
-                  run_bufs[r] = run_buf;
-              }
-              blocks_written += runs[r].count;
-            }
-
-            /* Submit all queued run writes at once */
-            device_write_batch_submit(dev);
-
-            /* Now safe to free all run buffers */
-            if (run_bufs) {
-              for (uint32_t r = 0; r < num_runs; r++)
-                free(run_bufs[r]);
-              free(run_bufs);
-            }
-
-            if (alloc_failed || num_runs == 0) {
-              free(runs);
-              continue;
-            }
-
-            if (num_runs == 1) {
-              /* Update extent to point to decompressed data (contiguous) */
-              ext->disk_bytenr = runs[0].phys_block * block_size;
-              ext->disk_num_bytes = (uint64_t)runs[0].count * block_size;
-              ext->num_bytes = decomp_len;
-              ext->ram_bytes = decomp_len;
-              ext->compression = BTRFS_COMPRESS_NONE;
-            } else {
-              /* Dynamic extent splitting for fragmented blocks */
-              if (fe_mut->extent_count + num_runs - 1 >
-                  fe_mut->extent_capacity) {
-                fe_mut->extent_capacity = fe_mut->extent_count + num_runs - 1;
-                struct file_extent *new_exts =
-                    realloc(fe_mut->extents, fe_mut->extent_capacity *
-                                                 sizeof(struct file_extent));
-                if (!new_exts) {
-                  free(runs);
-                  continue; /* OOM */
-                }
-                fe_mut->extents = new_exts;
-                ext = &fe_mut->extents[e]; /* update pointer */
-              }
-
-              /* Shift subsequent extents */
-              if (e + 1 < fe_mut->extent_count) {
-                memmove(&fe_mut->extents[e + num_runs], &fe_mut->extents[e + 1],
-                        (fe_mut->extent_count - e - 1) *
-                            sizeof(struct file_extent));
-              }
-
-              /* Fill the newly split extents */
-              uint64_t current_file_offset = ext->file_offset;
-              uint64_t remaining_decomp_len = decomp_len;
-
-              /* Save base properties before we overwrite */
-              uint8_t base_type = ext->type;
-
-              for (uint32_t r = 0; r < num_runs; r++) {
-                struct file_extent *r_ext = &fe_mut->extents[e + r];
-                memset(r_ext, 0, sizeof(struct file_extent));
-                r_ext->type = base_type;
-                r_ext->compression = BTRFS_COMPRESS_NONE;
-                r_ext->disk_bytenr = runs[r].phys_block * block_size;
-                r_ext->disk_num_bytes = (uint64_t)runs[r].count * block_size;
-
-                uint64_t run_bytes = (uint64_t)runs[r].count * block_size;
-                if (r == num_runs - 1) {
-                  r_ext->num_bytes = remaining_decomp_len;
-                  r_ext->ram_bytes = remaining_decomp_len;
-                } else {
-                  r_ext->num_bytes = run_bytes;
-                  r_ext->ram_bytes = run_bytes;
-                  remaining_decomp_len -= run_bytes;
-                }
-                r_ext->file_offset = current_file_offset;
-                current_file_offset += r_ext->num_bytes;
-              }
-
-              fe_mut->extent_count += (num_runs - 1);
-              e += (num_runs - 1); /* skip the newly inserted extents so outer
-                                      loop continues correctly */
-            }
-
-            /* Cleanup original thread buffer replica */
-            free(decomp_buf);
-            free(runs);
+            next_write++;
           }
+
+          free(cidx);
           free(jobs);
         }
 
-        /* Check if we can store it as Native Inline Data (Phase 5) */
+                /* Check if we can store it as Native Inline Data (Phase 5) */
         int stored_inline = 0;
         if (fe->extent_count == 1 &&
             fe->extents[0].type == BTRFS_FILE_EXTENT_INLINE &&

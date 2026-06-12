@@ -916,15 +916,16 @@ btrfs2ext4 --emergency-recover <device>
 
 ## Fase 5 — Optimizaciones de rendimiento ✅
 
-**Estado:** Completada `cursor/phase5-approach-a-76a0`  
+**Estado:** Completada `cursor/phase5-approach-c-76a0`  
 
-**Enfoque ganador:** Approach A (io_uring batch API en Pass 2 + free_space_init O(rangos))
+**Enfoque ganador:** Approach C (producer-consumer pipeline + unified mem_tracker)
 
 | Tarea | Resultado |
 |-------|-----------|
-| `device_batch_read` / `device_batch_write` | Wrappers batch en `device_io.c` |
-| Relocator Pass 2 | Agrupa entries adyacentes; `device_batch_*` para runs multi-bloque; pread/pwrite si excede queue depth |
-| `free_space_init` | Rangos merged (reserved + `used_blocks` extent-tree); O(rangos) vs O(total_blocks) |
+| Pass 3 `inode_writer` | Pipeline: thread_pool decompress + main io_uring batch writes |
+| Pass 2 `relocator` | Async queue 2×16MiB double-buffer; prefetch read overlaps write |
+| `mem_tracker` | Unified API: `mem_config` + allocation tracking |
+| `free_space_init` | Lazy sparse bitmap for TB+ volumes (chunked on demand) |
 | Preservado | `migration_map_update_entry`, checksum, `completed` por entry |
 
 ---
@@ -1019,7 +1020,7 @@ btrfs2ext4 --emergency-recover <device>
 
 [Fase 4] ✅ Planner space budget (+ 4b ETA analítica)
 
-[Fase 5] ✅ io_uring relocator (Approach A) + free_space_init O(rangos)
+[Fase 5] ✅ pipeline I/O + unified mem_tracker (Approach C)
 
 [Fase 6] 🔲 Tests E2E + e2fsck
 

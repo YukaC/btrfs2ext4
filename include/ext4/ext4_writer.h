@@ -9,6 +9,7 @@
 #include <stdint.h>
 
 #include "ext4/ext4_structures.h"
+#include "mem_tracker.h"
 
 struct device;
 struct ext4_layout;
@@ -45,8 +46,8 @@ struct inode_map {
   size_t mapped_entries_size;
   size_t mapped_ht_size;
 
-  /* Adaptive memory and HDD thrashing prevention */
-  struct adaptive_mem_config *mem_cfg;
+  /* Unified memory policy (mem_tracker.h) */
+  const struct mem_config *mem_cfg;
   struct bloom_filter *bloom;
 };
 

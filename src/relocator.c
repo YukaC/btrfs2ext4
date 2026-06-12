@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <sys/uio.h>
 
 #include "btrfs/btrfs_reader.h"
@@ -55,11 +56,19 @@ static inline int is_conflict(const uint8_t *bitmap, uint64_t block) {
  * ======================================================================== */
 
 struct free_space {
-  uint8_t *bitmap;
+  uint8_t *bitmap;        /* dense mode */
+  uint8_t **sparse;       /* lazy sparse page table (TB+ volumes) */
+  uint64_t sparse_chunks; /* number of chunk pointers */
+  int lazy;               /* 1 = sparse on-demand chunks */
   uint64_t total_blocks;
   uint64_t current_block;
   uint64_t free_count;
 };
+
+/* Lazy bitmap: allocate 64K-block chunks (~256 MiB @ 4K) on demand */
+#define FS_BITMAP_LAZY_THRESHOLD (256ULL * 1024 * 1024)
+#define FS_BITMAP_CHUNK_BLOCKS (65536ULL)
+#define FS_BITMAP_CHUNK_BYTES ((FS_BITMAP_CHUNK_BLOCKS + 7) / 8)
 
 struct block_range {
   uint64_t start;
@@ -134,10 +143,38 @@ static void block_ranges_merge(struct block_range *ranges, uint32_t *count) {
   *count = out + 1;
 }
 
-static void mark_block_range(uint8_t *bitmap, uint64_t start, uint64_t count) {
+static uint8_t *fs_bitmap_chunk(struct free_space *fs, uint64_t chunk_idx) {
+  if (!fs->lazy)
+    return fs->bitmap;
+
+  if (chunk_idx >= fs->sparse_chunks)
+    return NULL;
+
+  if (!fs->sparse[chunk_idx]) {
+    fs->sparse[chunk_idx] = calloc(1, FS_BITMAP_CHUNK_BYTES);
+    if (!fs->sparse[chunk_idx])
+      return NULL;
+    mem_track_alloc(FS_BITMAP_CHUNK_BYTES);
+  }
+  return fs->sparse[chunk_idx];
+}
+
+static void mark_block_range(struct free_space *fs, uint64_t start,
+                             uint64_t count) {
   for (uint64_t i = 0; i < count; i++) {
     uint64_t b = start + i;
-    bitmap[b / 8] |= (1 << (b % 8));
+    if (b >= fs->total_blocks)
+      break;
+
+    if (fs->lazy) {
+      uint64_t chunk_idx = b / FS_BITMAP_CHUNK_BLOCKS;
+      uint64_t bit = b % FS_BITMAP_CHUNK_BLOCKS;
+      uint8_t *chunk = fs_bitmap_chunk(fs, chunk_idx);
+      if (chunk)
+        chunk[bit / 8] |= (1 << (bit % 8));
+    } else {
+      fs->bitmap[b / 8] |= (1 << (b % 8));
+    }
   }
 }
 
@@ -150,9 +187,23 @@ static int free_space_init(struct free_space *fs,
   memset(fs, 0, sizeof(*fs));
   fs->total_blocks = total_blocks;
 
-  fs->bitmap = calloc((total_blocks + 7) / 8, 1);
-  if (!fs->bitmap)
-    return -1;
+  /* TB+ volumes: sparse chunked bitmap — pages allocated on demand */
+  if (total_blocks >= FS_BITMAP_LAZY_THRESHOLD) {
+    fs->lazy = 1;
+    fs->sparse_chunks =
+        (total_blocks + FS_BITMAP_CHUNK_BLOCKS - 1) / FS_BITMAP_CHUNK_BLOCKS;
+    fs->sparse = calloc(fs->sparse_chunks, sizeof(uint8_t *));
+    if (!fs->sparse)
+      return -1;
+    mem_track_alloc(fs->sparse_chunks * sizeof(uint8_t *));
+    printf("  Free-space bitmap: lazy sparse (%lu chunks for %lu blocks)\n",
+           (unsigned long)fs->sparse_chunks, (unsigned long)total_blocks);
+  } else {
+    fs->bitmap = calloc((total_blocks + 7) / 8, 1);
+    if (!fs->bitmap)
+      return -1;
+    mem_track_alloc((total_blocks + 7) / 8);
+  }
 
   struct block_range *ranges = NULL;
   uint32_t range_count = 0;
@@ -251,7 +302,7 @@ static int free_space_init(struct free_space *fs,
 
   uint64_t used_blocks = 0;
   for (uint32_t i = 0; i < range_count; i++) {
-    mark_block_range(fs->bitmap, ranges[i].start, ranges[i].count);
+    mark_block_range(fs, ranges[i].start, ranges[i].count);
     used_blocks += ranges[i].count;
   }
   free(ranges);
@@ -262,13 +313,34 @@ static int free_space_init(struct free_space *fs,
 
 fail:
   free(ranges);
-  free(fs->bitmap);
+  if (fs->lazy) {
+    if (fs->sparse) {
+      for (uint64_t c = 0; c < fs->sparse_chunks; c++) {
+        if (fs->sparse[c]) {
+          mem_track_free(FS_BITMAP_CHUNK_BYTES);
+          free(fs->sparse[c]);
+        }
+      }
+      mem_track_free(fs->sparse_chunks * sizeof(uint8_t *));
+      free(fs->sparse);
+    }
+  } else {
+    free(fs->bitmap);
+  }
   memset(fs, 0, sizeof(*fs));
   return -1;
 }
 
-static inline int fs_is_used(const uint8_t *bitmap, uint64_t block) {
-  return (bitmap[block / 8] >> (block % 8)) & 1;
+static inline int fs_is_used(const struct free_space *fs, uint64_t block) {
+  if (fs->lazy) {
+    uint64_t chunk_idx = block / FS_BITMAP_CHUNK_BLOCKS;
+    uint64_t bit = block % FS_BITMAP_CHUNK_BLOCKS;
+    if (chunk_idx >= fs->sparse_chunks || !fs->sparse[chunk_idx])
+      return 0;
+    const uint8_t *chunk = fs->sparse[chunk_idx];
+    return (chunk[bit / 8] >> (bit % 8)) & 1;
+  }
+  return (fs->bitmap[block / 8] >> (block % 8)) & 1;
 }
 
 /*
@@ -301,7 +373,7 @@ static uint64_t free_space_alloc_run(struct free_space *fs, uint32_t count,
     if (wrapped && fs->current_block >= saved_cursor)
       break; /* Back to start, no space */
 
-    if (!fs_is_used(fs->bitmap, fs->current_block)) {
+    if (!fs_is_used(fs, fs->current_block)) {
       if (run == 0) {
         start_block = fs->current_block;
       }
@@ -322,7 +394,7 @@ static uint64_t free_space_alloc_run(struct free_space *fs, uint32_t count,
     *actual_count = run;
     for (uint32_t i = 0; i < run; i++) {
       uint64_t b = start_block + i;
-      fs->bitmap[b / 8] |= (1 << (b % 8));
+      mark_block_range(fs, b, 1);
     }
     fs->free_count -= run;
     return start_block;
@@ -338,7 +410,20 @@ static uint64_t free_space_alloc(struct free_space *fs) {
 }
 
 static void free_space_free(struct free_space *fs) {
-  free(fs->bitmap);
+  if (fs->lazy) {
+    if (fs->sparse) {
+      for (uint64_t c = 0; c < fs->sparse_chunks; c++) {
+        if (fs->sparse[c]) {
+          mem_track_free(FS_BITMAP_CHUNK_BYTES);
+          free(fs->sparse[c]);
+        }
+      }
+      mem_track_free(fs->sparse_chunks * sizeof(uint8_t *));
+      free(fs->sparse);
+    }
+  } else {
+    free(fs->bitmap);
+  }
   memset(fs, 0, sizeof(*fs));
 }
 
@@ -681,14 +766,70 @@ static void update_entry_extents(struct relocation_entry *re,
 }
 
 /*
+ * Phase 5 Approach C — async relocation queue: 2×16MiB double buffers.
+ * Prefetch thread reads next chunk while main thread checksums + writes
+ * the current chunk (io_uring batch when multi-block).
+ */
+struct reloc_prefetch {
+  struct device *dev;
+  uint64_t offset;
+  uint8_t *buf;
+  size_t len;
+  int result;
+  int done;
+  int active;
+  pthread_mutex_t lock;
+  pthread_cond_t cond;
+  pthread_t thread;
+};
+
+static void *reloc_prefetch_thread(void *arg) {
+  struct reloc_prefetch *pf = (struct reloc_prefetch *)arg;
+  pf->result = device_read(pf->dev, pf->offset, pf->buf, pf->len);
+  pthread_mutex_lock(&pf->lock);
+  pf->done = 1;
+  pthread_cond_signal(&pf->cond);
+  pthread_mutex_unlock(&pf->lock);
+  return NULL;
+}
+
+static void reloc_prefetch_start(struct reloc_prefetch *pf, struct device *dev,
+                                 uint64_t offset, uint8_t *buf, size_t len) {
+  pf->dev = dev;
+  pf->offset = offset;
+  pf->buf = buf;
+  pf->len = len;
+  pf->result = 0;
+  pf->done = 0;
+  pf->active = 1;
+  pthread_mutex_init(&pf->lock, NULL);
+  pthread_cond_init(&pf->cond, NULL);
+  pthread_create(&pf->thread, NULL, reloc_prefetch_thread, pf);
+}
+
+static int reloc_prefetch_wait(struct reloc_prefetch *pf) {
+  if (!pf->active)
+    return 0;
+  pthread_mutex_lock(&pf->lock);
+  while (!pf->done)
+    pthread_cond_wait(&pf->cond, &pf->lock);
+  pthread_mutex_unlock(&pf->lock);
+  pthread_join(pf->thread, NULL);
+  pthread_mutex_destroy(&pf->lock);
+  pthread_cond_destroy(&pf->cond);
+  pf->active = 0;
+  return pf->result;
+}
+
+/*
  * Transfer a coalesced group of adjacent entries.
  * Multi-block contiguous chunks use device_batch_* (io_uring); larger runs
- * or single-block slices fall back to pread/pwrite.
+ * or single-block slices fall back to pread/pwrite. Double-buffered prefetch
+ * overlaps read of chunk N+1 with write of chunk N.
  */
 static int relocate_group_batch(struct device *dev,
                                 struct relocation_entry *entries,
                                 uint32_t start_idx, uint32_t end_idx,
-                                uint8_t *buf, size_t buf_cap,
                                 uint32_t block_size) {
   uint64_t grp_src = entries[start_idx].src_offset;
   uint64_t grp_dst = entries[start_idx].dst_offset;
@@ -699,20 +840,33 @@ static int relocate_group_batch(struct device *dev,
     entries[e].checksum = 0;
   }
 
+  uint8_t bufs[2][RELOC_MAX_CHUNK];
+  struct reloc_prefetch prefetch = {0};
+  int buf_idx = 0;
   uint64_t grp_off = 0;
+
   while (grp_off < grp_total) {
     uint64_t chunk = grp_total - grp_off;
-    if (chunk > buf_cap)
-      chunk = buf_cap;
+    if (chunk > RELOC_MAX_CHUNK)
+      chunk = RELOC_MAX_CHUNK;
 
-    uint64_t blocks = chunk / block_size;
-    int use_batch = (blocks > 1) && (blocks <= DEVICE_BATCH_QUEUE_DEPTH);
+    uint8_t *cur_buf = bufs[buf_idx];
 
-    if (use_batch) {
-      if (device_batch_read(dev, grp_src + grp_off, buf, (size_t)chunk) < 0)
+    if (prefetch.active) {
+      if (reloc_prefetch_wait(&prefetch) < 0)
         return -1;
-    } else if (device_read(dev, grp_src + grp_off, buf, (size_t)chunk) < 0) {
+    } else if (device_read(dev, grp_src + grp_off, cur_buf, (size_t)chunk) <
+               0) {
       return -1;
+    }
+
+    uint64_t next_off = grp_off + chunk;
+    if (next_off < grp_total) {
+      uint64_t next_chunk = grp_total - next_off;
+      if (next_chunk > RELOC_MAX_CHUNK)
+        next_chunk = RELOC_MAX_CHUNK;
+      reloc_prefetch_start(&prefetch, dev, grp_src + next_off,
+                           bufs[1 - buf_idx], (size_t)next_chunk);
     }
 
     /* Per-entry checksum over this chunk slice */
@@ -734,18 +888,27 @@ static int relocate_group_batch(struct device *dev,
       size_t buf_off = (size_t)(slice_start - grp_off);
 
       entries[e].checksum =
-          crc32c(entries[e].checksum, buf + buf_off, slice_len);
+          crc32c(entries[e].checksum, cur_buf + buf_off, slice_len);
     }
 
+    uint64_t blocks = chunk / block_size;
+    int use_batch = (blocks > 1) && (blocks <= DEVICE_BATCH_QUEUE_DEPTH);
+
     if (use_batch) {
-      if (device_batch_write(dev, grp_dst + grp_off, buf, (size_t)chunk) < 0)
+      if (device_batch_write(dev, grp_dst + grp_off, cur_buf, (size_t)chunk) <
+          0)
         return -1;
-    } else if (device_write(dev, grp_dst + grp_off, buf, (size_t)chunk) < 0) {
+    } else if (device_write(dev, grp_dst + grp_off, cur_buf, (size_t)chunk) <
+               0) {
       return -1;
     }
 
     grp_off += chunk;
+    buf_idx = 1 - buf_idx;
   }
+
+  if (prefetch.active)
+    reloc_prefetch_wait(&prefetch);
 
   return 0;
 }
@@ -764,27 +927,15 @@ int relocator_execute(struct relocation_plan *plan, struct device *dev,
   struct extent_hash ehash;
   int have_hash = (extent_hash_init(&ehash, fs_info, block_size) == 0);
 
-  uint64_t max_len = RELOC_MAX_CHUNK;
-  for (uint32_t i = 0; i < plan->count; i++) {
-    if (plan->entries[i].length > max_len)
-      max_len = plan->entries[i].length;
-  }
-  if (max_len > RELOC_MAX_CHUNK)
-    max_len = RELOC_MAX_CHUNK;
-
-  uint8_t *buf = malloc(max_len);
-  if (!buf) {
-    if (have_hash)
-      extent_hash_free(&ehash);
-    return -1;
-  }
+  printf("  Relocation I/O: double-buffer pipeline (2×%u MiB)\n",
+         (unsigned)(RELOC_MAX_CHUNK / (1024U * 1024U)));
 
   if (device_read_batch_begin(dev) < 0) {
-    free(buf);
     if (have_hash)
       extent_hash_free(&ehash);
     return -1;
   }
+
 
   for (uint32_t i = 0; i < plan->count;) {
     if (plan->entries[i].completed) {
@@ -800,11 +951,10 @@ int relocator_execute(struct relocation_plan *plan, struct device *dev,
       group_end++;
     }
 
-    if (relocate_group_batch(dev, plan->entries, i, group_end, buf,
-                             (size_t)max_len, block_size) < 0) {
-      free(buf);
+    if (relocate_group_batch(dev, plan->entries, i, group_end, block_size) <
+        0) {
       if (have_hash)
-        extent_hash_free(&ehash);
+       extent_hash_free(&ehash);
       fprintf(stderr,
               "btrfs2ext4: relocation I/O failed at seq %u\n",
               plan->entries[i].seq);
@@ -817,9 +967,8 @@ int relocator_execute(struct relocation_plan *plan, struct device *dev,
 
       re->completed = 1;
       if (migration_map_update_entry(dev, e, re) < 0) {
-        free(buf);
         if (have_hash)
-          extent_hash_free(&ehash);
+         extent_hash_free(&ehash);
         return -1;
       }
 
@@ -831,9 +980,8 @@ int relocator_execute(struct relocation_plan *plan, struct device *dev,
     i = group_end + 1;
   }
 
-  free(buf);
   if (have_hash)
-    extent_hash_free(&ehash);
+   extent_hash_free(&ehash);
 
   printf("  Block relocation complete\n\n");
   return 0;

@@ -87,7 +87,8 @@ static void test_decompress_bombs() {
   struct btrfs_fs_info *fs = create_fuzzed_fs();
 
   /* Add an intentional memory pressure event */
-  mem_track_init();
+  struct mem_config cfg;
+  mem_config_init(&cfg, 0, ".");
   mem_track_alloc(10ULL * 1024 * 1024 * 1024); /* Fake 10GB usage */
 
   /* We expect mem_tracker to catch the hash table initialization during
