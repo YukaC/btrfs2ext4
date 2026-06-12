@@ -130,7 +130,8 @@ btrfs2ext4 [options] <device>
 | `-i N`, `--inode-ratio N`    | Bytes-per-inode ratio (default: 16384)             |
 | `-w PATH`, `--workdir PATH`  | Directory for mmap() swap files (default: ./)      |
 | `-m LIMIT`, `--memory-limit` | Memory threshold for mmap, in bytes or `%`         |
-| `-r`, `--rollback`           | Restore original Btrfs superblock from backup      |
+| `-r`, `--rollback`           | Roll back Pass 2 checkpoint (relocations + Btrfs SB) |
+| `--emergency-recover`        | Recover from Pass 3 interruption (auto rollback)     |
 | `-V`, `--version`            | Print version                                      |
 | `-h`, `--help`               | Print help                                         |
 
@@ -161,6 +162,10 @@ If something goes wrong:
 sudo btrfs2ext4 -r /dev/sdX1
 sudo btrfs check /dev/sdX1
 ```
+
+### Emergency recovery (Pass 3 interrupted)
+
+If conversion was interrupted **after** Pass 3 began writing Ext4 metadata, use `--emergency-recover` to diagnose hybrid state, auto-rollback relocations, and restore the Btrfs superblock. Then run `btrfs check`.
 
 > [!NOTE]
 > Rollback restores the Btrfs superblock from the automatic backup written at the start of conversion. Relocated blocks stay at their new positions — run `btrfs check` to verify integrity.

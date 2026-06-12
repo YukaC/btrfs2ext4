@@ -44,6 +44,7 @@
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_structures.h"
 #include "ext4/ext4_writer.h"
+#include "btrfs2ext4.h"
 #include "migration_map.h"
 #include "relocator.h"
 
@@ -2150,6 +2151,135 @@ static void test_journal_deprecated(void) {
 #endif
 }
 
+
+static int capture_emergency_recover(const char *path, char *buf, size_t bufsz) {
+  char capfile[256];
+  snprintf(capfile, sizeof(capfile), "/tmp/b2e4_er_cap_%d.txt", (int)getpid());
+  int saved_stdout = dup(STDOUT_FILENO);
+  int saved_stderr = dup(STDERR_FILENO);
+  int capfd = open(capfile, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (capfd < 0)
+    return -1;
+  dup2(capfd, STDOUT_FILENO);
+  dup2(capfd, STDERR_FILENO);
+  close(capfd);
+  int rc = btrfs2ext4_emergency_recover(path);
+  fflush(stdout);
+  fflush(stderr);
+  dup2(saved_stdout, STDOUT_FILENO);
+  dup2(saved_stderr, STDERR_FILENO);
+  close(saved_stdout);
+  close(saved_stderr);
+  FILE *in = fopen(capfile, "r");
+  if (in) {
+    size_t n = fread(buf, 1, bufsz - 1, in);
+    buf[n] = '\0';
+    fclose(in);
+    unlink(capfile);
+  }
+  return rc;
+}
+
+static void test_emergency_pass3_gdt_interrupt(void) {
+  TEST_START("T-3.5.1 emergency: GDT step → bit 0x02 + Btrfs SB restored");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t35m1", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0x5678);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "migration_map_save falló");
+  REQUIRE(convert_state_save(&dev, CONVERT_STATE_PHASE_PASS2_DONE, 0) == 0,
+          "convert_state_save phase=2 falló");
+  REQUIRE(convert_state_set_step(&dev, CONVERT_STATE_STEP_SUPERBLOCK) == 0,
+          "set superblock step falló");
+  REQUIRE(convert_state_set_step(&dev, CONVERT_STATE_STEP_GDT) == 0,
+          "set GDT step falló");
+
+  struct btrfs_super_block corrupt;
+  memset(&corrupt, 0, sizeof(corrupt));
+  corrupt.magic = htole64(0xEF53CAFEULL);
+  REQUIRE(device_write(&dev, BTRFS_SUPER_OFFSET, &corrupt, sizeof(corrupt)) == 0,
+          "corrupción simulada falló");
+
+  char path[128];
+  strncpy(path, dev.path, sizeof(path));
+  device_close(&dev);
+
+  char msg[8192] = {0};
+  REQUIRE(capture_emergency_recover(path, msg, sizeof(msg)) == 0,
+          "emergency_recover falló");
+  CHECK(strstr(msg, "0x02") != NULL, "bit 0x02 (GDT) no reportado");
+  CHECK(strstr(msg, "GDT") != NULL, "paso GDT no reportado");
+  CHECK(strstr(msg, "hybrid") != NULL || strstr(msg, "HYBRID") != NULL,
+        "advertencia hybrid ausente");
+
+  struct device reopened;
+  REQUIRE(device_open(&reopened, path, 0) == 0, "reopen falló");
+  struct btrfs_super_block sb;
+  REQUIRE(read_raw(&reopened, BTRFS_SUPER_OFFSET, &sb, sizeof(sb)) == 0,
+          "lectura superbloque falló");
+  CHECK(le64toh(sb.magic) == (BTRFS_MAGIC ^ 0x5678ULL),
+        "magic Btrfs no restaurado tras emergency recover");
+  device_close(&reopened);
+  unlink(path);
+  TEST_PASS();
+}
+
+static void test_emergency_pass2_only(void) {
+  TEST_START("T-3.5.2 emergency: phase≤2 → suggests --rollback");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t35m2", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "migration_map_save falló");
+  REQUIRE(convert_state_save(&dev, CONVERT_STATE_PHASE_PASS2_DONE, 0) == 0,
+          "convert_state_save falló");
+  char path[128];
+  strncpy(path, dev.path, sizeof(path));
+  device_close(&dev);
+  char msg[4096] = {0};
+  CHECK(capture_emergency_recover(path, msg, sizeof(msg)) != 0,
+        "emergency_recover debe fallar en Pass 2 only");
+  CHECK(strstr(msg, "--rollback") != NULL, "recomendación --rollback ausente");
+  unlink(path);
+  TEST_PASS();
+}
+
+static void test_convert_state_clear_on_complete(void) {
+  TEST_START("T-3.5.3 convert_state: footer cleared after completion");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t35m3", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  write_test_btrfs_super(&dev, 0);
+  struct relocation_plan plan = {0};
+  REQUIRE(migration_map_save(&dev, &plan) == 0, "migration_map_save falló");
+  REQUIRE(convert_state_save(&dev, CONVERT_STATE_PHASE_PASS2_DONE, 0) == 0,
+          "convert_state_save falló");
+  REQUIRE(convert_state_set_step(&dev, CONVERT_STATE_STEP_SUPERBLOCK) == 0,
+          "set superblock step falló");
+  REQUIRE(convert_state_set_step(&dev, CONVERT_STATE_STEP_COMPLETE) == 0,
+          "set complete step falló");
+  REQUIRE(convert_state_clear(&dev) == 0, "convert_state_clear falló");
+  CHECK(convert_state_present(&dev) == 0, "footer CONVERT_STATE aún presente");
+  cleanup_test_dev(&dev);
+  TEST_PASS();
+}
+
+static void test_emergency_no_markers(void) {
+  TEST_START("T-3.5.4 emergency: sin markers → diagnóstico");
+  struct device dev;
+  REQUIRE(make_test_dev(&dev, "t35m4", TEST_IMG_SIZE) == 0, "make_test_dev falló");
+  char path[128];
+  strncpy(path, dev.path, sizeof(path));
+  device_close(&dev);
+  char msg[4096] = {0};
+  CHECK(capture_emergency_recover(path, msg, sizeof(msg)) != 0,
+        "emergency_recover debe fallar sin markers");
+  CHECK(strstr(msg, "no interrupted conversion") != NULL ||
+            strstr(msg, "CONVERT_STATE") != NULL,
+        "diagnóstico sin conversión interrumpida ausente");
+  unlink(path);
+  TEST_PASS();
+}
+
 static void test_rollback_bad_magic(void) {
   TEST_START("T-3.6  rollback: magic footer corrupto rechazado");
   struct device dev;
@@ -2729,6 +2859,12 @@ int main(void) {
   test_image_file_device();
   test_chunk_size_consistency();
   test_update_entry_reload();
+
+  printf("\n─── GROUP M: Phase 3.5 Emergency Recover (Approach A) ───────────────────\n");
+  test_emergency_pass3_gdt_interrupt();
+  test_emergency_pass2_only();
+  test_convert_state_clear_on_complete();
+  test_emergency_no_markers();
 
   /* GROUP K: Phase 2 extent tree metadata length */
   printf("\n─── GROUP K: Phase 2 Extent Tree (METADATA_ITEM) ────────────────────\n");

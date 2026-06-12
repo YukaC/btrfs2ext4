@@ -21,6 +21,7 @@
 #include "device_io.h"
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_writer.h"
+#include "convert_state.h"
 #include "mem_tracker.h"
 #include "migration_map.h"
 #include "relocator.h"
@@ -40,6 +41,7 @@ static void print_usage(const char *prog) {
       "  -b, --block-size N      Set ext4 block size (default: 4096)\n"
       "  -i, --inode-ratio N     Set inode ratio (default: 16384)\n"
       "  -r, --rollback          Rollback a previous conversion\n"
+      "      --emergency-recover Recover from Pass 3 interruption\n"
       "  -f, --force             Resume conversion with existing migration map\n"
       "  -w, --workdir <path>    Working directory for temp files (default: "
       "cwd)\n"
@@ -376,6 +378,10 @@ int btrfs2ext4_convert(const struct convert_options *opts,
         fprintf(stderr, "btrfs2ext4: failed to save migration map\n");
         goto cleanup;
       }
+      if (convert_state_save(&st.dev, CONVERT_STATE_PHASE_PASS2_DONE, 0) < 0) {
+        fprintf(stderr, "btrfs2ext4: failed to save convert state\n");
+        goto cleanup;
+      }
     }
     if (st.reloc_plan.count > 0) {
       if (!check_battery_safe()) {
@@ -621,8 +627,10 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   printf(":: An interruption (power loss, ctrl-c, crash) from this\n");
   printf(":: point forward will render the filesystem UNMOUNTABLE.\n");
   printf("::\n");
-  printf(":: If interrupted, DO NOT run fsck! Instead, run:\n");
+  printf(":: If interrupted during Pass 2, run:\n");
   printf("::     btrfs2ext4 --rollback %s\n", opts->device_path);
+  printf(":: If interrupted during Pass 3, run:\n");
+  printf("::     btrfs2ext4 --emergency-recover %s\n", opts->device_path);
   printf(":::::::::::::::::::::::::::::::::::::::::::::::::::::::::::\n\n");
 
   if (progress)
@@ -651,12 +659,20 @@ int btrfs2ext4_convert(const struct convert_options *opts,
     fprintf(stderr, "btrfs2ext4: failed to write superblock\n");
     goto cleanup;
   }
+  if (convert_state_set_step(&st.dev, CONVERT_STATE_STEP_SUPERBLOCK) < 0) {
+    fprintf(stderr, "btrfs2ext4: failed to update convert state\n");
+    goto cleanup;
+  }
 
   if (progress)
     progress("Pass 3", 20, "Writing group descriptor table...");
 
   if (ext4_write_gdt(&st.dev, &st.layout) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to write GDT\n");
+    goto cleanup;
+  }
+  if (convert_state_set_step(&st.dev, CONVERT_STATE_STEP_GDT) < 0) {
+    fprintf(stderr, "btrfs2ext4: failed to update convert state\n");
     goto cleanup;
   }
 
@@ -667,12 +683,20 @@ int btrfs2ext4_convert(const struct convert_options *opts,
     fprintf(stderr, "btrfs2ext4: failed to write inode tables\n");
     goto cleanup;
   }
+  if (convert_state_set_step(&st.dev, CONVERT_STATE_STEP_INODES) < 0) {
+    fprintf(stderr, "btrfs2ext4: failed to update convert state\n");
+    goto cleanup;
+  }
 
   if (progress)
     progress("Pass 3", 55, "Writing directory entries...");
 
   if (ext4_write_directories(&st.dev, &st.layout, &st.fs_info, &st.ino_map, &st.alloc) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to write directories\n");
+    goto cleanup;
+  }
+  if (convert_state_set_step(&st.dev, CONVERT_STATE_STEP_DIRS) < 0) {
+    fprintf(stderr, "btrfs2ext4: failed to update convert state\n");
     goto cleanup;
   }
 
@@ -688,12 +712,20 @@ int btrfs2ext4_convert(const struct convert_options *opts,
     fprintf(stderr, "btrfs2ext4: failed to finalize journal inode\n");
     goto cleanup;
   }
+  if (convert_state_set_step(&st.dev, CONVERT_STATE_STEP_JOURNAL) < 0) {
+    fprintf(stderr, "btrfs2ext4: failed to update convert state\n");
+    goto cleanup;
+  }
 
   if (progress)
     progress("Pass 3", 88, "Finalizing block and inode bitmaps...");
 
   if (ext4_finalize_bitmaps(&st.dev, &st.layout, &st.alloc, &st.ino_map) < 0) {
     fprintf(stderr, "btrfs2ext4: failed to finalize bitmaps\n");
+    goto cleanup;
+  }
+  if (convert_state_set_step(&st.dev, CONVERT_STATE_STEP_BITMAPS) < 0) {
+    fprintf(stderr, "btrfs2ext4: failed to update convert state\n");
     goto cleanup;
   }
 
@@ -704,8 +736,20 @@ int btrfs2ext4_convert(const struct convert_options *opts,
     fprintf(stderr, "btrfs2ext4: failed to update free counts\n");
     goto cleanup;
   }
+  if (convert_state_set_step(&st.dev, CONVERT_STATE_STEP_FREE_COUNTS) < 0) {
+    fprintf(stderr, "btrfs2ext4: failed to update convert state\n");
+    goto cleanup;
+  }
 
+  if (convert_state_set_step(&st.dev, CONVERT_STATE_STEP_COMPLETE) < 0) {
+    fprintf(stderr, "btrfs2ext4: failed to update convert state\n");
+    goto cleanup;
+  }
   device_sync(&st.dev);
+  if (convert_state_clear(&st.dev) < 0) {
+    fprintf(stderr, "btrfs2ext4: failed to clear convert state\n");
+    goto cleanup;
+  }
 
   if (progress)
     progress("Pass 3", 100, "Ext4 filesystem written!");
@@ -766,6 +810,7 @@ int main(int argc, char **argv) {
       {"block-size", required_argument, NULL, 'b'},
       {"inode-ratio", required_argument, NULL, 'i'},
       {"rollback", no_argument, NULL, 'r'},
+      {"emergency-recover", no_argument, NULL, 1001},
       {"force", no_argument, NULL, 'f'},
       {"workdir", required_argument, NULL, 'w'},
       {"memory-limit", required_argument, NULL, 'm'},
@@ -797,6 +842,9 @@ int main(int argc, char **argv) {
       break;
     case 'r':
       opts.rollback = 1;
+      break;
+    case 1001:
+      opts.emergency_recover = 1;
       break;
     case 'f':
       opts.force = 1;

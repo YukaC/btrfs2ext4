@@ -123,6 +123,7 @@ set(BTRFS2EXT4_SOURCES
     src/bloom.c
     src/mem_tracker.c
     src/migration_map.c
+    src/convert_state.c
     src/thread_pool.c
 )
 
@@ -189,6 +190,7 @@ set(BTRFS2EXT4_LIB_SOURCES
     src/bloom.c
     src/mem_tracker.c
     src/migration_map.c
+    src/convert_state.c
     src/thread_pool.c
 )
 

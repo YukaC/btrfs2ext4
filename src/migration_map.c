@@ -9,6 +9,7 @@
 
 #include "btrfs/btrfs_reader.h"
 #include "btrfs/btrfs_structures.h"
+#include "convert_state.h"
 #include "device_io.h"
 #include "migration_map.h"
 #include "relocator.h"
@@ -129,9 +130,9 @@ int migration_map_compute_layout(uint64_t dev_size, uint32_t entry_count,
     *map_offset = *footer_offset;
     return 0;
   }
-  if (*map_size > *footer_offset)
+  if (*map_size > *footer_offset - CONVERT_STATE_SIZE)
     return -1;
-  uint64_t raw = *footer_offset - *map_size;
+  uint64_t raw = *footer_offset - *map_size - CONVERT_STATE_SIZE;
   *map_offset = (raw + 4095ULL) & ~4095ULL;
   if (*map_offset + *map_size > *footer_offset)
     *map_offset = raw & ~4095ULL;

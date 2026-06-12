@@ -442,17 +442,49 @@ The journal (`journal.c`) was designed as a write-ahead log for block relocation
 
 ---
 
-## 10. Rollback Mechanism
+## 10. Rollback and Emergency Recovery
 
-**Primary recovery path:** `migration_map_save()` runs unconditionally at the end of Pass 2 (even when `reloc_plan.count == 0`), persisting every relocated block mapping and a Btrfs superblock backup. `btrfs2ext4_rollback()` / `migration_map_rollback()` reverses block moves and restores the superblock from this map.
+### Pass 2 rollback (`--rollback`)
 
-Before any block relocations, `btrfs2ext4_convert()` also copies the original Btrfs superblock to the last aligned 4 KiB slot on the device:
+**Primary Pass 2 recovery path:** `migration_map_save()` runs unconditionally at the end of Pass 2 (even when `reloc_plan.count == 0`), persisting every relocated block mapping and a Btrfs superblock backup. `btrfs2ext4_rollback()` / `migration_map_rollback()` reverses completed block moves and restores the superblock from this map.
+
+Before any block relocations, `btrfs2ext4_convert()` copies the original Btrfs superblock to the last aligned 4 KiB slot on the device:
 
 ```
 backup_offset = (device_size − 4096) & ~4095
 ```
 
-`btrfs2ext4_rollback()` reads this backup, verifies its `BTRFS_MAGIC`, and writes it back to `0x10000`. After rollback, `btrfs check` should be run to verify integrity, since relocated data blocks remain at their new positions.
+`btrfs2ext4_rollback()` reads this backup, verifies its `BTRFS_MAGIC`, and writes it back to `0x10000`. After rollback, `btrfs check` should be run to verify integrity.
+
+### Pass 3 emergency recovery (`--emergency-recover`)
+
+If Pass 3 begins writing Ext4 metadata and the process is interrupted, the device enters a **hybrid state**: partial Ext4 structures coexist with Btrfs data. `--rollback` restores the Btrfs superblock but does not remove Ext4 metadata already written.
+
+**Convert-state footer** (`B2E4CVST`, 64 bytes) sits immediately before the migration-map region at the device tail. It is updated after each Pass 3 milestone:
+
+| Bit | Pass 3 step |
+|-----|-------------|
+| `0x01` | Superblock written |
+| `0x02` | GDT written |
+| `0x04` | Inode tables written |
+| `0x08` | Directories written |
+| `0x10` | Journal written |
+| `0x20` | Bitmaps finalized |
+| `0x40` | Free counts updated |
+| `0x80` | Conversion complete |
+
+`migration_map_save()` sets `phase = 2`. Each `ext4_write_*` step sets the corresponding bitmask bit and syncs the footer. On successful completion the footer is cleared.
+
+`btrfs2ext4 --emergency-recover DEVICE`:
+
+1. Detects state from `CONVERT_STATE` + `B2E4MAP1` footers
+2. Reports completed Pass 3 steps (bitmask)
+3. Warns about hybrid state — do not mount Ext4 or run `e2fsck` blindly
+4. Runs `migration_map_rollback()` automatically
+5. Clears the convert-state footer
+6. Recommends `btrfs check` / `btrfs scrub` or restore from backup
+
+Emergency recovery is best-effort; partial Ext4 metadata may remain on disk. The footer bitmask is also the foundation for a future `--resume` feature.
 
 ---
 
