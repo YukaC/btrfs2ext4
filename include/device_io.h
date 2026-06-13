@@ -15,6 +15,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/uio.h>
 
 #ifdef HAVE_IO_URING
 #include <liburing.h>
@@ -62,6 +63,16 @@ int device_read(struct device *dev, uint64_t offset, void *buf, size_t size);
  */
 int device_write(struct device *dev, uint64_t offset, const void *buf,
                  size_t size);
+
+/*
+ * Vectored read/write at a single file offset (preadv/pwritev).
+ * Transfers data sequentially through iov[0..iovcnt-1].
+ * Returns 0 on success, -1 on error.
+ */
+int device_readv(struct device *dev, uint64_t offset, struct iovec *iov,
+                 int iovcnt);
+int device_writev(struct device *dev, uint64_t offset, struct iovec *iov,
+                  int iovcnt);
 
 /*
  * Force sync all pending writes to disk.
@@ -127,5 +138,13 @@ int device_read_batch_add(struct device *dev, uint64_t offset, void *buf,
                           size_t size);
 
 int device_read_batch_submit(struct device *dev);
+
+/*
+ * Convenience: queue one read/write and submit immediately.
+ * Equivalent to _add() followed by _submit().
+ */
+int device_batch_read(struct device *dev, uint64_t offset, void *buf, size_t size);
+int device_batch_write(struct device *dev, uint64_t offset, const void *buf,
+                       size_t size);
 
 #endif /* DEVICE_IO_H */

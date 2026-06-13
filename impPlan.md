@@ -6,9 +6,9 @@ Refleja el análisis profundo del código, las fases ejecutadas (best-of-N) y el
 
 **Última actualización:** 2026-06-11  
 
-**Rama de referencia:** `cursor/phase2-foundations-76a0`  
+**Rama de referencia:** `cursor/implementation-complete`  
 
-**Estado del proyecto:** `0.2.0-alpha`
+**Estado del proyecto:** `0.3.0-dev` (main congelado hasta merge final)
 
 ---
 
@@ -24,11 +24,11 @@ Refleja el análisis profundo del código, las fases ejecutadas (best-of-N) y el
 
 5. [Fase 2 — Lector Btrfs](#fase-2--lector-btrfs) ✅
 
-6. [Fase 3 — Recuperación Pass 2 (Opción A+)](#fase-3--recuperación-pass-2-opción-a) 🔲
+6. [Fase 3 — Recuperación Pass 2 (Opción A+)](#fase-3--recuperación-pass-2-opción-a) ✅
 
-7. [Fase 3.5 — Emergencia Pass 3](#fase-35--emergencia-pass-3) 🔲
+7. [Fase 3.5 — Emergencia Pass 3](#fase-35--emergencia-pass-3) ✅
 
-8. [Fase 4 — Planificación y espacio](#fase-4--planificación-y-espacio) 🔲
+8. [Fase 4 — Planificación y espacio](#fase-4--planificación-y-espacio) ✅
 
 9. [Fase 5 — Optimizaciones de rendimiento](#fase-5--optimizaciones-de-rendimiento) 🔲
 
@@ -914,23 +914,19 @@ btrfs2ext4 --emergency-recover <device>
 
 ---
 
-## Fase 5 — Optimizaciones de rendimiento 🔲
+## Fase 5 — Optimizaciones de rendimiento ✅
 
-**Objetivo:** Reducir tiempo de conversión en HDD y volúmenes TB+.
+**Estado:** Completada `cursor/phase5-approach-c-76a0`  
 
-| Prioridad | Optimización | Estado actual |
+**Enfoque ganador:** Approach C (producer-consumer pipeline + unified mem_tracker)
 
-|-----------|--------------|---------------|
-
-| Alta | io_uring en `relocator_execute` | Solo Pass 3 |
-
-| Alta | `preadvpwritev` para runs contiguos | No implementado |
-
-| Media | Pipeline descompresión + escritura | Pool solo descomprime |
-
-| Media | `free_space_init` O(rangos) vs O(total_blocks) | O(total_blocks) |
-
-| Baja | Unificar `mem_tracker` + `adaptive_mem_config` | Dos políticas |
+| Tarea | Resultado |
+|-------|-----------|
+| Pass 3 `inode_writer` | Pipeline: thread_pool decompress + main io_uring batch writes |
+| Pass 2 `relocator` | Async queue 2×16MiB double-buffer; prefetch read overlaps write |
+| `mem_tracker` | Unified API: `mem_config` + allocation tracking |
+| `free_space_init` | Lazy sparse bitmap for TB+ volumes (chunked on demand) |
+| Preservado | `migration_map_update_entry`, checksum, `completed` por entry |
 
 ---
 
@@ -1018,13 +1014,13 @@ btrfs2ext4 --emergency-recover <device>
 
 [Fase 2] ✅ tree_walk + PREALLOC + CoW hash
 
-[Fase 3] 🔲 migration_map robusto (Opción A+: E1–E20)
+[Fase 3] ✅ migration_map robusto (Opción A+: E1–E20)
 
-[Fase 3.5] 🔲 --emergency-recover (Pass 3 interrumpido)
+[Fase 3.5] ✅ --emergency-recover (Pass 3 interrumpido)
 
-[Fase 4] 🔲 Planner space budget
+[Fase 4] ✅ Planner space budget (+ 4b ETA analítica)
 
-[Fase 5] 🔲 io_uring relocator, pipeline I/O
+[Fase 5] ✅ pipeline I/O + unified mem_tracker (Approach C)
 
 [Fase 6] 🔲 Tests E2E + e2fsck
 

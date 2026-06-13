@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 int device_open(struct device *dev, const char *path, int read_only) {
@@ -140,6 +141,103 @@ int device_write(struct device *dev, uint64_t offset, const void *buf,
       return -1;
     }
     total += n;
+  }
+
+  return 0;
+}
+
+static size_t iovec_total_len(const struct iovec *iov, int iovcnt) {
+  size_t total = 0;
+  for (int i = 0; i < iovcnt; i++)
+    total += iov[i].iov_len;
+  return total;
+}
+
+static void iovec_advance(struct iovec **iov, int *iovcnt, size_t n) {
+  while (n > 0 && *iovcnt > 0) {
+    if (n >= (*iov)->iov_len) {
+      n -= (*iov)->iov_len;
+      (*iov)++;
+      (*iovcnt)--;
+    } else {
+      (*iov)->iov_base = (uint8_t *)(*iov)->iov_base + n;
+      (*iov)->iov_len -= n;
+      n = 0;
+    }
+  }
+}
+
+static int iovec_transfer(
+    ssize_t (*fn)(int, const struct iovec *, int, off_t), int fd,
+    uint64_t offset, struct iovec *iov, int iovcnt) {
+  size_t total = iovec_total_len(iov, iovcnt);
+  size_t done = 0;
+
+  while (done < total) {
+    ssize_t n = fn(fd, iov, iovcnt, (off_t)offset);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      return -1;
+    }
+    if (n == 0)
+      return -1;
+
+    done += (size_t)n;
+    offset += (uint64_t)n;
+    iovec_advance(&iov, &iovcnt, (size_t)n);
+  }
+
+  return 0;
+}
+
+int device_readv(struct device *dev, uint64_t offset, struct iovec *iov,
+                 int iovcnt) {
+  if (iovcnt <= 0)
+    return 0;
+
+  size_t total = iovec_total_len(iov, iovcnt);
+  if (total > dev->size || offset > dev->size - total) {
+    fprintf(stderr,
+            "btrfs2ext4: readv beyond device end: offset=%lu size=%zu "
+            "dev_size=%lu\n",
+            (unsigned long)offset, total, (unsigned long)dev->size);
+    return -1;
+  }
+
+  if (iovec_transfer(preadv, dev->fd, offset, iov, iovcnt) < 0) {
+    fprintf(stderr, "btrfs2ext4: readv error at offset %lu: %s\n",
+            (unsigned long)offset, strerror(errno));
+    return -1;
+  }
+
+  return 0;
+}
+
+int device_writev(struct device *dev, uint64_t offset, struct iovec *iov,
+                  int iovcnt) {
+  if (iovcnt <= 0)
+    return 0;
+
+  if (dev->read_only) {
+    fprintf(stderr,
+            "btrfs2ext4: cannot write: device opened read-only (dry-run)\n");
+    return -1;
+  }
+
+  size_t total = iovec_total_len(iov, iovcnt);
+  if (total > dev->size || offset > dev->size - total) {
+    fprintf(stderr,
+            "btrfs2ext4: writev beyond device end: offset=%lu size=%zu "
+            "dev_size=%lu\n",
+            (unsigned long)offset, total, (unsigned long)dev->size);
+    return -1;
+  }
+
+  if (iovec_transfer(pwritev, dev->fd, offset, iov, iovcnt) < 0) {
+    fprintf(stderr, "btrfs2ext4: writev error at offset %lu: %s\n",
+            (unsigned long)offset, strerror(errno));
+    return -1;
   }
 
   return 0;
@@ -308,6 +406,20 @@ int device_read_batch_submit(struct device *dev) {
   return device_write_batch_submit(dev); /* Same completion harvesting logic */
 }
 
+int device_batch_read(struct device *dev, uint64_t offset, void *buf,
+                      size_t size) {
+  if (device_read_batch_add(dev, offset, buf, size) < 0)
+    return -1;
+  return device_read_batch_submit(dev);
+}
+
+int device_batch_write(struct device *dev, uint64_t offset, const void *buf,
+                       size_t size) {
+  if (device_write_batch_add(dev, offset, buf, size) < 0)
+    return -1;
+  return device_write_batch_submit(dev);
+}
+
 #else /* !HAVE_IO_URING — synchronous fallback */
 
 int device_write_batch_begin(struct device *dev) {
@@ -338,6 +450,16 @@ int device_read_batch_add(struct device *dev, uint64_t offset, void *buf,
 int device_read_batch_submit(struct device *dev) {
   (void)dev;
   return 0;
+}
+
+int device_batch_read(struct device *dev, uint64_t offset, void *buf,
+                      size_t size) {
+  return device_read(dev, offset, buf, size);
+}
+
+int device_batch_write(struct device *dev, uint64_t offset, const void *buf,
+                       size_t size) {
+  return device_write(dev, offset, buf, size);
 }
 
 #endif /* HAVE_IO_URING */
