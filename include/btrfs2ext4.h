@@ -16,7 +16,6 @@ struct convert_options {
   int rollback;             /* 1 = rollback a previous conversion */
   int emergency_recover;    /* 1 = recover from interrupted Pass 3 */
   int force;                /* 1 = resume conversion with existing map */
-  int no_journal;           /* 1 = skip crash-recovery journal */
   uint32_t block_size;      /* ext4 block size (default 4096) */
   uint32_t inode_ratio;     /* bytes per inode (default 16384) */
   uint32_t memory_limit_mb; /* --memory-limit: max RAM MB (0=auto) */

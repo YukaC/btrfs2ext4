@@ -51,23 +51,7 @@ struct inode_map {
   struct bloom_filter *bloom;
 };
 
-/*
- * Write the complete ext4 filesystem structures to the device.
- * This is the main "Pass 3" function that writes all ext4 metadata.
- *
- * Parameters:
- *   dev        - opened device handle
- *   layout     - pre-calculated ext4 layout
- *   fs_info    - btrfs filesystem data (source of truth for files/dirs)
- *   inode_map  - btrfs→ext4 inode number mapping (populated by this function)
- *
- * Returns 0 on success, -1 on error.
- */
-int ext4_write_filesystem(struct device *dev, const struct ext4_layout *layout,
-                          const struct btrfs_fs_info *fs_info,
-                          struct inode_map *inode_map);
-
-/* Individual writer functions (called internally by ext4_write_filesystem) */
+/* Individual Pass 3 writer functions (orchestrated inline in main.c) */
 int ext4_write_superblock(struct device *dev, const struct ext4_layout *layout,
                           const struct btrfs_fs_info *fs_info);
 int ext4_write_gdt(struct device *dev, const struct ext4_layout *layout);
