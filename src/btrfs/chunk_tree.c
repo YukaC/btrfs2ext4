@@ -14,6 +14,7 @@
 #include "btrfs/chunk_tree.h"
 #include "btrfs/tree_walk.h"
 #include "device_io.h"
+#include "term_ui.h"
 
 #define INITIAL_CHUNK_CAPACITY 64
 
@@ -88,7 +89,7 @@ int chunk_map_init_from_superblock(struct chunk_map *map,
   const uint8_t *p = sb->sys_chunk_array;
   const uint8_t *end = p + array_size;
 
-  printf("Parsing sys_chunk_array (%u bytes)...\n", array_size);
+  term_log_debug("Parsing sys_chunk_array (%u bytes)...\n", array_size);
 
   while (p < end) {
     /* Each entry is: btrfs_disk_key + btrfs_chunk + stripes */
@@ -131,9 +132,10 @@ int chunk_map_init_from_superblock(struct chunk_map *map,
     uint64_t length = le64toh(chunk->length);
     uint64_t type = le64toh(chunk->type);
 
-    printf("  Chunk: logical=0x%lx physical=0x%lx length=0x%lx type=0x%lx\n",
-           (unsigned long)logical, (unsigned long)physical,
-           (unsigned long)length, (unsigned long)type);
+    term_log_debug(
+        "  Chunk: logical=0x%lx physical=0x%lx length=0x%lx type=0x%lx\n",
+        (unsigned long)logical, (unsigned long)physical, (unsigned long)length,
+        (unsigned long)type);
 
     if (chunk_map_add(map, logical, physical, length, type) < 0)
       return -1;
@@ -144,7 +146,7 @@ int chunk_map_init_from_superblock(struct chunk_map *map,
   /* Sort by logical address for binary search */
   qsort(map->entries, map->count, sizeof(struct chunk_mapping), chunk_cmp);
 
-  printf("  Parsed %u system chunks\n\n", map->count);
+  term_log_debug("  Parsed %u system chunks\n\n", map->count);
   return 0;
 }
 
@@ -194,8 +196,8 @@ int chunk_map_populate(struct chunk_map *map, struct device *dev,
   uint32_t nodesize = le32toh(sb->nodesize);
   uint16_t csum_type = le16toh(sb->csum_type);
 
-  printf("Walking chunk tree (root=0x%lx, level=%u, nodesize=%u)...\n",
-         (unsigned long)chunk_root_logical, chunk_root_level, nodesize);
+  term_log_debug("Walking chunk tree (root=0x%lx, level=%u, nodesize=%u)...\n",
+                 (unsigned long)chunk_root_logical, chunk_root_level, nodesize);
 
   if (btrfs_tree_walk(dev, map, chunk_root_logical, chunk_root_level, nodesize,
                       csum_type, chunk_tree_leaf_cb, map) < 0)
@@ -203,7 +205,7 @@ int chunk_map_populate(struct chunk_map *map, struct device *dev,
 
   qsort(map->entries, map->count, sizeof(struct chunk_mapping), chunk_cmp);
 
-  printf("  Total chunk mappings: %u\n\n", map->count);
+  term_log_debug("  Total chunk mappings: %u\n\n", map->count);
   return 0;
 }
 

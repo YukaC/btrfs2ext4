@@ -125,11 +125,11 @@ btrfs2ext4 [options] <device>
 | Option                       | Description                                        |
 | ---------------------------- | -------------------------------------------------- |
 | `-n`, `--dry-run`            | Simulate the conversion (space + time audit)       |
-| `-v`, `--verbose`            | Enable verbose output                              |
+| `-v`, `--verbose`            | Diagnostic dumps (default output is compact)         |
 | `-b N`, `--block-size N`     | Ext4 block size: 1024, 2048, or **4096** (default) |
-| `-i N`, `--inode-ratio N`    | Bytes-per-inode ratio (default: 16384)             |
+| `-i N`, `--inode-ratio N`    | Bytes-per-inode ratio (block size–67108864; default 16384) |
 | `-w PATH`, `--workdir PATH`  | Directory for mmap() swap files (default: ./)      |
-| `-m LIMIT`, `--memory-limit` | Memory threshold for mmap, in bytes or `%`         |
+| `-m N`, `--memory-limit`     | mmap threshold in MiB (`0` = auto, 60% of RAM)     |
 | `--safety-margin N`          | Planner free-space headroom % (1–25, default 5)    |
 | `-r`, `--rollback`           | Restore original Btrfs superblock from backup      |
 | `-V`, `--version`            | Print version                                      |
@@ -141,10 +141,10 @@ btrfs2ext4 [options] <device>
 # 1. Unmount
 sudo umount /dev/sdX1
 
-# 2. Dry-run first — checks space, estimates time, detects problems
-#    Prints planner budget (data/journal/HTree/dedup/decompression) and an
-#    analytical conversion ETA (HDD/SSD via sysfs; optional 128 MiB read benchmark)
+# 2. Dry-run first — compact dashboard (space, viability, ETA)
+#    Use -v for full diagnostic dumps (planner budget, tree walks, etc.)
 sudo btrfs2ext4 -n /dev/sdX1
+# sudo btrfs2ext4 -nv /dev/sdX1
 
 # 3. Convert
 sudo btrfs2ext4 /dev/sdX1
@@ -177,7 +177,6 @@ Things the tool doesn't do yet but reasonably could:
 - Multi-device / RAID Btrfs support
 - Subvolume selection
 - Non-4K sector size support
-- Better progress reporting
 - `io_uring` for async I/O on modern kernels
 
 Contributions and bug reports are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).

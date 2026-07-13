@@ -12,7 +12,7 @@ struct convert_options {
   const char *device_path;
   const char *workdir;      /* --workdir: path for temp files (default: pwd) */
   int dry_run;              /* 1 = simulate only, don't write */
-  int verbose;              /* 1 = detailed output */
+  int verbose;              /* 1 = diagnostic dumps (default: compact) */
   int rollback;             /* 1 = rollback a previous conversion */
   int emergency_recover;    /* 1 = recover from interrupted Pass 3 */
   int force;                /* 1 = resume conversion with existing map */

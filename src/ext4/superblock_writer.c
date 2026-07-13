@@ -15,6 +15,7 @@
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_structures.h"
 #include "ext4/ext4_writer.h"
+#include "term_ui.h"
 
 int ext4_write_superblock(struct device *dev, const struct ext4_layout *layout,
                           const struct btrfs_fs_info *fs_info) {
@@ -124,7 +125,7 @@ int ext4_write_superblock(struct device *dev, const struct ext4_layout *layout,
   ext4_superblock_csum_set(&sb);
 
   /* Write primary superblock at offset 1024 */
-  printf("Writing ext4 superblock at offset %u...\n", EXT4_SUPER_OFFSET);
+  term_log_debug("Writing ext4 superblock at offset %u...\n", EXT4_SUPER_OFFSET);
 
   /* Superblock needs to be padded to block_size for writing to block devices */
   uint8_t *sb_buf = calloc(1, block_size);
@@ -160,7 +161,7 @@ int ext4_write_superblock(struct device *dev, const struct ext4_layout *layout,
   }
 
   free(sb_buf);
-  printf("  Superblock written (+ %u backup copies)\n",
+  term_log_debug("  Superblock written (+ %u backup copies)\n",
          layout->num_groups > 1 ? layout->num_groups - 1 : 0);
 
   return 0;

@@ -28,6 +28,7 @@
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_structures.h"
 #include "ext4/ext4_writer.h"
+#include "term_ui.h"
 
 /* Maximum extents in an inline (inode) extent tree */
 #define INLINE_EXTENT_MAX 4
@@ -544,7 +545,7 @@ int ext4_build_extent_tree(struct ext4_block_allocator *alloc,
     }
 
     if (depth > 1) {
-      printf("  inode %lu: %d extents → depth-%u extent tree "
+      term_log_debug("  inode %lu: %d extents → depth-%u extent tree "
              "(%u index levels)\n",
              (unsigned long)fe->ino, ext_count, depth, depth - 1);
     }

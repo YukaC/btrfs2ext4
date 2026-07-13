@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "mem_tracker.h"
+#include "term_ui.h"
 
 static uint64_t g_mem_used = 0;
 static uint64_t g_track_threshold = 0;
@@ -82,13 +83,13 @@ void mem_config_init(struct mem_config *cfg, uint32_t memory_limit_mb,
   g_mem_cfg = *cfg;
   g_mem_cfg_ptr = &g_mem_cfg;
 
-  printf("[INFO] RAM detected:     %.1f GiB total, %.1f GiB available\n",
+  term_log_debug("[INFO] RAM detected:     %.1f GiB total, %.1f GiB available\n",
          (double)cfg->total_ram / (1024.0 * 1024.0 * 1024.0),
          (double)cfg->available_ram / (1024.0 * 1024.0 * 1024.0));
-  printf("[INFO] mmap threshold:   %.0f MiB%s\n",
+  term_log_debug("[INFO] mmap threshold:   %.0f MiB%s\n",
          (double)cfg->mmap_threshold / (1024.0 * 1024.0),
          memory_limit_mb > 0 ? " (user-configured)" : " (auto: 60%%)");
-  printf("[INFO] Temp file dir:    %s%s\n\n", cfg->workdir,
+  term_log_debug("[INFO] Temp file dir:    %s%s\n\n", cfg->workdir,
          cfg->workdir_is_tmpfs ? " [tmpfs WARNING]" : "");
 
   if (cfg->workdir_is_tmpfs) {
@@ -127,7 +128,7 @@ void mem_track_report(void) {
   if (!g_initialized)
     return;
 
-  printf("  Memory usage:     %.1f MiB / %.1f MiB available (%.0f%% of "
+  term_log_debug("  Memory usage:     %.1f MiB / %.1f MiB available (%.0f%% of "
          "threshold)\n",
          (double)g_mem_used / (1024.0 * 1024.0),
          (double)g_mem_available / (1024.0 * 1024.0),

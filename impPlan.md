@@ -34,7 +34,7 @@ Refleja el análisis profundo del código, las fases ejecutadas (best-of-N) y el
 
 10. [Fase 6 — Tests e infraestructura](#fase-6--tests-e-infraestructura) 🔲
 
-11. [Fase 7 — API, CLI y limpieza](#fase-7--api-cli-y-limpieza) 🔲
+11. [Fase 7 — API, CLI y limpieza](#fase-7--api-cli-y-limpieza) ✅
 
 12. [Métricas de éxito](#métricas-de-éxito)
 
@@ -948,21 +948,18 @@ btrfs2ext4 --emergency-recover <device>
 
 ---
 
-## Fase 7 — API, CLI y limpieza 🔲
+## Fase 7 — API, CLI y limpieza ✅
 
-| Tarea | Detalle |
+**Estado:** Completada `cursor/phase7-approach-b-76a0` — Approach B (remove dead code)
 
-|-------|---------|
-
-| `verbose` | Implementar o eliminar flag y documentación |
-
-| `no_journal` | Implementar o eliminar de `convert_options` |
-
-| `ext4_write_filesystem()` | Wrapper de Pass 3 (API declarada, no implementada) |
-
-| Validar `inode_ratio` en CLI | Mínimo/máximo |
-
-| Alinear `-m` con man page | MB vs % de RAM |
+| Tarea | Resultado |
+|-------|-----------|
+| `verbose` | Reintroducido: default compacto + `-v` dumps (`term_ui`) |
+| `no_journal` | Eliminado de `convert_options` |
+| `ext4_write_filesystem()` | Declaración eliminada; Pass 3 inline en `main.c` |
+| Validar `inode_ratio` en CLI | Rango `[block_size, 67108864]` (mke2fs) |
+| Alinear `-m` con man page | MiB absolutos; `0` = auto 60% RAM física |
+| Headers | `btrfs2ext4.h`, `ext4_writer.h` sin API muerta; `term_ui` |
 
 ---
 
@@ -1024,7 +1021,7 @@ btrfs2ext4 --emergency-recover <device>
 
 [Fase 6] 🔲 Tests E2E + e2fsck
 
-[Fase 7] 🔲 Limpieza API/CLI
+[Fase 7] ✅ Limpieza API/CLI (Approach B: remove dead code)
 
 ```
 

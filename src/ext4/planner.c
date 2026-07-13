@@ -14,6 +14,7 @@
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_space.h"
 #include "ext4/ext4_structures.h"
+#include "term_ui.h"
 
 static uint8_t normalize_safety_margin(uint8_t safety_margin_percent)
 {
@@ -285,17 +286,17 @@ int ext4_plan_layout(const struct btrfs_fs_info *fs_info, uint64_t device_size,
   dedup_blocks = compute_dedup_blocks(fs_info);
   decompression_blocks = compute_decompression_blocks(fs_info, block_size);
 
-  printf("=== Ext4 Constraints & Pre-Calculation ===\n");
-  printf("  Device size:       %lu bytes (%.1f GiB)\n",
+  term_log_debug("=== Ext4 Constraints & Pre-Calculation ===\n");
+  term_log_debug("  Device size:       %lu bytes (%.1f GiB)\n",
          (unsigned long)device_size,
          (double)device_size / (1024.0 * 1024.0 * 1024.0));
-  printf("  Block size:        %u\n", layout->block_size);
-  printf("  Total blocks:      %lu\n", (unsigned long)layout->total_blocks);
-  printf("  Blocks per group:  %u\n", layout->blocks_per_group);
-  printf("  Number of groups:  %u\n", layout->num_groups);
-  printf("  Inodes per group:  %u\n", layout->inodes_per_group);
-  printf("  Total inodes:      %u\n", layout->total_inodes);
-  printf("  Inode size:        %u\n", layout->inode_size);
+  term_log_debug("  Block size:        %u\n", layout->block_size);
+  term_log_debug("  Total blocks:      %lu\n", (unsigned long)layout->total_blocks);
+  term_log_debug("  Blocks per group:  %u\n", layout->blocks_per_group);
+  term_log_debug("  Number of groups:  %u\n", layout->num_groups);
+  term_log_debug("  Inodes per group:  %u\n", layout->inodes_per_group);
+  term_log_debug("  Total inodes:      %u\n", layout->total_inodes);
+  term_log_debug("  Inode size:        %u\n", layout->inode_size);
 
   layout->groups = calloc(layout->num_groups, sizeof(struct ext4_bg_layout));
   if (!layout->groups) {
@@ -387,17 +388,17 @@ int ext4_plan_layout(const struct btrfs_fs_info *fs_info, uint64_t device_size,
   margin_blocks =
       (uint32_t)(layout->total_blocks * (uint64_t)margin_pct / 100);
 
-  printf("  Reserved blocks:   %u (metadata zones + journal)\n",
+  term_log_debug("  Reserved blocks:   %u (metadata zones + journal)\n",
          layout->reserved_block_count);
-  printf("  Data blocks req:   %u (files, index, dirs)\n", data_blocks_required);
-  printf("  HTree blocks req:  %u\n", htree_blocks);
-  printf("  Journal blocks:    %u (tail %lu–%lu)\n", layout->journal_blocks,
+  term_log_debug("  Data blocks req:   %u (files, index, dirs)\n", data_blocks_required);
+  term_log_debug("  HTree blocks req:  %u\n", htree_blocks);
+  term_log_debug("  Journal blocks:    %u (tail %lu–%lu)\n", layout->journal_blocks,
          (unsigned long)layout->journal_start_block,
          (unsigned long)(layout->journal_start_block + layout->journal_blocks -
                          1));
-  printf("  Dedup/CoW blocks:  %u\n", dedup_blocks);
-  printf("  Decompress blocks: %u\n", decompression_blocks);
-  printf("  Safety margin:     %u%% (%u blocks)\n", margin_pct, margin_blocks);
+  term_log_debug("  Dedup/CoW blocks:  %u\n", dedup_blocks);
+  term_log_debug("  Decompress blocks: %u\n", decompression_blocks);
+  term_log_debug("  Safety margin:     %u%% (%u blocks)\n", margin_pct, margin_blocks);
 
   physically_usable =
       layout->total_blocks > layout->reserved_block_count
@@ -438,10 +439,10 @@ int ext4_plan_layout(const struct btrfs_fs_info *fs_info, uint64_t device_size,
     return -1;
   }
 
-  printf("  Free Space Margin: %lu blocks (%.1f MiB)\n",
+  term_log_debug("  Free Space Margin: %lu blocks (%.1f MiB)\n",
          (unsigned long)free_blocks,
          (double)(free_blocks * block_size) / (1024.0 * 1024.0));
-  printf("========================\n\n");
+  term_log_debug("========================\n\n");
 
   if (budget) {
     fill_budget(budget, data_blocks_required, journal_blocks, htree_blocks,
@@ -495,7 +496,7 @@ uint32_t ext4_find_conflicts(const struct ext4_layout *layout,
   }
 
   free(bitmap);
-  printf("Found %u data extents conflicting with ext4 metadata zones\n\n",
+  term_log_debug("Found %u data extents conflicting with ext4 metadata zones\n\n",
          conflicts);
   return conflicts;
 }

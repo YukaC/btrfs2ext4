@@ -7,6 +7,7 @@
 #include "ext4/ext4_metadata_csum.h"
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_structures.h"
+#include "term_ui.h"
 #include <endian.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -79,7 +80,7 @@ int ext4_write_gdt(struct device *dev, const struct ext4_layout *layout) {
     }
   }
 
-  printf("Writing GDT (%u groups, %u blocks)...\n", layout->num_groups,
+  term_log_debug("Writing GDT (%u groups, %u blocks)...\n", layout->num_groups,
          gdt_blocks);
 
   /* Write GDT to each block group that has a superblock */
@@ -95,6 +96,6 @@ int ext4_write_gdt(struct device *dev, const struct ext4_layout *layout) {
   }
 
   free(gdt_buf);
-  printf("  GDT written to all superblock groups\n");
+  term_log_debug("  GDT written to all superblock groups\n");
   return 0;
 }

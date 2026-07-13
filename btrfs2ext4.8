@@ -17,22 +17,22 @@ Always back up critical data before proceeding. If a conversion fails or is inte
 .SH OPTIONS
 .TP
 .BR \-n ", " \-\-dry\-run
-Simulate the conversion read-only. This performs a complete "Hardware Viability Audit," physically reading conflicting blocks to detect bad sectors, resolving layout overlaps, and verifying that the conversion can mathematically fit. It will cleanly abort if there is insufficient free space.
+Simulate the conversion read-only. Prints a compact dashboard (passes, viability, ETA). Physically reads conflicting blocks to detect bad sectors when needed, and aborts if there is insufficient free space. Use \fB\-v\fR for full diagnostic dumps.
 .TP
 .BR \-v ", " \-\-verbose
-Enable verbose logging of relocation steps, block allocations, and metadata construction.
+Show diagnostic dumps (superblock details, tree walks, planner budget, Pass 3 writer chatter). Default output is compact.
 .TP
 .BR \-b ", " \-\-block\-size \ \fISIZE\fR
 Set the Ext4 physical block size. Valid options are 1024, 2048, or \fB4096\fR. 4096 is the default and strongly recommended.
 .TP
 .BR \-i ", " \-\-inode\-ratio \ \fIRATIO\fR
-Set the bytes-per-inode ratio (default: 16384). A lower ratio creates more inodes, consuming more metadata blocks.
+Set the bytes-per-inode ratio (default: 16384). Valid range: block size through 67108864. A lower ratio creates more inodes, consuming more metadata blocks.
 .TP
 .BR \-w ", " \-\-workdir \ \fIPATH\fR
 Specify the directory used for large \fBmmap()\fR SSD-backed swap files when memory consumption exceeds limits (default: current working directory \fB./\fR).
 .TP
-.BR \-m ", " \-\-memory\-limit \ \fILIMIT\fR
-Define the strict threshold where the engine drops into \fBmmap()\fR paging to prevent OOM death. Can be an absolute byte count (e.g., \fB1073741824\fR) or a percentage of total system RAM (e.g., \fB60%\fR).
+.BR \-m ", " \-\-memory\-limit \ \fIMIB\fR
+Set the maximum RAM in MiB used as the \fBmmap()\fR threshold before spilling to disk-backed swap files. \fB0\fR (default) selects automatic mode: 60% of physical RAM.
 .TP
 .B \-\-safety\-margin \ \fIPERCENT\fR
 Set the planner free-space headroom percentage (1–25, default \fB5\fR). Higher values reject conversions earlier when the device is nearly full.
@@ -64,9 +64,9 @@ Safely dry-run a volume to ensure successful mathematical conversion:
 .B btrfs2ext4 --dry-run /dev/sda1
 .RE
 .PP
-Convert a live partition directly, defining an explicit memory boundary:
+Convert a live partition directly, capping mmap threshold at 4 GiB:
 .RS
-.B btrfs2ext4 -m 50% /dev/sda1
+.B btrfs2ext4 -m 4096 /dev/sda1
 .RE
 .PP
 Mount the newly converted Ext4 partition:

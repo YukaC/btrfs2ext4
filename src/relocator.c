@@ -25,6 +25,7 @@
 #include "mem_tracker.h"
 #include "migration_map.h"
 #include "relocator.h"
+#include "term_ui.h"
 
 /* CRC32C from superblock.c */
 extern uint32_t crc32c(uint32_t crc, const void *buf, size_t len);
@@ -196,7 +197,7 @@ static int free_space_init(struct free_space *fs,
     if (!fs->sparse)
       return -1;
     mem_track_alloc(fs->sparse_chunks * sizeof(uint8_t *));
-    printf("  Free-space bitmap: lazy sparse (%lu chunks for %lu blocks)\n",
+    term_log_debug("  Free-space bitmap: lazy sparse (%lu chunks for %lu blocks)\n",
            (unsigned long)fs->sparse_chunks, (unsigned long)total_blocks);
   } else {
     fs->bitmap = calloc((total_blocks + 7) / 8, 1);
@@ -308,7 +309,7 @@ static int free_space_init(struct free_space *fs,
   free(ranges);
 
   fs->free_count = total_blocks - used_blocks;
-  printf("  Free blocks available: %lu\n", (unsigned long)fs->free_count);
+  term_log_debug("  Free blocks available: %lu\n", (unsigned long)fs->free_count);
   return 0;
 
 fail:
@@ -455,7 +456,7 @@ static int extent_hash_init(struct extent_hash *eh,
 
   size_t hash_bytes = eh->size * sizeof(struct extent_hash_entry);
   if (mem_track_exceeded()) {
-    printf(
+    term_log_debug(
         "  [Relocator] High memory usage detected, disabling extent hash.\n");
     return -1; /* Signal caller to fall back to linear scan */
   }
@@ -538,7 +539,7 @@ int relocator_plan(struct relocation_plan *plan,
   if (!plan->entries)
     return -1;
 
-  printf("=== Phase 2: Planning Block Relocation ===\n\n");
+  term_log_debug("=== Phase 2: Planning Block Relocation ===\n\n");
 
   /* Build conflict bitmap for O(1) lookups */
   uint8_t *conflict_bmp = build_conflict_bitmap(layout);
@@ -691,12 +692,12 @@ int relocator_plan(struct relocation_plan *plan,
     plan->count = active + 1;
   }
 
-  printf("  Relocation entries: %u (coalesced from individual blocks)\n",
+  term_log_debug("  Relocation entries: %u (coalesced from individual blocks)\n",
          plan->count);
-  printf("  Total bytes to move: %lu (%.1f MiB)\n",
+  term_log_debug("  Total bytes to move: %lu (%.1f MiB)\n",
          (unsigned long)plan->total_bytes_to_move,
          (double)plan->total_bytes_to_move / (1024.0 * 1024.0));
-  printf("==========================================\n\n");
+  term_log_debug("==========================================\n\n");
 
   return 0;
 }
@@ -916,18 +917,18 @@ static int relocate_group_batch(struct device *dev,
 int relocator_execute(struct relocation_plan *plan, struct device *dev,
                       struct btrfs_fs_info *fs_info, uint32_t block_size) {
   if (plan->count == 0) {
-    printf("No blocks need relocation.\n\n");
+    term_log_debug("No blocks need relocation.\n\n");
     return 0;
   }
 
   uint32_t done0 = migration_map_completed_count(plan);
-  printf("Executing %u block relocations (%u already completed)...\n",
+  term_log_debug("Executing %u block relocations (%u already completed)...\n",
          plan->count, done0);
 
   struct extent_hash ehash;
   int have_hash = (extent_hash_init(&ehash, fs_info, block_size) == 0);
 
-  printf("  Relocation I/O: double-buffer pipeline (2×%u MiB)\n",
+  term_log_debug("  Relocation I/O: double-buffer pipeline (2×%u MiB)\n",
          (unsigned)(RELOC_MAX_CHUNK / (1024U * 1024U)));
 
   if (device_read_batch_begin(dev) < 0) {
@@ -973,7 +974,7 @@ int relocator_execute(struct relocation_plan *plan, struct device *dev,
       }
 
       uint32_t completed = migration_map_completed_count(plan);
-      printf("Pass 2: entry=%u/%u completed=%u\n", e + 1, plan->count,
+      term_log_debug("Pass 2: entry=%u/%u completed=%u\n", e + 1, plan->count,
              completed);
     }
 
@@ -983,7 +984,7 @@ int relocator_execute(struct relocation_plan *plan, struct device *dev,
   if (have_hash)
    extent_hash_free(&ehash);
 
-  printf("  Block relocation complete\n\n");
+  term_log_debug("  Block relocation complete\n\n");
   return 0;
 }
 

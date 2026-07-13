@@ -21,10 +21,12 @@
 #include "conversion_eta.h"
 #include "device_io.h"
 #include "ext4/ext4_planner.h"
+#include "ext4/ext4_structures.h"
 #include "ext4/ext4_writer.h"
 #include "mem_tracker.h"
 #include "migration_map.h"
 #include "relocator.h"
+#include "term_ui.h"
 
 #define VERSION "0.1.0-alpha"
 
@@ -37,7 +39,7 @@ static void print_usage(const char *prog) {
       "Options:\n"
       "  -n, --dry-run           Simulate conversion (read-only, no "
       "writes)\n"
-      "  -v, --verbose           Enable verbose output\n"
+      "  -v, --verbose           Show diagnostic dumps (default: compact)\n"
       "  -b, --block-size N      Set ext4 block size (default: 4096)\n"
       "  -i, --inode-ratio N     Set inode ratio (default: 16384)\n"
       "  -r, --rollback          Rollback a previous conversion\n"
@@ -63,49 +65,7 @@ void btrfs2ext4_version(void) { printf("btrfs2ext4 version " VERSION "\n"); }
 
 static void progress_print(const char *phase, uint32_t percent,
                            const char *detail) {
-  static struct timespec start_time;
-  static int started = 0;
-  static const char *last_phase = NULL;
-
-  struct timespec now;
-  clock_gettime(CLOCK_MONOTONIC, &now);
-
-  /* Reset timer on phase change */
-  if (!started || !last_phase || strcmp(phase, last_phase) != 0) {
-    start_time = now;
-    started = 1;
-    last_phase = phase;
-  }
-
-  /* Build progress bar: [████████░░░░░░░░] 45% */
-  char bar[21]; /* 20 chars + null */
-  uint32_t filled = percent / 5;
-  for (uint32_t i = 0; i < 20; i++)
-    bar[i] = (i < filled) ? '#' : '-';
-  bar[20] = '\0';
-
-  /* Calculate ETA */
-  double elapsed = (double)(now.tv_sec - start_time.tv_sec) +
-                   (double)(now.tv_nsec - start_time.tv_nsec) / 1e9;
-  char eta_buf[32] = "";
-  if (percent > 0 && percent < 100 && elapsed > 1.0) {
-    double total_est = elapsed * 100.0 / (double)percent;
-    double remaining = total_est - elapsed;
-    if (remaining > 3600)
-      snprintf(eta_buf, sizeof(eta_buf), " ETA: %.0fh%.0fm", remaining / 3600,
-               fmod(remaining, 3600) / 60);
-    else if (remaining > 60)
-      snprintf(eta_buf, sizeof(eta_buf), " ETA: %.0fm%.0fs", remaining / 60,
-               fmod(remaining, 60));
-    else
-      snprintf(eta_buf, sizeof(eta_buf), " ETA: %.0fs", remaining);
-  }
-
-  printf("\r[%s] [%s] %3u%%%s %s", phase, bar, percent, eta_buf,
-         detail ? detail : "");
-  if (percent >= 100)
-    printf("\n");
-  fflush(stdout);
+  term_progress(phase, percent, detail);
 }
 
 /* ========================================================================
@@ -238,14 +198,14 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   struct convert_state st;
   convert_state_init(&st);
 
-  printf("==============================================\n");
-  printf("   btrfs2ext4 v" VERSION "\n");
-  printf("   In-place Btrfs → Ext4 Converter\n");
-  printf("==============================================\n\n");
+  term_ui_init();
+  term_ui_set_verbose(opts->verbose);
+  term_banner(VERSION);
 
-  if (opts->dry_run) {
-    printf("*** DRY RUN MODE — no changes will be written ***\n\n");
-  }
+  if (opts->dry_run)
+    term_kv("Mode", "dry-run (no writes)");
+  else
+    term_kv("Mode", "convert (in-place)");
 
   /* Unified memory policy (mem_tracker) */
   mem_config_init(&st.mem_cfg, opts->memory_limit_mb,
@@ -255,8 +215,9 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   if (device_open(&st.dev, opts->device_path, opts->dry_run) < 0)
     goto cleanup;
 
-  printf("Device: %s (%.1f GiB)\n\n", opts->device_path,
-         (double)st.dev.size / (1024.0 * 1024.0 * 1024.0));
+  term_kv("Device", "%s (%.1f GiB)", opts->device_path,
+          (double)st.dev.size / (1024.0 * 1024.0 * 1024.0));
+  printf("\n");
 
   if (!opts->dry_run && migration_map_detect_existing(&st.dev) > 0 &&
       !opts->force) {
@@ -279,11 +240,17 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   if (progress)
     progress("Pass 1", 100, "Btrfs metadata read complete");
 
+  {
+    const char *label =
+        st.fs_info.sb.label[0] ? st.fs_info.sb.label : "(none)";
+    term_kv("Label", "%s", label);
+  }
+
   /* ================================================
    * PASS 2: Plan ext4 layout + relocate conflicts
    * ================================================ */
   if (progress)
-    progress("Pass 2", 0, "Planning ext4 st.layout...");
+    progress("Pass 2", 0, "Planning ext4 layout...");
 
   struct ext4_space_budget space_budget;
   if (ext4_plan_layout(&st.fs_info, st.dev.size, opts->block_size,
@@ -350,44 +317,8 @@ int btrfs2ext4_convert(const struct convert_options *opts,
   if (progress)
     progress("Pass 2", 100, "Layout planned, relocation complete");
 
-  printf("\n=== Hardware Viability Audit (Pre-flight Check) ===\n");
-  printf("  RAM total detected:     %.1f GiB\n",
-         (double)st.mem_cfg.total_ram / (1024.0 * 1024.0 * 1024.0));
-
-  double ext4_ino_ram =
-      (double)(st.fs_info.inode_count * sizeof(struct inode_map_entry) * 3) /
-      (1024.0 * 1024.0);
-  printf("  Conversion RAM needed:  %.1f MiB%s\n", ext4_ino_ram,
-         (ext4_ino_ram * 1024 * 1024 > st.mem_cfg.mmap_threshold)
-             ? " (mmap WILL BE USED)"
-             : " (in-memory)");
-
-  printf("  Data blocks required:   %u blocks (%.1f MiB)\n",
-         space_budget.data_blocks,
-         (double)space_budget.data_blocks * st.layout.block_size /
-             (1024.0 * 1024.0));
-  printf("  Journal reservation:    %u blocks (%.1f MiB)\n",
-         space_budget.journal_blocks,
-         (double)space_budget.journal_blocks * st.layout.block_size /
-             (1024.0 * 1024.0));
-  printf("  HTree reservation:      %u blocks (%.1f MiB)\n",
-         space_budget.htree_blocks,
-         (double)space_budget.htree_blocks * st.layout.block_size /
-             (1024.0 * 1024.0));
-  printf("  Dedup/CoW expansion:    %u blocks (%.1f MiB)\n",
-         space_budget.dedup_blocks,
-         (double)space_budget.dedup_blocks * st.layout.block_size /
-             (1024.0 * 1024.0));
-  printf("  Decompression reserve:  %u blocks (%.1f MiB)\n",
-         space_budget.decompression_blocks,
-         (double)space_budget.decompression_blocks * st.layout.block_size /
-             (1024.0 * 1024.0));
-  printf("  Metadata reserved:      %u blocks\n",
-         space_budget.metadata_blocks);
-  printf("  Safety margin (%u%%):    %u blocks (%.1f MiB)\n",
-         st.layout.safety_margin_percent, space_budget.safety_margin_blocks,
-         (double)space_budget.safety_margin_blocks * st.layout.block_size /
-             (1024.0 * 1024.0));
+  /* Viability + ETA: compact by default, full dump with -v */
+  double headroom_pct = 0.0;
   {
     uint64_t physically_usable =
         st.layout.total_blocks > space_budget.metadata_blocks
@@ -397,24 +328,67 @@ int btrfs2ext4_convert(const struct convert_options *opts,
                          ? physically_usable - space_budget.total_required -
                                space_budget.safety_margin_blocks
                          : 0;
-    printf("  Space viability check:  OK (%.1f%% headroom after margin)\n",
-           physically_usable > 0
-               ? (double)slack * 100.0 / (double)physically_usable
-               : 0.0);
+    headroom_pct = physically_usable > 0
+                       ? (double)slack * 100.0 / (double)physically_usable
+                       : 0.0;
   }
-  printf("===================================================\n\n");
 
-  /* ================================================
-   * Conversion time estimate (analytical; benchmark only on dry-run)
-   * ================================================ */
+  if (term_ui_is_verbose()) {
+    printf("\n=== Hardware Viability Audit (Pre-flight Check) ===\n");
+    printf("  RAM total detected:     %.1f GiB\n",
+           (double)st.mem_cfg.total_ram / (1024.0 * 1024.0 * 1024.0));
+
+    double ext4_ino_ram =
+        (double)(st.fs_info.inode_count * sizeof(struct inode_map_entry) * 3) /
+        (1024.0 * 1024.0);
+    printf("  Conversion RAM needed:  %.1f MiB%s\n", ext4_ino_ram,
+           (ext4_ino_ram * 1024 * 1024 > st.mem_cfg.mmap_threshold)
+               ? " (mmap WILL BE USED)"
+               : " (in-memory)");
+
+    printf("  Data blocks required:   %u blocks (%.1f MiB)\n",
+           space_budget.data_blocks,
+           (double)space_budget.data_blocks * st.layout.block_size /
+               (1024.0 * 1024.0));
+    printf("  Journal reservation:    %u blocks (%.1f MiB)\n",
+           space_budget.journal_blocks,
+           (double)space_budget.journal_blocks * st.layout.block_size /
+               (1024.0 * 1024.0));
+    printf("  HTree reservation:      %u blocks (%.1f MiB)\n",
+           space_budget.htree_blocks,
+           (double)space_budget.htree_blocks * st.layout.block_size /
+               (1024.0 * 1024.0));
+    printf("  Dedup/CoW expansion:    %u blocks (%.1f MiB)\n",
+           space_budget.dedup_blocks,
+           (double)space_budget.dedup_blocks * st.layout.block_size /
+               (1024.0 * 1024.0));
+    printf("  Decompression reserve:  %u blocks (%.1f MiB)\n",
+           space_budget.decompression_blocks,
+           (double)space_budget.decompression_blocks * st.layout.block_size /
+               (1024.0 * 1024.0));
+    printf("  Metadata reserved:      %u blocks\n",
+           space_budget.metadata_blocks);
+    printf("  Safety margin (%u%%):    %u blocks (%.1f MiB)\n",
+           st.layout.safety_margin_percent, space_budget.safety_margin_blocks,
+           (double)space_budget.safety_margin_blocks * st.layout.block_size /
+               (1024.0 * 1024.0));
+    printf("  Space viability check:  OK (%.1f%% headroom after margin)\n",
+           headroom_pct);
+    printf("===================================================\n\n");
+  }
+
+  double eta_min = 0.0, eta_max = 0.0;
   {
     struct conversion_eta eta;
     double throughput_scale = 1.0;
 
-    printf("=== Conversion Time Estimate ===\n");
+    if (term_ui_is_verbose())
+      printf("=== Conversion Time Estimate ===\n");
+
     if (conversion_eta_estimate(&st.dev, &st.layout, &space_budget,
                                 &st.reloc_plan, &st.fs_info, 1.0, &eta) != 0) {
-      printf("  WARNING: ETA model failed.\n");
+      if (term_ui_is_verbose())
+        printf("  WARNING: ETA model failed.\n");
     } else {
       if (opts->dry_run) {
         uint64_t bench_size = 128ULL * 1024 * 1024;
@@ -442,49 +416,59 @@ int btrfs2ext4_convert(const struct convert_options *opts,
                 ((double)read_bytes / (1024.0 * 1024.0)) / elapsed_sec;
             double expected = (eta.device_rotational == 1) ? 120.0 : 400.0;
             throughput_scale = speed_mb_s / expected;
-            printf("  Read benchmark:         %.1f MB/s (scale %.2fx)\n",
-                   speed_mb_s, throughput_scale);
+            if (term_ui_is_verbose())
+              printf("  Read benchmark:         %.1f MB/s (scale %.2fx)\n",
+                     speed_mb_s, throughput_scale);
             conversion_eta_estimate(&st.dev, &st.layout, &space_budget,
                                     &st.reloc_plan, &st.fs_info,
                                     throughput_scale, &eta);
           }
         }
       }
-      const char *media = eta.device_rotational == 1
-                              ? "HDD"
-                              : (eta.device_rotational == 0 ? "SSD/NVMe"
-                                                            : "unknown");
-      printf("  Storage class:          %s\n", media);
-      printf("  Pass 1 (metadata read): %.1f s\n", eta.pass1_sec);
-      printf("  Pass 2 (relocation):    %.1f s (%lu MiB moved)\n",
-             eta.pass2_reloc_sec,
-             (unsigned long)((eta.pass2_read_bytes + eta.pass2_write_bytes) /
-                             (1024 * 1024)));
-      printf("  Pass 3 (ext4 write):    %.1f s (%lu MiB footprint)\n",
-             eta.pass3_write_sec,
-             (unsigned long)(eta.pass3_write_bytes / (1024 * 1024)));
-      printf("\n  >> Estimated conversion time: %.0f–%.0f seconds <<\n",
-             eta.total_min_sec, eta.total_max_sec);
+      eta_min = eta.total_min_sec;
+      eta_max = eta.total_max_sec;
+      if (term_ui_is_verbose()) {
+        const char *media = eta.device_rotational == 1
+                                ? "HDD"
+                                : (eta.device_rotational == 0 ? "SSD/NVMe"
+                                                              : "unknown");
+        printf("  Storage class:          %s\n", media);
+        printf("  Pass 1 (metadata read): %.1f s\n", eta.pass1_sec);
+        printf("  Pass 2 (relocation):    %.1f s (%lu MiB moved)\n",
+               eta.pass2_reloc_sec,
+               (unsigned long)((eta.pass2_read_bytes + eta.pass2_write_bytes) /
+                               (1024 * 1024)));
+        printf("  Pass 3 (ext4 write):    %.1f s (%lu MiB footprint)\n",
+               eta.pass3_write_sec,
+               (unsigned long)(eta.pass3_write_bytes / (1024 * 1024)));
+        printf("\n  >> Estimated conversion time: %.0f–%.0f seconds <<\n",
+               eta.total_min_sec, eta.total_max_sec);
+      }
     }
-    printf("================================\n\n");
+    if (term_ui_is_verbose())
+      printf("================================\n\n");
   }
 
   /* ================================================
    * PASS 3: Write ext4 structures
    * ================================================ */
   if (opts->dry_run) {
-    printf("=== DRY RUN: Would write ext4 structures here ===\n");
-    printf("  - %u block groups\n", st.layout.num_groups);
-    printf("  - %u inodes\n", st.layout.total_inodes);
-    printf("  - %u data/metadata conflicts detected\n", conflicts);
-    printf("  - %u blocks would be relocated\n", st.reloc_plan.count);
-    printf("  - %lu total blocks\n", (unsigned long)st.layout.total_blocks);
+    printf("  Pass 3    skipped (dry-run)\n");
 
-    /* Dry-run integrity check: physically read all conflicting blocks
-     * and compute CRC32C to detect I/O errors / bad sectors */
+    printf("\n");
+    printf("  Groups %u · Inodes %u · Conflicts %u · Relocations %u\n",
+           st.layout.num_groups, st.layout.total_inodes, conflicts,
+           st.reloc_plan.count);
+    printf("  Viability OK (%.0f%% headroom) · ETA ~%.0f–%.0fs\n\n",
+           headroom_pct, eta_min, eta_max);
+    term_ok("Dry-run complete — no changes written.");
+
+    /* Dry-run integrity check: physically read all conflicting blocks */
     if (st.reloc_plan.count > 0) {
-      printf("\n=== Dry-Run Integrity Check ===\n");
-      printf("  Reading %u conflicting blocks...\n", st.reloc_plan.count);
+      if (term_ui_is_verbose()) {
+        printf("\n=== Dry-Run Integrity Check ===\n");
+        printf("  Reading %u conflicting blocks...\n", st.reloc_plan.count);
+      }
 
       uint32_t read_errors = 0;
       uint32_t blocks_checked = 0;
@@ -505,8 +489,8 @@ int btrfs2ext4_convert(const struct convert_options *opts,
             blocks_checked++;
           }
 
-          /* Progress every 1000 blocks */
-          if ((r + 1) % 1000 == 0 || r + 1 == st.reloc_plan.count) {
+          if (term_ui_is_verbose() &&
+              ((r + 1) % 1000 == 0 || r + 1 == st.reloc_plan.count)) {
             printf("  [%u/%u] blocks verified\r", r + 1, st.reloc_plan.count);
             fflush(stdout);
           }
@@ -516,8 +500,10 @@ int btrfs2ext4_convert(const struct convert_options *opts,
         fprintf(stderr, "  WARNING: could not allocate check buffer\n");
       }
 
-      printf("\n  Integrity check: %u blocks verified, %u read errors\n",
-             blocks_checked, read_errors);
+      if (term_ui_is_verbose()) {
+        printf("\n  Integrity check: %u blocks verified, %u read errors\n",
+               blocks_checked, read_errors);
+      }
 
       if (read_errors > 0) {
         fprintf(stderr,
@@ -526,10 +512,10 @@ int btrfs2ext4_convert(const struct convert_options *opts,
                 "  Conversion may fail or produce corrupt data.\n"
                 "  Consider cloning the device first with ddrescue.\n\n",
                 read_errors);
-      } else {
+      } else if (term_ui_is_verbose()) {
         printf("  All conflicting blocks are readable.\n");
+        printf("===============================\n");
       }
-      printf("===============================\n");
     }
 
     st.ret = 0;
@@ -541,28 +527,25 @@ int btrfs2ext4_convert(const struct convert_options *opts,
     goto cleanup;
   }
 
-  printf("\n:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::\n");
-  printf("::          DANGER: POINT OF NO RETURN\n");
-  printf(":: The converter is about to overwrite filesystem metadata.\n");
-  printf(":: An interruption (power loss, ctrl-c, crash) from this\n");
-  printf(":: point forward will render the filesystem UNMOUNTABLE.\n");
-  printf("::\n");
-  printf(":: If interrupted during Pass 2, run:\n");
-  printf("::     btrfs2ext4 --rollback %s\n", opts->device_path);
-  printf(":: If interrupted during Pass 3, run:\n");
-  printf("::     btrfs2ext4 --emergency-recover %s\n", opts->device_path);
-  printf(":::::::::::::::::::::::::::::::::::::::::::::::::::::::::::\n\n");
+  printf("\n");
+  term_warn("POINT OF NO RETURN — about to overwrite filesystem metadata.");
+  term_warn("If interrupted in Pass 2: btrfs2ext4 --rollback %s",
+            opts->device_path);
+  term_warn("If interrupted in Pass 3: btrfs2ext4 --emergency-recover %s",
+            opts->device_path);
+  printf("\n");
 
   if (progress)
     progress("Pass 3", 0, "Writing ext4 filesystem...");
 
-  printf("=== Phase 3: Writing Ext4 Structures ===\n\n");
+  term_log_debug("=== Phase 3: Writing Ext4 Structures ===\n\n");
 
   if (progress)
     progress("Pass 3", 0, "Linearizing I/O (sorting inodes)...");
 
-  printf("Sorting %u inodes for optimal Ext4 sequential I/O layout...\n",
-         st.fs_info.inode_count);
+  term_log_debug(
+      "Sorting %u inodes for optimal Ext4 sequential I/O layout...\n",
+      st.fs_info.inode_count);
   qsort(st.fs_info.inode_table, st.fs_info.inode_count, sizeof(struct file_entry *),
         compare_file_entry);
 
@@ -671,11 +654,8 @@ int btrfs2ext4_convert(const struct convert_options *opts,
     progress("Pass 3", 100, "Ext4 filesystem written!");
 
   printf("\n");
-  printf("==============================================\n");
-  printf("   Conversion complete!\n");
-  printf("==============================================\n");
-  printf("\n");
-  printf("Next steps:\n");
+  term_ok("Conversion complete!");
+  printf("\nNext steps:\n");
   printf("  1. Run: e2fsck -f %s\n", opts->device_path);
   printf("  2. Mount: mount %s /mnt\n", opts->device_path);
   printf("  3. (Optional) Defragment: e4defrag /mnt\n");
@@ -750,8 +730,8 @@ int main(int argc, char **argv) {
       {NULL, 0, NULL, 0}};
 
   int opt;
-  while ((opt = getopt_long(argc, argv, "nvb:i:rfw:m:hV", long_options, NULL)) !=
-         -1) {
+  while ((opt = getopt_long(argc, argv, "nvb:i:rfw:m:hV", long_options,
+                            NULL)) != -1) {
     switch (opt) {
     case 'n':
       opts.dry_run = 1;
@@ -768,9 +748,16 @@ int main(int argc, char **argv) {
         return 1;
       }
       break;
-    case 'i':
-      opts.inode_ratio = (uint32_t)atoi(optarg);
+    case 'i': {
+      long ratio = strtol(optarg, NULL, 10);
+      if (ratio <= 0 || ratio > (long)EXT4_MAX_INODE_RATIO) {
+        fprintf(stderr, "Invalid inode ratio %ld (must be 1-%u)\n", ratio,
+                EXT4_MAX_INODE_RATIO);
+        return 1;
+      }
+      opts.inode_ratio = (uint32_t)ratio;
       break;
+    }
     case 'r':
       opts.rollback = 1;
       break;
@@ -813,6 +800,13 @@ int main(int argc, char **argv) {
   if (optind >= argc) {
     fprintf(stderr, "Error: no device specified\n\n");
     print_usage(argv[0]);
+    return 1;
+  }
+
+  if (opts.inode_ratio < opts.block_size) {
+    fprintf(stderr,
+            "Invalid inode ratio %u (must be at least block size %u)\n",
+            opts.inode_ratio, opts.block_size);
     return 1;
   }
 

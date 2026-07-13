@@ -29,6 +29,7 @@
 #include "ext4/ext4_writer.h"
 #include "relocator.h"
 #include "thread_pool.h"
+#include "term_ui.h"
 
 static int dir_needs_htree(const struct file_entry *dir, uint32_t block_size) {
   uint32_t dir_size = 24;
@@ -450,7 +451,7 @@ int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
   uint32_t block_size = layout->block_size;
   uint32_t inode_size = layout->inode_size;
 
-  printf("Writing inode tables...\n");
+  term_log_debug("Writing inode tables...\n");
 
   struct ext4_super_block sb;
   if (device_read(dev, EXT4_SUPER_OFFSET, &sb, sizeof(sb)) < 0)
@@ -475,7 +476,7 @@ int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
     inode_map_add(inode_map, btrfs_ino, next_ino++);
   }
 
-  printf("  Mapped %u btrfs inodes to ext4 inode numbers\n", inode_map->count);
+  term_log_debug("  Mapped %u btrfs inodes to ext4 inode numbers\n", inode_map->count);
 
   /* Build hash table for O(1) lookups from here on */
   inode_map_build_hash(inode_map);
@@ -896,7 +897,7 @@ int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
     free(table_buf);
   }
 
-  printf("  Inode tables written\n");
+  term_log_debug("  Inode tables written\n");
   free(btrfs_for_ext4);
 
   if (g_decomp_pool) {

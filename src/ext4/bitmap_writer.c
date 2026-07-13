@@ -17,6 +17,7 @@
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_structures.h"
 #include "ext4/ext4_writer.h"
+#include "term_ui.h"
 
 static inline void bitmap_set(uint8_t *bitmap, uint64_t bit,
                               uint32_t max_bits) {
@@ -121,21 +122,21 @@ static int write_bitmaps_from_state(struct device *dev,
 int ext4_write_bitmaps(struct device *dev, const struct ext4_layout *layout,
                        const struct ext4_block_allocator *alloc,
                        const struct inode_map *inode_map) {
-  printf("Writing block and inode bitmaps...\n");
+  term_log_debug("Writing block and inode bitmaps...\n");
   if (write_bitmaps_from_state(dev, layout, alloc, inode_map) < 0)
     return -1;
-  printf("  Bitmaps written for %u groups\n", layout->num_groups);
+  term_log_debug("  Bitmaps written for %u groups\n", layout->num_groups);
   return 0;
 }
 
 int ext4_finalize_bitmaps(struct device *dev, struct ext4_layout *layout,
                           const struct ext4_block_allocator *alloc,
                           const struct inode_map *inode_map) {
-  printf("Finalizing block and inode bitmaps from in-memory state...\n");
+  term_log_debug("Finalizing block and inode bitmaps from in-memory state...\n");
   if (write_bitmaps_from_state(dev, layout, alloc, inode_map) < 0)
     return -1;
   ext4_update_gdt_used_dirs(dev, layout);
-  printf("  Bitmaps finalized for %u groups\n", layout->num_groups);
+  term_log_debug("  Bitmaps finalized for %u groups\n", layout->num_groups);
   return 0;
 }
 
@@ -145,7 +146,7 @@ int ext4_update_free_counts(struct device *dev,
   uint64_t total_free_blocks = 0;
   uint64_t total_free_inodes = 0;
 
-  printf("Calculating true free blocks and inodes...\n");
+  term_log_debug("Calculating true free blocks and inodes...\n");
 
   struct ext4_super_block sb;
   if (device_read(dev, EXT4_SUPER_OFFSET, &sb, sizeof(sb)) < 0) {
@@ -248,8 +249,8 @@ int ext4_update_free_counts(struct device *dev,
   }
 
   free(bitmap);
-  printf("  Total free blocks: %lu\n", (unsigned long)total_free_blocks);
-  printf("  Total free inodes: %lu\n", (unsigned long)total_free_inodes);
+  term_log_debug("  Total free blocks: %lu\n", (unsigned long)total_free_blocks);
+  term_log_debug("  Total free inodes: %lu\n", (unsigned long)total_free_inodes);
 
   return 0;
 }
