@@ -1,5 +1,7 @@
 # btrfs2ext4
 
+[![CI](https://github.com/YukaC/btrfs2ext4/actions/workflows/ci.yml/badge.svg)](https://github.com/YukaC/btrfs2ext4/actions/workflows/ci.yml)
+
 **In-place Btrfs → Ext4 filesystem converter**
 
 > [!CAUTION]
@@ -108,6 +110,10 @@ cmake --build build -j$(nproc)
 cd build && ctest --output-on-failure
 ```
 
+### Continuous integration
+
+GitHub Actions builds and tests every push/PR to `main` on Ubuntu with GCC and Clang in Debug (ASan+UBSan) and Release configurations (see `.github/workflows/ci.yml`).
+
 ---
 
 ## Usage
@@ -124,6 +130,7 @@ btrfs2ext4 [options] <device>
 | `-i N`, `--inode-ratio N`    | Bytes-per-inode ratio (default: 16384)             |
 | `-w PATH`, `--workdir PATH`  | Directory for mmap() swap files (default: ./)      |
 | `-m LIMIT`, `--memory-limit` | Memory threshold for mmap, in bytes or `%`         |
+| `--safety-margin N`          | Planner free-space headroom % (1–25, default 5)    |
 | `-r`, `--rollback`           | Restore original Btrfs superblock from backup      |
 | `-V`, `--version`            | Print version                                      |
 | `-h`, `--help`               | Print help                                         |
@@ -135,6 +142,8 @@ btrfs2ext4 [options] <device>
 sudo umount /dev/sdX1
 
 # 2. Dry-run first — checks space, estimates time, detects problems
+#    Prints planner budget (data/journal/HTree/dedup/decompression) and an
+#    analytical conversion ETA (HDD/SSD via sysfs; optional 128 MiB read benchmark)
 sudo btrfs2ext4 -n /dev/sdX1
 
 # 3. Convert

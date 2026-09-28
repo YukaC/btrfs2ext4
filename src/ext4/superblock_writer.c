@@ -11,12 +11,10 @@
 
 #include "btrfs/btrfs_reader.h"
 #include "device_io.h"
+#include "ext4/ext4_metadata_csum.h"
 #include "ext4/ext4_planner.h"
 #include "ext4/ext4_structures.h"
 #include "ext4/ext4_writer.h"
-
-/* CRC32C from superblock.c */
-extern uint32_t crc32c(uint32_t crc, const void *buf, size_t len);
 
 int ext4_write_superblock(struct device *dev, const struct ext4_layout *layout,
                           const struct btrfs_fs_info *fs_info) {
@@ -70,19 +68,19 @@ int ext4_write_superblock(struct device *dev, const struct ext4_layout *layout,
 
   /* Feature flags:
    * - COMPAT: EXT_ATTR, DIR_INDEX, HAS_JOURNAL
-   * - INCOMPAT: FILETYPE, EXTENTS, 64BIT, FLEX_BG
+   * - INCOMPAT: FILETYPE, EXTENTS, 64BIT, FLEX_BG (CSUM_SEED disabled)
    * - RO_COMPAT: SPARSE_SUPER, LARGE_FILE, HUGE_FILE, GDT_CSUM,
-   *              DIR_NLINK, EXTRA_ISIZE
+   *              DIR_NLINK, EXTRA_ISIZE, METADATA_CSUM
+   *
+   * Phase 1: METADATA_CSUM for inode checksums; CSUM_SEED disabled (seed from
+   * UUID). Superblock checksum itself is deferred to a later phase.
    */
   sb.s_feature_compat = htole32(
       EXT4_FEATURE_COMPAT_EXT_ATTR | EXT4_FEATURE_COMPAT_DIR_INDEX |
       EXT4_FEATURE_COMPAT_RESIZE_INODE | EXT4_FEATURE_COMPAT_HAS_JOURNAL);
-  /* Bug O fix: Added CSUM_SEED (incompat) and METADATA_CSUM (ro_compat)
-   * for modern ext4 metadata checksumming support (kernel 3.18+). */
   sb.s_feature_incompat =
       htole32(EXT4_FEATURE_INCOMPAT_FILETYPE | EXT4_FEATURE_INCOMPAT_EXTENTS |
-              EXT4_FEATURE_INCOMPAT_64BIT | EXT4_FEATURE_INCOMPAT_FLEX_BG |
-              EXT4_FEATURE_INCOMPAT_CSUM_SEED);
+              EXT4_FEATURE_INCOMPAT_64BIT | EXT4_FEATURE_INCOMPAT_FLEX_BG);
   sb.s_feature_ro_compat = htole32(
       EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER | EXT4_FEATURE_RO_COMPAT_LARGE_FILE |
       EXT4_FEATURE_RO_COMPAT_HUGE_FILE | EXT4_FEATURE_RO_COMPAT_GDT_CSUM |
@@ -91,6 +89,8 @@ int ext4_write_superblock(struct device *dev, const struct ext4_layout *layout,
 
   /* Generate UUID */
   uuid_generate(sb.s_uuid);
+  sb.s_checksum_seed = htole32(ext4_csum_seed_from_uuid(sb.s_uuid));
+  sb.s_checksum_type = EXT4_CRC32C_CHKSUM;
 
   /* Volume name — copy from btrfs label if available */
   if (fs_info->sb.label[0]) {
@@ -121,6 +121,8 @@ int ext4_write_superblock(struct device *dev, const struct ext4_layout *layout,
   sb.s_reserved_gdt_blocks =
       htole16((uint16_t)layout->groups[0].reserved_gdt_blocks);
 
+  ext4_superblock_csum_set(&sb);
+
   /* Write primary superblock at offset 1024 */
   printf("Writing ext4 superblock at offset %u...\n", EXT4_SUPER_OFFSET);
 
@@ -144,6 +146,7 @@ int ext4_write_superblock(struct device *dev, const struct ext4_layout *layout,
       continue;
 
     sb.s_block_group_nr = htole16((uint16_t)g);
+    ext4_superblock_csum_set(&sb);
 
     memset(sb_buf, 0, block_size);
     memcpy(sb_buf, &sb,

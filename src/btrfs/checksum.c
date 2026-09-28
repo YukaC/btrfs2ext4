@@ -114,9 +114,8 @@ int btrfs_verify_checksum(uint16_t type, const uint8_t *stored_csum,
     break;
   }
   case BTRFS_CSUM_TYPE_BLAKE2: {
-#ifdef HAVE_LIBCRYPTO
+#if defined(HAVE_LIBCRYPTO) && defined(HAVE_OPENSSL_BLAKE2B256)
     unsigned int md_len = 0;
-    // OpenSSL uses blake2b256
     if (!EVP_Digest(data, len, computed, &md_len, EVP_blake2b256(), NULL)) {
       fprintf(stderr, "error: EVP_Digest() failed for BLAKE2b-256\n");
       return -1;

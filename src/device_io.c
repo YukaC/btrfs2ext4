@@ -145,9 +145,22 @@ int device_write(struct device *dev, uint64_t offset, const void *buf,
   return 0;
 }
 
+#ifdef BTRFS_TESTING
+static int g_fail_next_sync = 0;
+void device_test_fail_next_sync(void) { g_fail_next_sync = 1; }
+#endif
+
 int device_sync(struct device *dev) {
   if (dev->read_only)
     return 0;
+
+#ifdef BTRFS_TESTING
+  if (g_fail_next_sync) {
+    g_fail_next_sync = 0;
+    fprintf(stderr, "btrfs2ext4: sync error: simulated failure\n");
+    return -1;
+  }
+#endif
 
   if (fdatasync(dev->fd) < 0) {
     fprintf(stderr, "btrfs2ext4: sync error: %s\n", strerror(errno));

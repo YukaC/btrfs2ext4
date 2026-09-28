@@ -1,3 +1,6 @@
+# BTRFS2EXT4_ENABLE_SANITIZERS: enable AddressSanitizer + UBSan on all test
+# targets. Defaults to ON for Debug builds and OFF for Release. Override with
+# -DBTRFS2EXT4_ENABLE_SANITIZERS=ON|OFF.
 cmake_minimum_required(VERSION 3.16)
 project(btrfs2ext4 C)
 
@@ -14,6 +17,15 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug)
 endif()
 
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(BTRFS2EXT4_ENABLE_SANITIZERS_DEFAULT ON)
+else()
+    set(BTRFS2EXT4_ENABLE_SANITIZERS_DEFAULT OFF)
+endif()
+option(BTRFS2EXT4_ENABLE_SANITIZERS
+       "Enable ASan+UBSan on test targets"
+       ${BTRFS2EXT4_ENABLE_SANITIZERS_DEFAULT})
+
 # Find required libraries
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(UUID REQUIRED uuid)
@@ -22,8 +34,19 @@ pkg_check_modules(ZLIB REQUIRED zlib)
 # Optional checksum libraries
 pkg_check_modules(CRYPTO libcrypto)
 if(CRYPTO_FOUND)
-    add_definitions(-DHAVE_LIBCRYPTO=1)
-    message(STATUS "Found libcrypto: enabling SHA256 and BLAKE2b support")
+    include(CheckSymbolExists)
+    set(CMAKE_REQUIRED_INCLUDES ${CRYPTO_INCLUDE_DIRS})
+    set(CMAKE_REQUIRED_LIBRARIES ${CRYPTO_LIBRARIES})
+    check_symbol_exists(EVP_sha256 "openssl/evp.h" HAVE_OPENSSL_SHA256)
+    check_symbol_exists(EVP_blake2b256 "openssl/evp.h" HAVE_OPENSSL_BLAKE2B256)
+    if(HAVE_OPENSSL_SHA256 OR HAVE_OPENSSL_BLAKE2B256)
+        add_definitions(-DHAVE_LIBCRYPTO=1)
+        message(STATUS "Found libcrypto: enabling OpenSSL checksum support")
+    endif()
+    if(HAVE_OPENSSL_BLAKE2B256)
+        add_definitions(-DHAVE_OPENSSL_BLAKE2B256=1)
+        message(STATUS "Found EVP_blake2b256: enabling BLAKE2b support")
+    endif()
 endif()
 
 pkg_check_modules(XXHASH libxxhash)
@@ -77,17 +100,22 @@ endif()
 # Source files
 set(BTRFS2EXT4_SOURCES
     src/main.c
+    src/conversion_eta.c
     src/device_io.c
     src/btrfs/checksum.c
     src/btrfs/superblock.c
     src/btrfs/chunk_tree.c
+    src/btrfs/tree_walk.c
     src/btrfs/btree.c
     src/btrfs/fs_tree.c
     src/btrfs/decompress.c
     src/ext4/planner.c
+    src/ext4/ext4_space.c
     src/ext4/superblock_writer.c
     src/ext4/gdt_writer.c
     src/ext4/bitmap_writer.c
+    src/ext4/metadata_csum.c
+    src/ext4/inode_checksum.c
     src/ext4/inode_writer.c
     src/ext4/dir_writer.c
     src/ext4/extent_writer.c
@@ -95,7 +123,6 @@ set(BTRFS2EXT4_SOURCES
     src/ext4/ext4_crc16.c
     src/relocator.c
     src/bloom.c
-    src/journal.c
     src/mem_tracker.c
     src/migration_map.c
     src/thread_pool.c
@@ -103,6 +130,7 @@ set(BTRFS2EXT4_SOURCES
 
 # Main executable
 add_executable(btrfs2ext4 ${BTRFS2EXT4_SOURCES})
+target_compile_definitions(btrfs2ext4 PRIVATE BTRFS2EXT4_NO_RELOC_JOURNAL=1)
 
 target_link_libraries(btrfs2ext4
     ${UUID_LIBRARIES}
@@ -140,17 +168,22 @@ enable_testing()
 
 # Shared source files (everything except main.c)
 set(BTRFS2EXT4_LIB_SOURCES
+    src/conversion_eta.c
     src/device_io.c
     src/btrfs/checksum.c
     src/btrfs/superblock.c
     src/btrfs/chunk_tree.c
+    src/btrfs/tree_walk.c
     src/btrfs/btree.c
     src/btrfs/fs_tree.c
     src/btrfs/decompress.c
     src/ext4/planner.c
+    src/ext4/ext4_space.c
     src/ext4/superblock_writer.c
     src/ext4/gdt_writer.c
     src/ext4/bitmap_writer.c
+    src/ext4/metadata_csum.c
+    src/ext4/inode_checksum.c
     src/ext4/inode_writer.c
     src/ext4/dir_writer.c
     src/ext4/extent_writer.c
@@ -158,7 +191,6 @@ set(BTRFS2EXT4_LIB_SOURCES
     src/ext4/ext4_crc16.c
     src/relocator.c
     src/bloom.c
-    src/journal.c
     src/mem_tracker.c
     src/migration_map.c
     src/thread_pool.c
@@ -166,6 +198,7 @@ set(BTRFS2EXT4_LIB_SOURCES
 
 # Stress / vulnerability / performance test suite
 add_executable(test_stress tests/test_stress.c ${BTRFS2EXT4_LIB_SOURCES})
+target_compile_definitions(test_stress PRIVATE BTRFS_TESTING=1)
 target_link_libraries(test_stress
     ${UUID_LIBRARIES}
     ${ZLIB_LIBRARIES}
@@ -173,6 +206,7 @@ target_link_libraries(test_stress
 )
 
 add_executable(test_fuzz tests/test_fuzz.c ${BTRFS2EXT4_LIB_SOURCES})
+target_compile_definitions(test_fuzz PRIVATE BTRFS_TESTING=1)
 target_link_libraries(test_fuzz
     ${UUID_LIBRARIES}
     ${ZLIB_LIBRARIES}
@@ -225,6 +259,8 @@ endif()
 
 # --- Integration Test ---
 add_executable(test_integration tests/test_integration.c ${BTRFS2EXT4_LIB_SOURCES})
+target_compile_definitions(test_integration PRIVATE
+    BTRFS_TESTING=1 BTRFS2EXT4_NO_RELOC_JOURNAL=1)
 target_link_libraries(test_integration
     ${UUID_LIBRARIES}
     ${ZLIB_LIBRARIES}
@@ -252,16 +288,28 @@ add_test(NAME fuzz_test COMMAND test_fuzz)
 add_test(NAME checksum_test COMMAND test_checksum)
 add_test(NAME integration_test COMMAND test_integration)
 
-# Enable AddressSanitizer in debug builds for memory bug detection (if available)
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    include(CheckCCompilerFlag)
-    check_c_compiler_flag(-fsanitize=address HAS_ASAN)
-    if(HAS_ASAN)
-        target_compile_options(test_stress PRIVATE -fsanitize=address -fno-omit-frame-pointer)
-        target_link_options(test_stress PRIVATE -fsanitize=address)
-        
-        # Agregamos ASAN al test de integracion tambien
-        target_compile_options(test_integration PRIVATE -fsanitize=address -fno-omit-frame-pointer)
-        target_link_options(test_integration PRIVATE -fsanitize=address)
+
+function(btrfs2ext4_enable_sanitizers target)
+    if(NOT BTRFS2EXT4_ENABLE_SANITIZERS)
+        return()
     endif()
-endif()
+    include(CheckCCompilerFlag)
+    if(NOT DEFINED HAS_BTRFS2EXT4_SANITIZERS)
+        set(CMAKE_REQUIRED_LINK_OPTIONS -fsanitize=address,undefined)
+        check_c_compiler_flag(-fsanitize=address,undefined HAS_BTRFS2EXT4_SANITIZERS)
+        unset(CMAKE_REQUIRED_LINK_OPTIONS)
+        if(HAS_BTRFS2EXT4_SANITIZERS)
+            message(STATUS "Enabling ASan+UBSan on test targets")
+        endif()
+    endif()
+    if(HAS_BTRFS2EXT4_SANITIZERS)
+        target_compile_options(${target} PRIVATE
+            -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+    endif()
+endfunction()
+
+btrfs2ext4_enable_sanitizers(test_stress)
+btrfs2ext4_enable_sanitizers(test_fuzz)
+btrfs2ext4_enable_sanitizers(test_checksum)
+btrfs2ext4_enable_sanitizers(test_integration)

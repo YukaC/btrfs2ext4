@@ -178,12 +178,24 @@ int btrfs_decompress_extent(struct device *dev,
   }
 
   /* Resolve physical address of compressed data */
-  uint64_t phys = chunk_map_resolve(chunk_map, ext->disk_bytenr);
-  if (phys == (uint64_t)-1) {
-    fprintf(stderr, "btrfs2ext4: cannot resolve compressed extent at 0x%lx\n",
-            (unsigned long)ext->disk_bytenr);
-    return -1;
+  uint64_t phys;
+  if (ext->is_physical) {
+    phys = ext->disk_bytenr;
+  } else {
+    phys = chunk_map_resolve(chunk_map, ext->disk_bytenr);
+    if (phys == (uint64_t)-1) {
+      uint64_t dev_size = dev ? dev->size : 0;
+      if (dev_size > 0 && ext->disk_bytenr < dev_size)
+        phys = ext->disk_bytenr;
+      else {
+        fprintf(stderr,
+                "btrfs2ext4: cannot resolve compressed extent at 0x%lx\n",
+                (unsigned long)ext->disk_bytenr);
+        return -1;
+      }
+    }
   }
+  phys += ext->offset;
 
   /* Read compressed data from disk */
   static __thread uint8_t *shared_comp_buf = NULL;

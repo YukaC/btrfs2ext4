@@ -8,6 +8,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "ext4/ext4_structures.h"
+
 struct device;
 struct ext4_layout;
 struct btrfs_fs_info;
@@ -71,13 +73,20 @@ int ext4_write_gdt(struct device *dev, const struct ext4_layout *layout);
 int ext4_write_bitmaps(struct device *dev, const struct ext4_layout *layout,
                        const struct ext4_block_allocator *alloc,
                        const struct inode_map *inode_map);
+int ext4_finalize_bitmaps(struct device *dev, struct ext4_layout *layout,
+                          const struct ext4_block_allocator *alloc,
+                          const struct inode_map *inode_map);
 int ext4_update_free_counts(struct device *dev,
                             const struct ext4_layout *layout);
+void ext4_inode_set_checksum(const uint8_t uuid[16], struct ext4_inode *inode,
+                             uint32_t inode_size);
+void ext4_inode_set_checksum_ino(uint32_t csum_seed, struct ext4_inode *inode,
+                                 uint32_t inode_size, uint32_t ino);
 int ext4_write_inode_table(struct device *dev, const struct ext4_layout *layout,
                            const struct btrfs_fs_info *fs_info,
                            struct inode_map *inode_map,
                            struct ext4_block_allocator *alloc);
-int ext4_write_directories(struct device *dev, const struct ext4_layout *layout,
+int ext4_write_directories(struct device *dev, struct ext4_layout *layout,
                            const struct btrfs_fs_info *fs_info,
                            const struct inode_map *inode_map,
                            struct ext4_block_allocator *alloc);

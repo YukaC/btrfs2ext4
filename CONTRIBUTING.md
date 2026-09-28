@@ -36,14 +36,41 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
-**Debug build (AddressSanitizer + UBSan):**
+**Debug build with sanitizers (recommended for development):**
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Debug
+cmake -B build -DCMAKE_BUILD_TYPE=Debug -DBTRFS2EXT4_ENABLE_SANITIZERS=ON
 cmake --build build -j$(nproc)
 ```
 
-**Dependencies:** CMake ≥ 3.16, GCC or Clang, `libuuid-devel`, `zlib-devel`. Optional: `lzo-devel`, `libzstd-devel`.
+Sanitizers are controlled by `-DBTRFS2EXT4_ENABLE_SANITIZERS=ON|OFF` (default ON in Debug, OFF in Release) via `btrfs2ext4_enable_sanitizers()` in `CMakeLists.txt`, applied to all four test targets.
+
+**Dependencies:** CMake ≥ 3.16, GCC or Clang, `libuuid-dev`, `zlib1g-dev`. Optional: `libssl-dev`, `libxxhash-dev`, `liblzo2-dev`, `libzstd-dev`, `liburing-dev`.
+
+---
+
+## CI
+
+GitHub Actions runs on every push/PR to `main` via `.github/workflows/ci.yml`, which calls the reusable workflow `.github/workflows/reusable-build-test.yml` with:
+
+| Compiler | Build type | Sanitizers |
+| -------- | ---------- | ---------- |
+| GCC      | Debug      | ON         |
+| Clang    | Debug      | ON         |
+| GCC      | Release    | OFF        |
+| Clang    | Release    | OFF        |
+
+All optional dependencies are installed in CI so feature-gated code paths are compiled.
+
+**Run CI locally (matches the Debug + sanitizers job):**
+
+```bash
+sudo apt-get install -y build-essential cmake ninja-build pkg-config \
+  uuid-dev zlib1g-dev libssl-dev libxxhash-dev liblzo2-dev libzstd-dev liburing-dev
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=ON
+cmake --build build
+cd build && ctest --output-on-failure
+```
 
 ---
 
@@ -57,7 +84,7 @@ The test suite (`test_stress.c`) covers:
 
 - Virtual loop device conversions with edge-case filesystems (massive inline files, millions of empty files, overlapping extents)
 - Fuzz inputs: malformed superblocks, truncated B-trees, looping symlinks, out-of-bounds references
-- ASan / UBSan traps on corrupted input
+- ASan + UBSan traps on corrupted input (when built with `-DBTRFS2EXT4_ENABLE_SANITIZERS=ON`)
 
 If your change touches Btrfs parsing, run the fuzz path and confirm no new ASan warnings appear.
 
