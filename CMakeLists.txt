@@ -205,6 +205,7 @@ target_link_libraries(test_stress
     ${UUID_LIBRARIES}
     ${ZLIB_LIBRARIES}
     Threads::Threads
+    m
 )
 
 add_executable(test_fuzz tests/test_fuzz.c ${BTRFS2EXT4_LIB_SOURCES})
@@ -213,6 +214,7 @@ target_link_libraries(test_fuzz
     ${UUID_LIBRARIES}
     ${ZLIB_LIBRARIES}
     Threads::Threads
+    m
 )
 
 if(CRYPTO_FOUND)
@@ -242,6 +244,7 @@ target_link_libraries(test_checksum
     ${UUID_LIBRARIES}
     ${ZLIB_LIBRARIES}
     Threads::Threads
+    m
 )
 if(CRYPTO_FOUND)
     target_link_libraries(test_checksum ${CRYPTO_LIBRARIES})
@@ -267,6 +270,7 @@ target_link_libraries(test_integration
     ${UUID_LIBRARIES}
     ${ZLIB_LIBRARIES}
     Threads::Threads
+    m
 )
 if(CRYPTO_FOUND)
     target_link_libraries(test_integration ${CRYPTO_LIBRARIES})
