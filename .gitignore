@@ -1,5 +1,6 @@
 # Build and IDE files
 build/
+.codegraph/
 .cursor/
 btrfs2ext4
 test_stress
