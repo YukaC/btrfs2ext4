@@ -12,6 +12,7 @@
 #include "btrfs/btrfs_structures.h"
 #include "btrfs/checksum.h"
 #include "device_io.h"
+#include "term_ui.h"
 
 /*
  * Validate and parse the btrfs superblock.
@@ -51,23 +52,27 @@ int btrfs_read_superblock(struct device *dev, struct btrfs_super_block *sb) {
     return -1;
   }
 
-  /* Print superblock info */
-  printf("=== Btrfs Superblock ===\n");
-  printf("  Label:       %s\n", sb->label[0] ? sb->label : "(none)");
-  printf("  Generation:  %lu\n", (unsigned long)le64toh(sb->generation));
-  printf("  Total bytes: %lu (%.1f GiB)\n",
-         (unsigned long)le64toh(sb->total_bytes),
-         (double)le64toh(sb->total_bytes) / (1024.0 * 1024.0 * 1024.0));
-  printf("  Bytes used:  %lu (%.1f GiB)\n",
-         (unsigned long)le64toh(sb->bytes_used),
-         (double)le64toh(sb->bytes_used) / (1024.0 * 1024.0 * 1024.0));
-  printf("  Sector size: %u\n", le32toh(sb->sectorsize));
-  printf("  Node size:   %u\n", le32toh(sb->nodesize));
-  printf("  Num devices: %lu\n", (unsigned long)le64toh(sb->num_devices));
-  printf("  Root tree:   0x%lx\n", (unsigned long)le64toh(sb->root));
-  printf("  Chunk tree:  0x%lx\n", (unsigned long)le64toh(sb->chunk_root));
-  printf("  Csum type:   %u (%s)\n", csum_type, btrfs_csum_name(csum_type));
-  printf("========================\n\n");
+  /* Print superblock info (verbose) */
+  term_log_debug("=== Btrfs Superblock ===\n");
+  term_log_debug("  Label:       %s\n", sb->label[0] ? sb->label : "(none)");
+  term_log_debug("  Generation:  %lu\n",
+                 (unsigned long)le64toh(sb->generation));
+  term_log_debug("  Total bytes: %lu (%.1f GiB)\n",
+                 (unsigned long)le64toh(sb->total_bytes),
+                 (double)le64toh(sb->total_bytes) / (1024.0 * 1024.0 * 1024.0));
+  term_log_debug("  Bytes used:  %lu (%.1f GiB)\n",
+                 (unsigned long)le64toh(sb->bytes_used),
+                 (double)le64toh(sb->bytes_used) / (1024.0 * 1024.0 * 1024.0));
+  term_log_debug("  Sector size: %u\n", le32toh(sb->sectorsize));
+  term_log_debug("  Node size:   %u\n", le32toh(sb->nodesize));
+  term_log_debug("  Num devices: %lu\n",
+                 (unsigned long)le64toh(sb->num_devices));
+  term_log_debug("  Root tree:   0x%lx\n", (unsigned long)le64toh(sb->root));
+  term_log_debug("  Chunk tree:  0x%lx\n",
+                 (unsigned long)le64toh(sb->chunk_root));
+  term_log_debug("  Csum type:   %u (%s)\n", csum_type,
+                 btrfs_csum_name(csum_type));
+  term_log_debug("========================\n\n");
 
   /* Validate sector size */
   uint32_t sectorsize = le32toh(sb->sectorsize);

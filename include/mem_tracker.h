@@ -1,8 +1,8 @@
 /*
- * mem_tracker.h — Memory usage tracker
+ * mem_tracker.h — Unified memory policy for btrfs2ext4
  *
- * Lightweight memory usage monitoring to prevent OOM-killer situations
- * on systems converting large, fragmented filesystems.
+ * Single API for allocation tracking, RAM detection, mmap thresholds,
+ * and optional-structure degradation (hash tables, bloom filters).
  */
 
 #ifndef MEM_TRACKER_H
@@ -12,37 +12,32 @@
 #include <stdint.h>
 
 /*
- * Initialize the memory tracker.
- * Reads available system memory from /proc/meminfo and sets the threshold
- * to 75% of MemAvailable.
+ * Unified memory configuration — replaces the former adaptive_mem_config
+ * scattered across main.c and btrfs_reader.h.
  */
-void mem_track_init(void);
+struct mem_config {
+  uint64_t total_ram;       /* physical RAM (sysconf) */
+  uint64_t available_ram;   /* currently available RAM */
+  uint64_t track_threshold; /* mem_track_exceeded cutoff (75% available) */
+  uint64_t mmap_threshold;  /* switch inode map to mmap (60% total or -m) */
+  const char *workdir;      /* --workdir for temp mmap files */
+  int workdir_is_tmpfs;     /* 1 = workdir on tmpfs (warn user) */
+};
 
 /*
- * Track a memory allocation of the given size.
+ * Detect hardware, set thresholds, and initialize the global tracker.
+ * memory_limit_mb: 0 = auto (60%% of total RAM for mmap threshold).
  */
+void mem_config_init(struct mem_config *cfg, uint32_t memory_limit_mb,
+                     const char *workdir);
+
+/* Global singleton set by mem_config_init(); NULL until init. */
+const struct mem_config *mem_config_get(void);
+
 void mem_track_alloc(size_t bytes);
-
-/*
- * Track a memory deallocation of the given size.
- */
 void mem_track_free(size_t bytes);
-
-/*
- * Returns the current tracked memory usage in bytes.
- */
 uint64_t mem_track_usage(void);
-
-/*
- * Returns 1 if current tracked usage exceeds the safety threshold, 0 otherwise.
- * When exceeded, callers should disable optional hash tables and fall back to
- * linear scan to reduce memory pressure.
- */
 int mem_track_exceeded(void);
-
-/*
- * Print memory usage summary.
- */
 void mem_track_report(void);
 
 #endif /* MEM_TRACKER_H */

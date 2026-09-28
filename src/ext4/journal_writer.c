@@ -20,6 +20,7 @@
 #include "ext4/ext4_space.h"
 #include "ext4/ext4_structures.h"
 #include "ext4/ext4_writer.h"
+#include "term_ui.h"
 
 /* JBD2 constants */
 #define JBD2_MAGIC_NUMBER 0xC03B3998
@@ -82,8 +83,8 @@ int ext4_write_journal(struct device *dev, const struct ext4_layout *layout,
   g_journal_start_block = 0;
   g_journal_block_count = 0;
 
-  printf("Writing ext4 journal (inode 8)...\n");
-  printf("  Journal size: %u blocks (%u MiB)\n", journal_blocks,
+  term_log_debug("Writing ext4 journal (inode 8)...\n");
+  term_log_debug("  Journal size: %u blocks (%u MiB)\n", journal_blocks,
          (journal_blocks * block_size) / (1024 * 1024));
 
   uint64_t first_block = (uint64_t)-1;
@@ -159,7 +160,7 @@ int ext4_write_journal(struct device *dev, const struct ext4_layout *layout,
   g_journal_start_block = first_block;
   g_journal_block_count = journal_blocks;
 
-  printf("  Journal blocks: %lu–%lu (%u blocks)\n", (unsigned long)first_block,
+  term_log_debug("  Journal blocks: %lu–%lu (%u blocks)\n", (unsigned long)first_block,
          (unsigned long)(first_block + journal_blocks - 1), journal_blocks);
 
   /* Build JBD2 superblock.
@@ -230,7 +231,7 @@ int ext4_write_journal(struct device *dev, const struct ext4_layout *layout,
   free(zero_chunk);
   free(jbd_buf);
 
-  printf("  Journal written (JBD2 v2 superblock + %u empty blocks, "
+  term_log_debug("  Journal written (JBD2 v2 superblock + %u empty blocks, "
          "%u chunk writes)\n",
          journal_blocks - 1,
          (journal_blocks + chunk_blocks - 1) / chunk_blocks);

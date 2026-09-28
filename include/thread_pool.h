@@ -4,6 +4,11 @@
 #include <pthread.h>
 #include <stdint.h>
 
+/*
+ * Fixed-size thread pool for CPU-bound work (e.g. Pass 3 decompression).
+ * Pass 3 Approach C pairs this with per-job completion signals on the main
+ * thread, which batches io_uring writes as decomp jobs finish.
+ */
 typedef void (*thread_task_fn)(void *arg);
 
 struct thread_task {
