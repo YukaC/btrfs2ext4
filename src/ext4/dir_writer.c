@@ -18,6 +18,7 @@
 #include "ext4/ext4_space.h"
 #include "ext4/ext4_structures.h"
 #include "ext4/ext4_writer.h"
+#include "term_ui.h"
 
 #define EXT4_HTREE_EOF_32BIT 0x7fffffffU
 
@@ -406,7 +407,7 @@ int ext4_write_directories(struct device *dev, struct ext4_layout *layout,
                            struct ext4_block_allocator *alloc) {
   uint32_t block_size = layout->block_size;
 
-  printf("Writing directory entries...\n");
+  term_log_debug("Writing directory entries...\n");
 
   struct ext4_super_block sb;
   if (device_read(dev, EXT4_SUPER_OFFSET, &sb, sizeof(sb)) < 0)
@@ -755,6 +756,6 @@ int ext4_write_directories(struct device *dev, struct ext4_layout *layout,
     free(dir_block_nums);
   }
 
-  printf("  Directory entries written\n");
+  term_log_debug("  Directory entries written\n");
   return 0;
 }

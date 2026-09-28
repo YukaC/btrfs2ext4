@@ -16,6 +16,7 @@
 #include "btrfs/btrfs_structures.h"
 #include "btrfs/chunk_tree.h"
 #include "device_io.h"
+#include "term_ui.h"
 
 #ifdef BTRFS_TESTING
 void *btrfs_test_malloc(size_t size);
@@ -621,7 +622,7 @@ static int root_tree_callback(const struct btrfs_disk_key *key,
       rctx->fs_tree_bytenr = le64toh(ri->bytenr);
       rctx->fs_tree_level = ri->level;
       rctx->found = 1;
-      printf("Found FS tree root: bytenr=0x%lx level=%u\n",
+      term_log_debug("Found FS tree root: bytenr=0x%lx level=%u\n",
              (unsigned long)rctx->fs_tree_bytenr, rctx->fs_tree_level);
     }
     return 0; /* Continue to find all trees */
@@ -631,7 +632,7 @@ static int root_tree_callback(const struct btrfs_disk_key *key,
       rctx->extent_tree_bytenr = le64toh(ri->bytenr);
       rctx->extent_tree_level = ri->level;
       rctx->found_extent = 1;
-      printf("Found Extent tree root: bytenr=0x%lx level=%u\n",
+      term_log_debug("Found Extent tree root: bytenr=0x%lx level=%u\n",
              (unsigned long)rctx->extent_tree_bytenr, rctx->extent_tree_level);
     }
     return 0;
@@ -713,15 +714,15 @@ int btrfs_read_fs(struct device *dev, struct btrfs_fs_info *fs_info) {
   fs_info->dev = dev;
   fs_info->use_hash = 1;
 
-  printf("=== Phase 1: Reading Btrfs Metadata ===\n\n");
+  term_log_debug("=== Phase 1: Reading Btrfs Metadata ===\n\n");
 
   /* Step 1: Read superblock */
-  printf("Step 1/6: Reading superblock...\n");
+  term_log_debug("Step 1/6: Reading superblock...\n");
   if (btrfs_read_superblock(dev, &fs_info->sb) < 0)
     return -1;
 
   /* Step 2: Bootstrap chunk mappings from sys_chunk_array */
-  printf("Step 2/6: Bootstrapping chunk mappings...\n");
+  term_log_debug("Step 2/6: Bootstrapping chunk mappings...\n");
   fs_info->chunk_map = calloc(1, sizeof(struct chunk_map));
   if (!fs_info->chunk_map)
     return -1;
@@ -730,12 +731,12 @@ int btrfs_read_fs(struct device *dev, struct btrfs_fs_info *fs_info) {
     return -1;
 
   /* Step 3: Fully populate chunk map */
-  printf("Step 3/6: Walking chunk tree...\n");
+  term_log_debug("Step 3/6: Walking chunk tree...\n");
   if (chunk_map_populate(fs_info->chunk_map, dev, &fs_info->sb) < 0)
     return -1;
 
   /* Step 4: Walk root tree to find FS tree and extent tree roots */
-  printf("Step 4/6: Walking root tree...\n");
+  term_log_debug("Step 4/6: Walking root tree...\n");
   posix_fadvise(dev->fd, 0, 0, POSIX_FADV_SEQUENTIAL);
   uint64_t root_tree_logical = le64toh(fs_info->sb.root);
   uint8_t root_tree_level = fs_info->sb.root_level;
@@ -757,7 +758,7 @@ int btrfs_read_fs(struct device *dev, struct btrfs_fs_info *fs_info) {
   }
 
   /* Step 5: Walk FS tree to build file/directory tree */
-  printf("Step 5/6: Walking filesystem tree...\n");
+  term_log_debug("Step 5/6: Walking filesystem tree...\n");
   struct fs_tree_ctx fctx;
   memset(&fctx, 0, sizeof(fctx));
   fctx.fs_info = fs_info;
@@ -774,12 +775,12 @@ int btrfs_read_fs(struct device *dev, struct btrfs_fs_info *fs_info) {
   free(fctx.cow_track.buckets);
 
   if (fctx.prealloc_skipped > 0) {
-    printf("  Skipped %lu sparse PREALLOC extent(s) (unwritten holes)\n",
+    term_log_debug("  Skipped %lu sparse PREALLOC extent(s) (unwritten holes)\n",
            (unsigned long)fctx.prealloc_skipped);
   }
 
   /* Step 6: Walk extent tree to build used-block map */
-  printf("Step 6/6: Walking extent tree...\n");
+  term_log_debug("Step 6/6: Walking extent tree...\n");
 
   /* The extent tree is rooted separately, we need to find it in the root tree.
    */
@@ -811,7 +812,7 @@ int btrfs_read_fs(struct device *dev, struct btrfs_fs_info *fs_info) {
       }
     }
   }
-  printf("  Built used-block map: %u extents\n", fs_info->used_blocks.count);
+  term_log_debug("  Built used-block map: %u extents\n", fs_info->used_blocks.count);
 
   /* Compute compression statistics for space check in Pass 2 */
   fs_info->total_compressed_bytes = 0;
@@ -832,14 +833,14 @@ int btrfs_read_fs(struct device *dev, struct btrfs_fs_info *fs_info) {
   }
 
   if (fs_info->compressed_extent_count > 0) {
-    printf("  Compressed extents:  %u\n", fs_info->compressed_extent_count);
-    printf("  Compressed size:     %lu bytes (%.1f MiB)\n",
+    term_log_debug("  Compressed extents:  %u\n", fs_info->compressed_extent_count);
+    term_log_debug("  Compressed size:     %lu bytes (%.1f MiB)\n",
            (unsigned long)fs_info->total_compressed_bytes,
            (double)fs_info->total_compressed_bytes / (1024.0 * 1024.0));
-    printf("  Decompressed size:   %lu bytes (%.1f MiB)\n",
+    term_log_debug("  Decompressed size:   %lu bytes (%.1f MiB)\n",
            (unsigned long)fs_info->total_decompressed_bytes,
            (double)fs_info->total_decompressed_bytes / (1024.0 * 1024.0));
-    printf("  Expansion needed:    %.1f MiB\n",
+    term_log_debug("  Expansion needed:    %.1f MiB\n",
            (double)(fs_info->total_decompressed_bytes -
                     fs_info->total_compressed_bytes) /
                (1024.0 * 1024.0));
@@ -883,12 +884,12 @@ int btrfs_read_fs(struct device *dev, struct btrfs_fs_info *fs_info) {
     return -1;
   }
 
-  printf("\n=== Btrfs Metadata Summary ===\n");
-  printf("  Total inodes read: %u\n", fs_info->inode_count);
-  printf("  Used extents:      %u\n", fs_info->used_blocks.count);
-  printf("  Root directory:    inode %lu\n",
+  term_log_debug("\n=== Btrfs Metadata Summary ===\n");
+  term_log_debug("  Total inodes read: %u\n", fs_info->inode_count);
+  term_log_debug("  Used extents:      %u\n", fs_info->used_blocks.count);
+  term_log_debug("  Root directory:    inode %lu\n",
          (unsigned long)fs_info->root_dir->ino);
-  printf("==============================\n\n");
+  term_log_debug("==============================\n\n");
 
   return 0;
 }

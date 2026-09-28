@@ -172,18 +172,6 @@ struct btrfs_fs_info {
 };
 
 /* ========================================================================
- * Adaptive Memory Configuration (production-grade hardware-agnostic)
- * ======================================================================== */
-
-struct adaptive_mem_config {
-  uint64_t total_ram;      /* physical RAM detected via sysconf */
-  uint64_t available_ram;  /* currently available RAM */
-  uint64_t mmap_threshold; /* dynamic threshold (60% of total_ram) */
-  const char *workdir;     /* --workdir path for temp files */
-  int workdir_is_tmpfs;    /* 1 = workdir is on tmpfs (WARNING) */
-};
-
-/* ========================================================================
  * Bloom filter for HDD thrashing prevention (graceful degradation)
  * ======================================================================== */
 
